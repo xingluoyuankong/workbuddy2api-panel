@@ -1073,11 +1073,21 @@ func mergeModelCapabilities(base []ModelInfo, overlay map[string]ModelInfo) []Mo
 // 来源**里（「国内运营裂变包」「拉新权益包」按次发放，面额 6~1500 不等）。
 // 只看聚合值看不出这件事，所以把逐包明细暴露出来。
 type CreditPackage struct {
-	Name    string `json:"name"`
-	Remain  int64  `json:"remain"`
-	Used    int64  `json:"used"`
-	Size    int64  `json:"size"`
+	Name   string `json:"name"`
+	Remain int64  `json:"remain"`
+	Used   int64  `json:"used"`
+	Size   int64  `json:"size"`
+	// EndTime 该包的周期结束时间（上游 ExpiredTime / PackageEndTime 二者取有值者）。
 	EndTime string `json:"end_time,omitempty"`
+	// CreatedAt 发放时刻，RFC3339。**这是区分「首登赠送」与「活动奖励」的唯一依据**：
+	// 两类包的 PackageName 与 PackageCode 完全相同（例如都是「国内运营裂变包」+
+	// TCACA_code_007_*），只看名字无法区分，只有时间能说明它是不是账号首次授权那刻发的。
+	CreatedAt string `json:"created_at,omitempty"`
+	// PackageCode / SubProductCode 上游的包类型标识。同 Name 不同 Code 的包可能
+	// 是不同来源；同 Code 不同面额则是同来源分批发放（首登 1500 与活动 300 即如此）。
+	PackageCode    string `json:"package_code,omitempty"`
+	SubProductCode string `json:"sub_product_code,omitempty"`
+	SubProductName string `json:"sub_product_name,omitempty"`
 	// Cycle 为 true 表示按周期发放的包（读 Cycle* 字段），否则读 Capacity*。
 	Cycle bool `json:"cycle,omitempty"`
 }
@@ -1117,6 +1127,11 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					// 到期时间字段名在上游同时存在两种口径，都读，谁有值用谁。
 					ExpiredTime    string `json:"ExpiredTime"`
 					PackageEndTime string `json:"PackageEndTime"`
+					// 发放时刻（epoch 毫秒）。
+					CreateTime     int64  `json:"CreateTime"`
+					PackageCode    string `json:"PackageCode"`
+					SubProductCode string `json:"SubProductCode"`
+					SubProductName string `json:"SubProductName"`
 				} `json:"Accounts"`
 			} `json:"Data"`
 		} `json:"Response"`
@@ -1128,11 +1143,20 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 	out := make([]CreditPackage, 0, len(packs))
 	var sumRemain, sumSize int64
 	for _, p := range packs {
-		cp := CreditPackage{Name: p.PackageName}
+		cp := CreditPackage{
+			Name:           p.PackageName,
+			PackageCode:    p.PackageCode,
+			SubProductCode: p.SubProductCode,
+			SubProductName: p.SubProductName,
+		}
 		if p.ExpiredTime != "" {
 			cp.EndTime = p.ExpiredTime
 		} else {
 			cp.EndTime = p.PackageEndTime
+		}
+		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
+		if p.CreateTime > 0 {
+			cp.CreatedAt = time.UnixMilli(p.CreateTime).Format(time.RFC3339)
 		}
 		if p.CycleCapacitySize > 0 {
 			cp.Cycle = true

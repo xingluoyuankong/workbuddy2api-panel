@@ -1036,14 +1036,23 @@ function pkColor(i) { return PK_COLORS[i % PK_COLORS.length]; }
 function pkBySource(packs) {
   const m = new Map();
   for (const p of packs) {
-    const k = p.name || '(未命名)';
-    const e = m.get(k) || { name: k, n: 0, remain: 0, size: 0, used: 0, minEnd: '' };
+    // 分组键用 code + name，而不是只 name：上游给「首登赠送」和普通活动包用了
+    // **同一个 PackageName 和同一个 PackageCode**，只按 name 会把两类混成一类，
+    // 那正是当初「两个号为何差 1500」看不出来的原因。这里至少把 code 带进键里，
+    // 并在卡片上显示最早的发放时间。
+    const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
+    const e = m.get(k) || {
+      key: k, name: p.name || '(未命名)', code: p.package_code || '',
+      n: 0, remain: 0, size: 0, used: 0, minEnd: '', minCreated: '',
+    };
     e.n += 1;
     e.remain += Number(p.remain || 0);
     e.size += Number(p.size || 0);
     e.used += Number(p.used || 0);
     const t = (p.end_time || '').slice(0, 10);
     if (t && (!e.minEnd || t < e.minEnd)) e.minEnd = t;
+    const c = (p.created_at || '').slice(0, 10);
+    if (c && (!e.minCreated || c < e.minCreated)) e.minCreated = c;
     m.set(k, e);
   }
   return [...m.values()].sort((a, b) => b.size - a.size);
@@ -1059,16 +1068,19 @@ function renderPackages(d) {
   // 包名 → 稳定色号（跨账号一致，方便肉眼对齐）
   const names = [];
   for (const a of list) for (const s of pkBySource(a.packages || [])) {
-    if (!names.includes(s.name)) names.push(s.name);
+    if (!names.includes(s.key)) names.push(s.key);
   }
   names.sort((x, y) => {
     const sz = n => Math.max(...list.map(a => {
-      const f = pkBySource(a.packages || []).find(s => s.name === n);
+      const f = pkBySource(a.packages || []).find(s => s.key === n);
       return f ? f.size : 0;
     }));
     return sz(y) - sz(x);
   });
   const colorOf = n => pkColor(names.indexOf(n));
+  // 键 → 展示名，供卡片与明细表共用（同一来源必然同色同名）。
+  const labelOf = {};
+  for (const a of list) for (const s of pkBySource(a.packages || [])) labelOf[s.key] = s;
 
   const maxRemain = Math.max(1, ...list.map(a => Number(a.remain || 0)));
 
@@ -1083,11 +1095,12 @@ function renderPackages(d) {
     const total = Math.max(1, Number(a.size || 0));
     const bar = srcs.map(s =>
       '<i style="width:' + (s.size / total * 100).toFixed(2) + '%;background:' +
-      colorOf(s.name) + '" title="' + esc(s.name) + ' ' + fmtTok(s.size) + '"></i>'
+      colorOf(s.key) + '" title="' + esc(s.name) + ' ' + fmtTok(s.size) + '"></i>'
     ).join('');
     const legend = srcs.map(s =>
-      '<span><i style="background:' + colorOf(s.name) + '"></i>' +
-      esc(s.name.replace(/^CodeBuddy/, '')) + ' x' + s.n + ' · ' + fmtTok(s.size) + '</span>'
+      '<span><i style="background:' + colorOf(s.key) + '"></i>' +
+      esc(s.name.replace(/^CodeBuddy/, '')) + ' x' + s.n + ' · ' + fmtTok(s.size) +
+      (s.minCreated ? ' · 首发 ' + esc(s.minCreated.slice(5)) : '') + '</span>'
     ).join('');
     return '<div class="pk-card">' +
       '<div class="who"><span class="nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
@@ -1106,24 +1119,29 @@ function renderPackages(d) {
   $('pkDetail').innerHTML = list.map(a => {
     if (a.error) return '';
     const packs = (a.packages || []);
-    const rows = packs.map((p, i) =>
-      '<tr><td class="mark" aria-hidden="true"><i style="background:' +
-        colorOf(p.name) + '"></i></td>' +
-      '<td>' + esc(p.name || '(未命名)') + '</td>' +
+    const rows = packs.map(p => {
+      const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
+      const sub = (p.sub_product_code || '').replace(/^sp_tcaca_codebuddyide_?/, '') ||
+                  (p.package_code || '').replace(/^TCACA_/, '');
+      return '<tr><td class="mark" aria-hidden="true"><i style="background:' +
+        colorOf(k) + '"></i></td>' +
+      '<td>' + esc(p.name || '(未命名)') +
+        (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
       '<td class="num">' + fmtTok(p.size) + '</td>' +
       '<td class="num">' + fmtTok(p.remain) + '</td>' +
       '<td class="num">' + fmtTok(p.used) + '</td>' +
+      '<td class="num">' + esc((p.created_at || '').slice(0, 16).replace('T', ' ') || '—') + '</td>' +
       '<td class="num">' + esc((p.end_time || '').slice(0, 10) || '—') + '</td>' +
-      '<td class="num">' + (fmtTok(p.size) === fmtTok(p.remain) ? '未用' : '部分') + '</td>' +
-      '</tr>').join('');
+      '</tr>';
+    }).join('');
     return '<div class="box"><header><h3>' +
       esc(a.nickname || a.uid.slice(0, 8)) + ' · ' + esc(a.realm || '') +
       '</h3><span class="grow"></span><span class="note">余额 ' + fmtTok(a.remain) +
       ' / 总额 ' + fmtTok(a.size) + ' · ' + packs.length + ' 个包（按面额降序）</span>' +
       '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
-      '<th class="mark" aria-hidden="true"></th><th>包名</th>' +
+      '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
       '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
-      '<th class="num">到期</th><th class="num">状态</th>' +
+      '<th class="num">发放</th><th class="num">到期</th>' +
       '</tr></thead><tbody>' + rows + '</tbody></table></div></div>';
   }).join('');
 }
