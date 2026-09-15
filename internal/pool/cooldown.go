@@ -198,16 +198,6 @@ func nextDay4AM(now time.Time) time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
 }
 
-// Disable 永久禁用（session 死亡），需人工重登后手工恢复或文件替换。
-func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
-	e.credits = credits
-	e.creditsTotal = total
-	e.until = time.Time{}
-	e.coolKind = 0
-	e.reason = ""
-	e.softStreak = 0
-	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
-}
-
 // ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。
 // 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
+// reviveCoolingLocked 已迁至 transition.go（状态机迁移唯一权威实现）。

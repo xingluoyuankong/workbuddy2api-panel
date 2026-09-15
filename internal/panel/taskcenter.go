@@ -37,13 +37,13 @@ type schoolTaskView struct {
 
 // scanAccountItem 单账号扫描结果。
 type scanAccountItem struct {
-	UID      string           `json:"uid"`
-	Nickname string           `json:"nickname"`
-	Growth   []upstream.Task  `json:"growth,omitempty"`
-	GrowthErr string          `json:"growth_error,omitempty"`
-	School   []schoolTaskView `json:"school,omitempty"`
-	SchoolErr string          `json:"school_error,omitempty"`
-	InPeriod bool             `json:"in_period"`
+	UID       string           `json:"uid"`
+	Nickname  string           `json:"nickname"`
+	Growth    []upstream.Task  `json:"growth,omitempty"`
+	GrowthErr string           `json:"growth_error,omitempty"`
+	School    []schoolTaskView `json:"school,omitempty"`
+	SchoolErr string           `json:"school_error,omitempty"`
+	InPeriod  bool             `json:"in_period"`
 }
 
 // growthPending 任务是否"未完成且可自动化"。
@@ -441,13 +441,13 @@ func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 	items := make([]queueItem, len(q.items))
 	copy(items, q.items)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"running":   q.running,
-		"total":     len(items),
-		"conc":      q.conc,
-		"started":   !q.startedAt.IsZero(),
+		"running":    q.running,
+		"total":      len(items),
+		"conc":       q.conc,
+		"started":    !q.startedAt.IsZero(),
 		"started_at": q.startedAt,
-		"seq":       q.seq,
-		"items":     items,
+		"seq":        q.seq,
+		"items":      items,
 	})
 }
 

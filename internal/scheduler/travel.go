@@ -53,6 +53,9 @@ func (s *Scheduler) RunTravelNow() {
 		if a == nil || a.RefreshToken == "" {
 			continue
 		}
+		if a.IsGlobal() {
+			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
+		}
 		if !first {
 			time.Sleep(travelAccountDelay)
 		}

@@ -13,9 +13,7 @@ func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.disabled = true
-		e.reason = reason
-		p.dirty.Store(true)
+		p.disableLocked(e, reason)
 	}
 }
 
@@ -39,10 +37,8 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 	if e.sessionDeadFails < sessionDeadThreshold {
 		return false
 	}
-	e.disabled = true
-	e.reason = sessionDeadReason
 	e.sessionDeadFails = 0
-	p.dirty.Store(true)
+	p.disableLocked(e, sessionDeadReason)
 	return true
 }
 
@@ -305,10 +301,24 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 // inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 // 与 ServableNow 的区别见该函数注释。
 func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull int) {
+	return p.countsDetailedForRealm("")
+}
+
+// CountsDetailedForRealm 同 CountsDetailed，但仅统计 Realm()==realm 的账号；
+// realm=="" 不加谓词（= CountsDetailed）。供 /status 按域分组透出。
+func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
+	return p.countsDetailedForRealm(realm)
+}
+
+// countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
+func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
 		total++
 		switch {
 		case e.disabled:
@@ -330,10 +340,20 @@ func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull
 // 不看 inFlight；ServableNow 额外叠加在途维度，与 chat 的真实可达性（Pick 会跳过 inFlightFull 账号）对齐。
 // 专供 /healthz 用，避免"全账号 healthy 但都占满"时探活误报 200 而 chat 返回 503 的口径裂缝。
 func (p *Pool) ServableNow() bool {
+	return p.ServableForRealm("")
+}
+
+// ServableForRealm 报告某 realm 是否可服务：存在至少一个该 realm 的 healthy 且未占满在途名额的账号。
+// 与 ServableNow 同口径（healthy 或模型豁免、排除 inFlightFull），仅叠加 Realm()==realm 谓词。
+// realm=="" 退化为 ServableNow（现状语义）。供 /healthz 按 realm 暴露 CN/global 各自可达性。
+func (p *Pool) ServableForRealm(realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
 		if p.inFlightFull(e) {
 			continue
 		}
@@ -371,6 +391,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels: p.rateLimitedModelsLocked(e, now),
+		Realm:             e.a.Realm(),
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
 		CreditsTotal:      e.creditsTotal,

@@ -70,13 +70,16 @@ type Status struct {
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
-	Disabled          bool               `json:"disabled"`
-	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
-	SuccessCount      int64              `json:"success_count,omitempty"`
-	ErrTotal          int64              `json:"err_total,omitempty"`
-	LastSuccessTime   time.Time          `json:"last_success,omitempty"`
-	LastErrTime       time.Time          `json:"last_err,omitempty"`
-	TokenUsage        TokenUsage         `json:"token_usage,omitempty"`
+	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
+	// 供面板/状态接口按域分组展示。
+	Realm           string     `json:"realm,omitempty"`
+	Disabled        bool       `json:"disabled"`
+	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	SuccessCount    int64      `json:"success_count,omitempty"`
+	ErrTotal        int64      `json:"err_total,omitempty"`
+	LastSuccessTime time.Time  `json:"last_success,omitempty"`
+	LastErrTime     time.Time  `json:"last_err,omitempty"`
+	TokenUsage      TokenUsage `json:"token_usage,omitempty"`
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`

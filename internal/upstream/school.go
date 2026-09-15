@@ -132,20 +132,20 @@ const mpReportPath = "/v2/report"
 // mpEventBase 小程序埋点公共指纹（appservice wQ()+Ao() 对齐）。
 func mpEventBase(a *auth.Auth) map[string]any {
 	return map[string]any{
-		"timestamp":   time.Now().UnixMilli(),
-		"ideType":     "WorkBuddy_MP",
-		"ideVersion":  "2.4.0",
-		"extName":     "workbuddy-mp",
-		"extVersion":  "2.4.0",
-		"product":     "SaaS",
-		"ideName":     "wx_app_cloud",
-		"platform":    "mini_program",
-		"os":          "windows",
-		"osVersion":   "11",
-		"arch":        "x64",
-		"machineId":   "0655736a-607f-4d9d-b430-58176ee9a090",
-		"timezone":  "Asia/Shanghai",
-		"userId":      a.UID,
+		"timestamp":    time.Now().UnixMilli(),
+		"ideType":      "WorkBuddy_MP",
+		"ideVersion":   "2.4.0",
+		"extName":      "workbuddy-mp",
+		"extVersion":   "2.4.0",
+		"product":      "SaaS",
+		"ideName":      "wx_app_cloud",
+		"platform":     "mini_program",
+		"os":           "windows",
+		"osVersion":    "11",
+		"arch":         "x64",
+		"machineId":    "0655736a-607f-4d9d-b430-58176ee9a090",
+		"timezone":     "Asia/Shanghai",
+		"userId":       a.UID,
 		"userNickname": a.Nickname,
 	}
 }
@@ -193,7 +193,7 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 func SchoolChatTimesEvents(conversationID string) map[string]any {
 	rid := "wb2api-" + clientToken()
 	return map[string]any{
-		"eventCode": "chat_request_send",
+		"eventCode":   "chat_request_send",
 		"inputLength": 14, "isPlan": false, "isAutoExecuteTerminal": false,
 		"isAutoModify": false, "codebaseEnable": false, "maxToken": 0,
 		"maxSteps": 500, "temperature": 0, "maxRetries": 0,
@@ -228,7 +228,7 @@ func SchoolExpertUseEvents(expertID, expertName, conversationID string) []map[st
 			"characterCount": 14, "expertType": "builtin",
 		},
 		{
-			"eventCode": "chat_request_send",
+			"eventCode":   "chat_request_send",
 			"inputLength": 14, "isPlan": false, "isAutoExecuteTerminal": false,
 			"isAutoModify": false, "codebaseEnable": false, "maxToken": 0,
 			"maxSteps": 500, "temperature": 0, "maxRetries": 0,

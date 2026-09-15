@@ -28,7 +28,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.7.0-panel"
+const appVersion = "1.8.0-panel"
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
@@ -84,11 +84,13 @@ func main() {
 	}
 	if cfg.SessionSticky.Enabled {
 		sessRouter = session.New(session.Config{
-			TTL:               cfg.SessionTTL,
-			GCInterval:        cfg.SessionGCInterval,
-			Store:             store,
-			Available:         p.AvailableUIDs,
-			AvailableForModel: p.AvailableUIDsForModel,
+			TTL:        cfg.SessionTTL,
+			GCInterval: cfg.SessionGCInterval,
+			Store:      store,
+			Available:  p.AvailableUIDs,
+			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
+			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
+			AvailableForModel: realmAwareAvailableForModel(p),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -122,6 +124,12 @@ func main() {
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
+	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
+	up.GlobalEnabled = cfg.Global.Enabled
+	up.ChatBaseGlobal = cfg.Global.ChatBase
+	up.BillingBaseGlobal = cfg.Global.BillingBase
+	auth.SetGlobalEnabled(cfg.Global.Enabled)
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
@@ -216,7 +224,9 @@ func main() {
 		Live:         live,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
-		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
+		GlobalEnabled: cfg.Global.Enabled,
+		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

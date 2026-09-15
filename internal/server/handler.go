@@ -52,6 +52,12 @@ type Config struct {
 	PromptMode string
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
+
+	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
+	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
+	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
+	// （modelList 不列 global 名单）。
+	GlobalEnabled bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -144,12 +150,19 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	if !h.cfg.Pool.ServableNow() {
 		status = http.StatusServiceUnavailable
 	}
+	// realm_servable 域可服务维度：不改判活语义（存在性探活保持不变），
+	// 只新增 CN/global 各自可达性供双域部署运维观察（任一域不可用单独告警）。
+	realmServable := map[string]bool{
+		"cn":     h.cfg.Pool.ServableForRealm("cn"),
+		"global": h.cfg.Pool.ServableForRealm("global"),
+	}
 	// 恒无鉴权（负载均衡/编排探活只需 2xx/503 语义），身份靠 service 字段 + X-Service 头双保险。
 	w.Header().Set("X-Service", ServiceName)
 	writeJSON(w, status, map[string]any{
-		"healthy": healthy,
-		"total":   total,
-		"service": ServiceName,
+		"healthy":        healthy,
+		"total":          total,
+		"service":        ServiceName,
+		"realm_servable": realmServable,
 	})
 }
 
@@ -164,15 +177,32 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		redisMode = "noop"
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":        h.cfg.Pool.List(),
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"in_flight_full":  inFlightFull,
+		"accounts":       h.cfg.Pool.List(),
+		"total":          total,
+		"healthy":        healthy,
+		"cooling":        cooling,
+		"disabled":       disabled,
+		"in_flight_full": inFlightFull,
+		// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
+		// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
+		"realm_totals": map[string]map[string]int{
+			"cn":     countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
+			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
+		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
 	})
+}
+
+// countsMapFrom 把 CountsDetailed 五元组打包成 /status 的域分组建模。
+func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[string]int {
+	return map[string]int{
+		"total":          total,
+		"healthy":        healthy,
+		"cooling":        cooling,
+		"disabled":       disabled,
+		"in_flight_full": inFlightFull,
+	}
 }
 
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
@@ -213,12 +243,18 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length 与 reasoning 档位）。
 // supported_efforts/default_effort 透出上游实际能力（客户端据此渲染思考档位选择）；
 // 未知（静态回退表 / 上游未返回）时省略字段，客户端按自身默认处理。
+// globalModels 国际版（global realm）模型名名单（PLAN §7.2 附录）。
+// 只含模型名、不含倍率。探测失败 / 无 global 账号时直接输出此名单。
+var globalModels = upstream.GlobalModelNames
+
+// modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
+// 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。动态失败回退静态表。
 func (h *Handler) modelList() []map[string]any {
+	out := make([]map[string]any, 0, len(staticModels)+len(globalModels))
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		out := make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {
 			entry := map[string]any{
-				"id":                mi.ID,
+				"id":                "cn:" + mi.ID,
 				"object":            "model",
 				"created":           1753600000,
 				"owned_by":          "workbuddy",
@@ -241,14 +277,49 @@ func (h *Handler) modelList() []map[string]any {
 				entry["supports_reasoning"] = mi.SupportsReasoning
 				entry["can_disable_thinking"] = mi.CanDisableThinking
 			}
+			if mi.SupportsImages {
+				entry["supports_images"] = true // P1：多模态能力透出
+			}
 			if mi.Credits != "" {
 				entry["credits"] = mi.Credits
 			}
 			out = append(out, entry)
 		}
-		return out
+	} else {
+		for _, m := range staticModels {
+			e := make(map[string]any, len(m)+1)
+			for k, v := range m {
+				e[k] = v
+			}
+			if id, ok := m["id"].(string); ok {
+				e["id"] = "cn:" + id
+			}
+			out = append(out, e)
+		}
 	}
-	return staticModels
+	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。名单 = 探测结果
+	// ∪ 静态兜底（fetchGlobalModels 内合并去重）；无 global 账号时直接静态名单且零上游调用。
+	if h.cfg.GlobalEnabled {
+		for _, id := range h.fetchGlobalModels() {
+			out = append(out, map[string]any{
+				"id":       "global:" + id,
+				"object":   "model",
+				"created":  1753600000,
+				"owned_by": "workbuddy",
+			})
+		}
+	}
+	return out
+}
+
+// fetchGlobalModels 拉 global realm 模型名目录（探测 ∪ 静态名单，1h 缓存 + 5min 负缓存）。
+// GlobalEnabled=false 时 modelList 已不进入本分支（逃生门在调用方 gate）。
+func (h *Handler) fetchGlobalModels() []string {
+	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
+	if acct == nil {
+		return globalModels // 无 global 账号：直接静态名单，零上游调用
+	}
+	return h.cfg.Upstream.FetchGlobalModels(acct)
 }
 
 // fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
@@ -312,6 +383,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
+
+	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
+	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
+	// 裸名 → ("cn", 原串)，CN 现状零回归。
+	realm, bareModel := resolveModel(peek.Model)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -399,6 +475,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		degradedApplied = true
 	}
 
+	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
+	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
+	if bareModel != peek.Model {
+		body = rewriteModel(body, bareModel)
+	}
+
 	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID（对话轮级）聚合请求，
 	// 官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。此处**轮转
 	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
@@ -422,19 +504,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		// 选号：粘性号优先（PickByUID 已校验 health + 在途未满），否则普通轮换。
+		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, peek.Model)
-			if acct == nil {
-				// 粘性号当前不可用（冷却/占满/被当前模型限额）→ 解绑，本次回落普通轮换。
+			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
+			if acct == nil || (realm != "" && acct.Realm() != realm) {
+				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
+				// 本次回落普通轮换。
 				unbindSticky()
+				acct = nil
 			}
 		}
 		if acct == nil {
-			// 模型感知选号：请求携带 model 时启用 6004 模型级冷却豁免
-			// （PickExcludingForModel 内部当 model 为空时即退化为 PickExcluding）。
-			acct = h.cfg.Pool.PickExcludingForModel(tried, peek.Model)
+			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
+			// （healthyForModel），realm 谓词过滤跨域账号。
+			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -475,7 +559,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 		attemptStarted := time.Now()
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(acct, r.Context(), body, clientIP, chatMeta)
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。

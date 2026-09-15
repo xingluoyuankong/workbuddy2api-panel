@@ -266,6 +266,12 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshToken == "" {
 			continue
 		}
+		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
+		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
+		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
+		if a.IsGlobal() {
+			continue
+		}
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 			if upstream.IsAlreadyCheckin(err) {
@@ -305,6 +311,9 @@ func (s *Scheduler) RunActivityNow() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessToken == "" {
 			continue
+		}
+		if a.IsGlobal() {
+			continue // D4 门控：global 无任务中心/活跃体系，不发起任何上游调用
 		}
 		if !first {
 			time.Sleep(activityAccountDelay)

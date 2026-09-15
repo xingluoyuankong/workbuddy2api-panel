@@ -24,6 +24,9 @@ func (s *Scheduler) RunBlackcatNow() {
 		if a == nil || a.AccessToken == "" {
 			continue
 		}
+		if a.IsGlobal() {
+			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
+		}
 		need, err := s.cfg.Upstream.BlackcatNeed(a)
 		if err != nil {
 			log.Printf("blackcat %s: %v", a.UID, err)

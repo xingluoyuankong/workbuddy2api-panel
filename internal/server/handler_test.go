@@ -859,12 +859,12 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 	found := false
 	for _, m := range data {
-		if m.(map[string]any)["id"] == "glm-5.2" {
+		if m.(map[string]any)["id"] == "cn:glm-5.2" {
 			found = true
 		}
 	}
 	if !found {
-		t.Error("glm-5.2 missing")
+		t.Error("cn:glm-5.2 missing")
 	}
 }
 
@@ -897,7 +897,7 @@ func TestModelsDynamic(t *testing.T) {
 	for _, m := range data {
 		ids[m.(map[string]any)["id"].(string)] = true
 	}
-	if !ids["dyn-model-a"] || !ids["glm-9.9"] {
+	if !ids["cn:dyn-model-a"] || !ids["cn:glm-9.9"] {
 		t.Errorf("dynamic ids missing: %v", ids)
 	}
 

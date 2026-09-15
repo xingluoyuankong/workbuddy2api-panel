@@ -24,6 +24,11 @@
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5
   },
+  "global": {
+    "enabled": true,
+    "chat_base": "",
+    "billing_base": ""
+  },
   "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,

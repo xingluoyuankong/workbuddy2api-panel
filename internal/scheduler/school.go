@@ -1,7 +1,7 @@
 // school.go 开学季管家：签到排程末尾自动「分享上报 → 领奖 → 抽奖」。
 //
 // 活动期 2026-09-13 ~ 09-24（每日刷新）：share_invite 判据为纯前端上报
-//（POST /tasks/share-complete，实测三账号即点亮），+100c + 1 次抽奖/天/号。
+// （POST /tasks/share-complete，实测三账号即点亮），+100c + 1 次抽奖/天/号。
 // chat_3_times / expert_use 判据绑定小程序原生沙箱会话，纯 API 不做（需人工）。
 // 活动结束后 in_period=false 自动跳过，无需下线代码。
 package scheduler
@@ -31,6 +31,9 @@ func (s *Scheduler) RunSchoolNow() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessToken == "" {
 			continue
+		}
+		if a.IsGlobal() {
+			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 		s.schoolAccount(a)
 		time.Sleep(activityAccountDelay)

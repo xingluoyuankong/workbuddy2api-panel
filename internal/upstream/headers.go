@@ -19,10 +19,16 @@ const (
 	// config upstream.cli_version 可覆盖（空 = 内置默认）。
 	defaultCliVersion = "2.137.1"
 
-	originRefererCN = "https://www.codebuddy.cn"
+	originRefererCN     = "https://www.codebuddy.cn"
+	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
+// originRefererFor 按账号 realm 返回 Origin/Referer 基础域：
+// global → https://www.workbuddy.ai；cn（含全局开关未开）→ https://www.codebuddy.cn。
 func originRefererFor(a *auth.Auth) string {
+	if a != nil && a.IsGlobal() {
+		return originRefererGlobal
+	}
 	return originRefererCN
 }
 
@@ -43,19 +49,35 @@ func (c *Client) cliVersion() string {
 	return defaultCliVersion
 }
 
-// defaultWorkBuddyUA 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
-// `WorkBuddy/<clientVersion> WorkBuddy/<clientVersion> CLI/<cliVersion>`。
-func (c *Client) defaultWorkBuddyUA() string {
-	return "WorkBuddy/" + c.clientVersion() + " WorkBuddy/" + c.clientVersion() + " CLI/" + c.cliVersion()
+// defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
+// `WorkBuddy/<clientVersion> <platform>/<clientVersion> CLI/<cliVersion>`。
+// 平台段（第二段）品牌按 realm 切换——CN 用 applicationName 同值 `WorkBuddy`，
+// global 用官方国际版 productName `WorkBuddy AI`（intl 项目逆向证据：
+// `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`）。
+// global 账号送错平台段（`WorkBuddy` 非 `WorkBuddy AI`）可能触发上游 403 code 11140
+// "request illegal" 风控。官方无任何 UA 随机化，故默认确定性。
+func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
+	platform := "WorkBuddy"
+	if a != nil && a.IsGlobal() {
+		platform = "WorkBuddy AI"
+	}
+	return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
 }
 
-// userAgent 返回当前出站 UA（客户端出站路径）：
-// Client.UserAgent（config user_agent）显式覆盖 > 默认 WorkBuddy 三段式。
-func (c *Client) userAgent() string {
+// defaultWorkBuddyUA 返回 CN 形态的默认 UA（默认账号形态即 CN，零回归兼容既有调用/测试）。
+func (c *Client) defaultWorkBuddyUA() string {
+	return c.defaultWorkBuddyUAFor(nil)
+}
+
+// userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
+// 优先级：Client.UserAgent（config user_agent）显式覆盖 > 按账号 realm 的默认 WorkBuddy 三段式。
+// 显式覆盖兼容既有覆盖逻辑：用户配了即以用户值为准（自定义品牌/版本），
+// 未配则走官方桌面端默认形态（global 换 `WorkBuddy AI` 平台段）。
+func (c *Client) userAgent(a *auth.Auth) string {
 	if c != nil && c.UserAgent != "" {
 		return c.UserAgent
 	}
-	return c.defaultWorkBuddyUA()
+	return c.defaultWorkBuddyUAFor(a)
 }
 
 // billingUA 白名单类（billing/checkin/banner）出站 UA：单段 `WorkBuddy/<clientVersion>`
@@ -101,11 +123,20 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	origin := originRefererFor(a)
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("User-Agent", c.userAgent())
+	req.Header.Set("User-Agent", c.userAgent(a))
 	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
 	req.Header.Set("X-CodeBuddy-Request", "1")
-	// Accept-Language 对齐官方客户端语言标识（D5，CN 域 zh-CN）。
-	req.Header.Set("Accept-Language", "zh-CN")
+	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
+	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
+	req.Header.Set("Accept-Language", acceptLanguageFor(a))
+}
+
+// acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
+func acceptLanguageFor(a *auth.Auth) string {
+	if a != nil && a.IsGlobal() {
+		return "en-US"
+	}
+	return "zh-CN"
 }
 
 // injectCodeBuddyRequest 在 req 注入 X-CodeBuddy-Request: 1。
@@ -144,16 +175,24 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	} else {
 		req.Header.Set("X-No-User-Id", "1")
 	}
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-	} else {
-		req.Header.Set("X-No-Enterprise-Id", "1")
-	}
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	// 企业与域头按 realm 分发：CN 走既有分支（EnterpriseID/Domain 原样透传，缺省 X-No-*）；
+	// global 账号由 injectGlobalChatHeaders 统一覆写为国际客户端形态
+	// （X-No-Enterprise-Id=1 声明无企业 + X-Domain=www.workbuddy.ai 声明国际版域），
+	// 且不回退 X-Domain 到登录会话原值——对齐 intl 项目出站头。
+	if a != nil && !a.IsGlobal() {
+		if a.EnterpriseID != "" {
+			req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+		} else {
+			req.Header.Set("X-No-Enterprise-Id", "1")
+		}
+		if a.Domain != "" {
+			req.Header.Set("X-Domain", a.Domain)
+		} else {
+			req.Header.Set("X-No-Department-Info", "1")
+		}
 	} else {
-		req.Header.Set("X-No-Department-Info", "1")
+		c.injectGlobalChatHeaders(req, a)
 	}
 	// 用量归属头：默认伪造 WorkBuddy 桌面端指纹（client_name="SaaS" 还原旧行为）。
 	c.injectAttribution(req)
@@ -163,6 +202,20 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.injectDeviceToken(req, a)
 	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
 	c.injectConversationHeaders(req, meta)
+}
+
+// injectGlobalChatHeaders global 账号（无企业 ID）的 chat 专属声明头，对齐 intl 项目
+// （ANALYSIS-global-chat-solutions.md）：
+//   - X-No-Enterprise-Id: 1  个人账号无企业 ID，显式声明（避免上游按缺省/可疑判定）
+//   - X-Domain: www.workbuddy.ai  显式声明国际版域（与 Origin/Referer 同域）
+//
+// 仅 global realm 注入；CN 账号走既有 X-No-Department-Info 等分支，零回归。
+func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
+	if a == nil || !a.IsGlobal() {
+		return
+	}
+	req.Header.Set("X-No-Enterprise-Id", "1")
+	req.Header.Set("X-Domain", "www.workbuddy.ai")
 }
 
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
@@ -288,8 +341,8 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	c.injectCodeBuddyRequest(req)
-	// Accept-Language 对齐官方客户端（D5，billing 域未走 CommonHeaders，单独注入）。
-	req.Header.Set("Accept-Language", "zh-CN")
+	// Accept-Language 按 realm 切（D5，billing 域未走 CommonHeaders，单独注入）。
+	req.Header.Set("Accept-Language", acceptLanguageFor(a))
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	} else if ua := c.billingUA(); ua != "" {
