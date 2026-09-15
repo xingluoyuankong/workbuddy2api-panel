@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -104,6 +105,19 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	// maxBodyBytes 请求体上限的运行期值（cfg.MaxBodyBytes 的原子镜像）。
+	// 面板在线改 server.max_body_mb 时经 SetMaxBodyBytes 热生效，无需重启
+	// （issue #17：改了配置却静默不生效，用户仍被 8MB 413 拦截）。
+	maxBodyBytes atomic.Int64
+}
+
+// SetMaxBodyBytes 热更新请求体上限（面板保存配置路径调用）。
+// n<=0 与 NewHandler 兜底口径一致：回落 8MB。
+func (h *Handler) SetMaxBodyBytes(n int64) {
+	if n <= 0 {
+		n = 8 << 20
+	}
+	h.maxBodyBytes.Store(n)
 }
 
 // NewHandler 构建 handler。
@@ -124,6 +138,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h.maxBodyBytes.Store(cfg.MaxBodyBytes)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -373,7 +388,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 超限直接 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
 	// unmarshal 报 unexpected EOF，网关却罚号轮空）。
 	// 413 是网关侧的客户端问题，不打上游、不罚账号、不轮转。
-	limit := h.cfg.MaxBodyBytes
+	limit := h.maxBodyBytes.Load()
 	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
@@ -381,7 +396,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if int64(len(body)) > limit {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large",
-			fmt.Sprintf("请求体超过 %d MB 上限：请压缩内容或调大 server.max_body_mb 配置后重试", limit>>20))
+			fmt.Sprintf("请求体超过 %d MB 上限：多图/长上下文会话易触发（历史图片每轮以 base64 重发）；请压缩图片或调大 server.max_body_mb（面板修改即时生效）后重试", limit>>20))
 		return
 	}
 	var peek struct {

@@ -196,6 +196,47 @@ func TestChatOversizedBodyDefaultLimit(t *testing.T) {
 	}
 }
 
+// TestSetMaxBodyBytesHotApply 面板在线改 server.max_body_mb 必须即时生效（issue #17：
+// 改了配置却静默不生效，用户仍被旧上限 413）。同一请求体：调小后 413、调大后放行，
+// 全程不重建 handler。另覆盖 setter 的 <=0 兜底（回落 8MB）。
+func TestSetMaxBodyBytesHotApply(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 100})
+
+	// 尾部空格不影响 JSON 合法性，只把请求体撑过 100 字节。
+	body := []byte(`{"model":"glm-5.2","messages":[]}` + strings.Repeat(" ", 128))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code=%d want 413 (body 228B > limit 100B)", rec.Code)
+	}
+
+	h.SetMaxBodyBytes(4096) // 面板保存路径的热更新
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200 after enlarge (limit 4096B)", rec.Code)
+	}
+	if calls != 1 {
+		t.Errorf("upstream calls = %d, want 1（放行后应恰好打一次）", calls)
+	}
+
+	// <=0 兜底回落 8MB：8MB+1 仍拒，8MB-1 放行。
+	h.SetMaxBodyBytes(0)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		bytes.NewReader(append(body, make([]byte, 8<<20)...))))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code=%d want 413 (fallback 8MB, body > 8MB)", rec.Code)
+	}
+}
+
 // TestChatBadParamsRotatesWithoutPenalty 上游 400 + Unmarshal chat params failed（11101）
 // → 该类归 ErrBadParams：不罚账号（无冷却/无禁用/无熔断计数/无 errTotal），但**仍然轮转**
 // （换号重试可能命中不同权限的账号）。端到端断言 bad 失败、good 成功、账号完好。
