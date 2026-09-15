@@ -64,7 +64,7 @@ type Config struct {
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
-		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"`  // 缺省 5；<=0 回落 5
+		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
 	} `json:"schedule"`
 
 	Upstream struct {
@@ -101,9 +101,9 @@ type Config struct {
 	} `json:"features"`
 
 	Prompt struct {
-		// Mode custom（默认）= 网关用自有系统提示词替换客户端 system/developer；
-		// passthrough = 透传客户端原始 system（降级重试仍会切到 Degraded）。
-		Mode string `json:"mode"` // "custom" / "passthrough"
+		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
+		// custom = 网关用自有系统提示词替换客户端 system/developer。
+		Mode string `json:"mode"` // "passthrough" / "custom"
 		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
 		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
 		File string `json:"file"`
@@ -124,6 +124,9 @@ type Config struct {
 		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
+		// 此窗口内的积分被标记为"快过期"，选号优先消耗。空/0 = 禁用分桶。
+		ExpiringSoon string `json:"expiring_soon"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -140,6 +143,7 @@ type Config struct {
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
+	ExpiringSoonDur        time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -172,13 +176,14 @@ func Default() *Config {
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
 	c.Features.SanitizeBlacklistFingerprints = true
-	c.Prompt.Mode = "custom" // 缺省 custom：网关自有提示词从源头消灭 system 指纹误报
+	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
 	c.Pool.BreakerCooldownMax = "6h"
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
+	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -335,6 +340,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
 		c.Prompt.File = v
 	}
+	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
+		c.Pool.ExpiringSoon = v
+	}
 }
 
 func (c *Config) normalize() error {
@@ -365,6 +373,12 @@ func (c *Config) normalize() error {
 	}
 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+	}
+	// 快过期窗口：空 = 禁用（ExpiringSoonDur 0）；非空必须可解析（拼写错误 fail fast）。
+	if c.Pool.ExpiringSoon != "" {
+		if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {
+			return fmt.Errorf("pool.expiring_soon: %w", err)
+		}
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
@@ -426,12 +440,12 @@ func (c *Config) normalize() error {
 // passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
 func (c *Config) normalizePrompt() error {
 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
-	case "", "custom":
-		c.Prompt.Mode = "custom"
-	case "passthrough":
+	case "", "passthrough":
 		c.Prompt.Mode = "passthrough"
+	case "custom":
+		c.Prompt.Mode = "custom"
 	default:
-		return fmt.Errorf("prompt.mode: %q 不是合法值（custom / passthrough）", c.Prompt.Mode)
+		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom）", c.Prompt.Mode)
 	}
 	if c.Prompt.Mode == "custom" {
 		text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)

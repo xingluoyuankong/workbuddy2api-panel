@@ -11,13 +11,22 @@ import (
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
-	return PrepareBodyOptWithEfforts(src, sanitize, nil)
+	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, nil, nil)
 }
 
 // PrepareBodyOptWithEfforts 在 PrepareBodyOpt 基础上按模型 supportedEfforts 降级 reasoning_effort：
 // 仅当请求显式携带且模型不支持该档位时，改为 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档；
 // 未知模型/未知档位/未携带该字段一律透传。efforts 为 nil 表示未知（不降级）。
+//
+// 向后兼容封装：不传 defaultEfforts（无模型声明默认档），thinking.go 回退硬编码 high。
 func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) []byte {
+	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, efforts, nil)
+}
+
+// PrepareBodyOptWithEffortsAndDefault 完整管线：efforts 降级 + thinking.go 按
+// defaultEfforts（模型声明默认档）补档。defaultEfforts 为 nil 时与旧行为一致
+// （deepseek 缺档回退硬编码 high）。
+func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -26,12 +35,18 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	obj["stream"] = true
+	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
+	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
+	if _, has := obj["stream_options"]; !has {
+		obj["stream_options"] = map[string]any{"include_usage": true}
+	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
-	injectThinking(obj)
+	modelName, _ := obj["model"].(string)
+	injectThinking(obj, lookupDefaultEffort(defaultEfforts, modelName))
 	normalizeReasoningEffort(obj, efforts)
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。

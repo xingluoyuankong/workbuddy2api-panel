@@ -66,16 +66,25 @@ func (p *Pool) RestoreFromSnapshot() {
 // Acquire 为账号占一个在途名额；false 表示该账号已达上限（或不存在）。
 // 必须在成功 Pick 后调用；调用方负责 defer Release。
 func (p *Pool) startFlusher() {
-	interval := flushInterval // 在启动 goroutine 前同步读取，避免与测试对 flushInterval 的恢复写竞争
+	stopCh := make(chan struct{})
+	// 在启动 goroutine 前同步写入（避免与测试对 flushInterval 的恢复写竞争）；
+	// stopCh 同步登记，Close 才能可靠停止（New 与 startFlusher 之间无并发窗口）。
+	p.stopCh = stopCh
+	interval := flushInterval
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
-		for range t.C {
-			p.mu.Lock()
-			if p.dirty.Swap(false) {
-				p.saveLocked()
+		for {
+			select {
+			case <-t.C:
+				p.mu.Lock()
+				if p.dirty.Swap(false) {
+					p.saveLocked()
+				}
+				p.mu.Unlock()
+			case <-stopCh:
+				return
 			}
-			p.mu.Unlock()
 		}
 	}()
 }

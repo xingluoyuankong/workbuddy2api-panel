@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"sync"
 	"time"
@@ -320,17 +321,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
-	sessKey := ""
+	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
+	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
+	sessKey := session.ExtractKey(body)
 	stickyUID := ""
-	if h.cfg.Session != nil {
-		sessKey = session.ExtractKey(body)
-		if sessKey != "" {
-			// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
-			// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-			if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
-				stickyUID = uid
-			}
+	if h.cfg.Session != nil && sessKey != "" {
+		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
+		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
+		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
+			stickyUID = uid
 		}
+	}
+
+	// 轮级兜底聚合键：无会话键的客户端（OpenAI 兼容协议——dsh / Codex / Cherry
+	// Studio 等请求体里既无 conversationId 也无 metadata）sessKey 恒空，会话头族的
+	// 聚合主键只能逐请求新生成，agent 多轮在上游用量明细里仍是一条请求一条记录。
+	// 这里按 body 里最后一条 user 消息派生轮级键（同轮内所有上游调用同键）。
+	// 必须在下方 prompt.Rewrite 之前取——改写会动 messages 内容，之后取会让键漂移。
+	turnKey := ""
+	if sessKey == "" {
+		turnKey = session.TurnKey(body)
 	}
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
@@ -389,6 +399,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		degradedApplied = true
 	}
 
+	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID（对话轮级）聚合请求，
+	// 官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。此处**轮转
+	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
+	// 碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个
+	// RequestID）。
+	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造）；
+	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先，否则按
+	//     粘性 key 进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID），
+	//     无 user 消息时退化成本请求级随机——轮转内捕获一次即共享；
+	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
+	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
+		chatMeta.ConversationRequestID = v
+	} else if sessKey != "" {
+		chatMeta.ConversationRequestID = session.RequestIDForKey(sessKey)
+	} else {
+		// 无会话键客户端：轮级兜底——同轮内 tool call 多轮 / 换号重试 / 降级重发
+		// 共享同键，用户发下一条消息自动换键。
+		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
+	}
+	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUID 已校验 health + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -443,7 +475,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 		attemptStarted := time.Now()
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, clientIP)
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(acct, r.Context(), body, clientIP, chatMeta)
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
@@ -459,7 +491,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			kind := upstream.Classify(status, string(respBody))
 			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试。
-			// 第二次仍被拦（用户内容本身触发审核）→ 走既有错误路径返回客户端。
+			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
 			if kind == upstream.ErrContentBlocked && h.cfg.PromptMode == "passthrough" && !degradedApplied {
 				h.degrade.Trigger()
@@ -469,6 +501,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				releaseHeld()
 				log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
 				continue
+			}
+			if kind == upstream.ErrContentBlocked {
+				// 内容命中网关内容防火墙：立即回客户端，**不轮转**、不暴露账号/冷却/上游错误码
+				// （此前会落到 503 no_healthy_account + lastErr 泄露 11128 与账号语义）。
+				// 不罚账号（ErrContentBlocked 分支无冷却/熔断/NoteError），但 content_blocked
+				// 是本请求的终态——换任何账号都会撞同一审核，轮转纯属浪费时间。
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
+				fail(acct.UID)
+				msg := upstream.ContentBlockedClientMessage(string(respBody))
+				writeOpenAIError(w, http.StatusBadRequest, "content_blocked", msg)
+				st.status = http.StatusBadRequest
+				return
 			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
@@ -563,6 +607,20 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
+	case upstream.ErrAccountFault:
+		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
+		//   - "request illegal"（code 11140）→ 账号级**授权封禁**：软冷却到期也不会自动
+		//     恢复（需重新 OAuth 登录），到期后重新选号只会再撞 403 浪费一次轮换——
+		//     硬禁用（Disable），不再参与选号。面板以 disabled + disabled_reason 呈现。
+		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
+		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
+		// 两条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
+		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
+		if strings.Contains(strings.ToLower(body), "request illegal") {
+			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+			return
+		}
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)

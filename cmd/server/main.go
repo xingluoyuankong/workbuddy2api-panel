@@ -28,7 +28,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.6.3-panel"
+const appVersion = "1.7.0-panel"
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
@@ -65,7 +65,7 @@ func main() {
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
 
 	p := pool.New(cfg.StateFile)
-	defer p.Flush() // 进程退出前强制落盘（后台 flush 每 5s 一次，退出时补一次）
+	defer p.Close() // 进程退出前停后台落盘 goroutine + 最后补一次落盘（消除 goroutine 泄漏）
 	p.SetStore(store)
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
@@ -84,9 +84,9 @@ func main() {
 	}
 	if cfg.SessionSticky.Enabled {
 		sessRouter = session.New(session.Config{
-			TTL:        cfg.SessionTTL,
-			GCInterval: cfg.SessionGCInterval,
-			Store:      store,
+			TTL:               cfg.SessionTTL,
+			GCInterval:        cfg.SessionGCInterval,
+			Store:             store,
 			Available:         p.AvailableUIDs,
 			AvailableForModel: p.AvailableUIDsForModel,
 		})
@@ -124,18 +124,20 @@ func main() {
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
 
 	sch := scheduler.New(scheduler.Config{
-		Pool:              p,
-		Upstream:          up,
-		CheckinHours:      cfg.Schedule.CheckinHours,
-		TravelHours:       cfg.Schedule.TravelHours,
-		ActivityHours:     cfg.Schedule.ActivityHours,
-		KeepaliveHours:    cfg.Schedule.KeepaliveHours,
-		BlackcatHours:     cfg.Schedule.BlackcatHours,
-		CheckinDisabled:   !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:    !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:  !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
-		BlackcatDisabled:  !cfg.Schedule.BlackcatEnabled,
+		Pool:           p,
+		Upstream:       up,
+		CheckinHours:   cfg.Schedule.CheckinHours,
+		TravelHours:    cfg.Schedule.TravelHours,
+		ActivityHours:  cfg.Schedule.ActivityHours,
+		KeepaliveHours: cfg.Schedule.KeepaliveHours,
+		BlackcatHours:  cfg.Schedule.BlackcatHours,
+		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
+		ExpiringSoonWindow: cfg.ExpiringSoonDur,
+		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:     !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
+		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -226,6 +228,13 @@ func main() {
 		Addr:              cfg.Listen,
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
+		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
+		// 取值大于 MaxBodyMB 在常规带宽下的上传耗时；聊天请求体上限默认 8MB。
+		ReadTimeout: 60 * time.Second,
+		// IdleTimeout keep-alive 空闲连接回收：配合 chat 出站 ctx 传播防连接泄漏堆积。
+		// 注意：SSE 流式响应期间连接非空闲，不受此项掐断；不设全局 WriteTimeout
+		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
+		IdleTimeout: 120 * time.Second,
 	}
 	go func() {
 		<-ctx.Done()

@@ -12,7 +12,7 @@
 //   - template_5 / playbook_prompt / create_canvas：asar 逆向出的判据事件
 //     （template_used / playbook_prompt_send / wbx_design_canvas_*），纯 API 可点亮（三账号实测）
 //   - expert_5 / Expert_team_use_3：真实专家列表 + 召唤链 + 真实 chat（服务端 requestId）
-//     + expert_actual_use（三账号实测）
+//   - expert_actual_use（三账号实测）
 //   - Hp_Appearance：appearance/set + appearance_skin_apply 事件（两账号实测）
 //
 // 仍未破解：skill_1（疑似要求真实 Skill 工具调用）。
@@ -380,7 +380,7 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 		},
 		"stream": true,
 	})
-	rc, status, respBody, err := p.cfg.Upstream.ChatStream(a, body, "")
+	rc, status, respBody, err := p.cfg.Upstream.ChatStream(a, body, "", upstream.ChatMeta{})
 	if err != nil {
 		return "", fmt.Errorf("对话请求: %w", err)
 	}
@@ -493,13 +493,13 @@ func runSkillFresh(p *Panel, a *auth.Auth) (string, error) {
 		}
 	}
 	events = append(events, upstream.DesktopEvent{
-		"eventCode": "skill_info",
-		"id":        "润泽小馆·日报撰写",
-		"skillId":   "skill_2097350077599879168",
-		"skillVersion": "1.0.0",
-		"toolStatus":   "success",
-		"fileCount":    56,
-		"source":       "workbuddy-desktop",
+		"eventCode":      "skill_info",
+		"id":             "润泽小馆·日报撰写",
+		"skillId":        "skill_2097350077599879168",
+		"skillVersion":   "1.0.0",
+		"toolStatus":     "success",
+		"fileCount":      56,
+		"source":         "workbuddy-desktop",
 		"conversationId": conv, "requestId": req, "messageId": msgID,
 		"requestModelId": "fast-model", "requestModelName": "fast-model",
 		"traceId": req,

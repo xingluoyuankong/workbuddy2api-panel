@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 const (
@@ -58,9 +59,10 @@ func (c *Client) userAgent() string {
 }
 
 // billingUA 白名单类（billing/checkin/banner）出站 UA：单段 `WorkBuddy/<clientVersion>`
-// （官方 banner 显式覆写形态，不带 CLI 段）。仅当 client_name 配置（非空）才生效。
+// （官方 banner 显式覆写形态，不带 CLI 段）。默认生效（伪造官方桌面端指纹）；
+// 显式 client_name="SaaS" 才不设 UA（还原旧行为，Go 默认 UA）。
 func (c *Client) billingUA() string {
-	if c == nil || c.ClientName == "" {
+	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""
 	}
 	return "WorkBuddy/" + c.clientVersion()
@@ -92,20 +94,46 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 // CommonHeaders 设置所有 API 共享的请求头。
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
+	// Accept 非流式默认 application/json（D6：去掉宽松的 text/plain, */*）。
+	// chat 流式路径在 ChatHeaders 覆盖为 event-stream。
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	origin := originRefererFor(a)
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", c.userAgent())
+	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
+	req.Header.Set("X-CodeBuddy-Request", "1")
+	// Accept-Language 对齐官方客户端语言标识（D5，CN 域 zh-CN）。
+	req.Header.Set("Accept-Language", "zh-CN")
+}
+
+// injectCodeBuddyRequest 在 req 注入 X-CodeBuddy-Request: 1。
+// billing 域未走 CommonHeaders，单独注入保证全出站覆盖（D1）。
+func (c *Client) injectCodeBuddyRequest(req *http.Request) {
+	req.Header.Set("X-CodeBuddy-Request", "1")
+}
+
+// ChatMeta 一次 chat 出站的会话头族元数据（issue #35：后台按 X-Conversation-Request-ID
+// 聚合请求，官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID）。
+// handler 在轮转循环外生成 conversationID / conversationRequestID，循环内每次出站
+// 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
+// messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
+type ChatMeta struct {
+	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
+	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
+	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
 }
 
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
 // 缺省字段用 X-No-* 约定（与 CodeBuddy 官方 CLI 一致）。
 // clientIP 为本次请求的客户端 IP（按参数传递，不读共享字段——避免并发串扰）；
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
-func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string) {
+// meta 为会话头族元数据（纯新增，不改既有头），见 injectConversationHeaders。
+func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
 	c.CommonHeaders(req, a)
+	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
+	req.Header.Set("Accept", "application/json, text/event-stream")
 	if a.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	} else {
@@ -127,26 +155,100 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string) {
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
-	// 用量归属头：ClientName 非空则四头跟随（对齐官方桌面端），空则保持 X-Product="SaaS"。
+	// 用量归属头：默认伪造 WorkBuddy 桌面端指纹（client_name="SaaS" 还原旧行为）。
 	c.injectAttribution(req)
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
 	c.injectDeviceToken(req, a)
+	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
+	c.injectConversationHeaders(req, meta)
+}
+
+// injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
+// 头族分四层，各司其职：
+//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
+//     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
+//   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
+//     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
+//   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex）。
+//   - X-Root-Request-ID：= conversationRequestID（根请求追踪）。
+//   - X-Trace-ID：入站透传或 = conversationRequestID。
+//   - X-B3-TraceId / X-B3-SpanId / X-B3-Sampled：链路族。B3 规范只认 16/32 hex
+//     TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId 回落
+//     messageID（恒 32 hex），SpanId 取 messageID[:16]（每消息新）。
+func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
+	convReqID := meta.ConversationRequestID
+	if convReqID == "" {
+		// 零值 meta（直接调 ChatHeaders 的调用方/测试）也要保证聚合主键必发：
+		// 本级补一个 32 hex，调用方（handler）已生成稳定的不走到这里。
+		convReqID = session.NewMessageID()
+	}
+	messageID := session.NewMessageID()
+	if meta.ConversationID != "" {
+		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+	}
+	req.Header.Set("X-Conversation-Request-ID", convReqID)
+	req.Header.Set("X-Conversation-Message-ID", messageID)
+	req.Header.Set("X-Request-ID", messageID)
+	req.Header.Set("X-Root-Request-ID", convReqID)
+	traceID := meta.TraceID
+	if traceID == "" {
+		traceID = convReqID
+	}
+	req.Header.Set("X-Trace-ID", traceID)
+	b3Trace := convReqID
+	if !validTraceID(b3Trace) {
+		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
+	}
+	req.Header.Set("X-B3-TraceId", b3Trace)
+	req.Header.Set("X-B3-SpanId", messageID[:16])
+	req.Header.Set("X-B3-Sampled", "1")
+}
+
+// validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。
+// 官方客户端生成的 conversationRequestId 是 32 位 hex（UUID 去横线），入站透传值
+// 可能是任意形状（含横线/超长/非 hex），直接塞进 B3 头会破坏链路关联（issue #35）。
+func validTraceID(s string) bool {
+	if len(s) != 16 && len(s) != 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// attributionClientName 生效的用量归属名：ClientName 非空取之；
+// 空默认 "WorkBuddy"（伪造官方桌面端指纹；显式配 "SaaS" 可还原旧行为）。
+func (c *Client) attributionClientName() string {
+	if c != nil && c.ClientName != "" {
+		return c.ClientName
+	}
+	return "WorkBuddy"
 }
 
 // injectAttribution 注入用量归属头（X-Agent-Purpose / X-IDE-* / X-Product）。
-// ClientName 非空时全量跟随该值，空则只保留 X-Product="SaaS"（旧行为，向后兼容）。
+// 仅在 chat/completions 路径生效（ChatHeaders 调用）。
+//
+// 默认（ClientName 空）即对齐官方 WorkBuddy 桌面端指纹：X-Agent-Purpose="conversation"
+// + X-IDE-Name/Type/Product="WorkBuddy" + X-IDE-Version=client_version，上游用量归因
+// 不再出现 client/agentPurpose 为空的「网关特征」。显式 ClientName="SaaS" 还原旧行为
+// （仅 X-Product="SaaS"，不设 X-IDE-*）；配其他值则四头跟随该值。
 func (c *Client) injectAttribution(req *http.Request) {
-	if c == nil || c.ClientName == "" {
+	name := c.attributionClientName()
+	if name == "SaaS" {
 		req.Header.Set("X-Product", "SaaS")
 		return
 	}
 	req.Header.Set("X-Agent-Purpose", "conversation")
-	req.Header.Set("X-IDE-Name", c.ClientName)
-	req.Header.Set("X-IDE-Type", c.ClientName)
+	req.Header.Set("X-IDE-Name", name)
+	req.Header.Set("X-IDE-Type", name)
 	req.Header.Set("X-IDE-Version", c.clientVersion())
-	req.Header.Set("X-Product", c.ClientName)
+	req.Header.Set("X-Product", name)
 }
 
 // injectClientIP 在 PassthroughIP 开启时把 clientIP 参数透传给上游（三等价头）。
@@ -185,6 +287,9 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
+	c.injectCodeBuddyRequest(req)
+	// Accept-Language 对齐官方客户端（D5，billing 域未走 CommonHeaders，单独注入）。
+	req.Header.Set("Accept-Language", "zh-CN")
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	} else if ua := c.billingUA(); ua != "" {
@@ -211,5 +316,6 @@ func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
 	if a.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 	}
-	req.Header.Set("X-Auth-Refresh-Source", "workbuddy")
+	// X-Auth-Refresh-Source 对齐官方客户端 refresh 渠道标识 "plugin"（D3）。
+	req.Header.Set("X-Auth-Refresh-Source", "plugin")
 }

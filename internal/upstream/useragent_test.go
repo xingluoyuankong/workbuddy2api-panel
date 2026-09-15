@@ -21,7 +21,8 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 // TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent/client_name 空）行为：
 // chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（report/travel/balance）
-// 不设 UA 头（保持现状，Go 客户端自带默认 UA）。
+// 单段 WorkBuddy/<ver>（对齐官方 banner 白名单头组，默认伪造桌面端指纹）；
+// 显式 client_name="SaaS" 才还原"billing 不设 UA"的旧行为。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -31,7 +32,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 		{
 			name: "chat",
 			call: func(c *Client) error {
-				rc, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{"model":"glm-5.2","messages":[]}`), "")
+				rc, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
 				if status != 200 {
 					t.Fatalf("chat status=%d", status)
 				}
@@ -47,7 +48,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "",
+			wantUA: "WorkBuddy/5.5.4",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -91,7 +92,7 @@ func TestUserAgentOverrideAllOutbound(t *testing.T) {
 		UserAgent:     ua,
 	}
 	// chat
-	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), ""); status != 200 || err != nil {
+	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{}); status != 200 || err != nil {
 		t.Errorf("chat: status=%d err=%v", status, err)
 	} else if rc != nil {
 		rc.Close()
@@ -170,7 +171,7 @@ func TestUserAgentDefaultWorkBuddyShape(t *testing.T) {
 		ChatBaseCN:    "https://chat.example",
 		BillingBaseCN: "https://billing.example",
 	}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{})
 	if status != 200 || err != nil {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -205,7 +206,7 @@ func TestUserAgentExplicitOverride(t *testing.T) {
 		BillingBaseCN: "https://billing.example",
 		UserAgent:     explicitString,
 	}
-	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), ""); status != 200 || err != nil {
+	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{}); status != 200 || err != nil {
 		t.Errorf("chat: status=%d err=%v", status, err)
 	} else if rc != nil {
 		rc.Close()
@@ -229,7 +230,7 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
 		BillingBaseCN: "https://billing.example",
 		ClientVersion: "6.0.0",
 	}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{})
 	if status != 200 || err != nil {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -294,8 +295,8 @@ func TestBillingUA_WhenClientNameSet(t *testing.T) {
 	}
 }
 
-// TestBillingUA_WhenClientNameEmpty client_name 空 = 保持现状：不设 UA（Go 默认 UA），
-// 即使 version 配置了也不上 UA。
+// TestBillingUA_WhenClientNameEmpty client_name 空 = 默认对齐官方桌面端：
+// billing UA 单段 WorkBuddy/<clientVersion>；显式 client_name="SaaS" 才不设 UA。
 func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	var ua string
@@ -307,16 +308,21 @@ func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 		})},
 		ChatBaseCN:    "https://chat.example",
 		BillingBaseCN: "https://billing.example",
-		ClientVersion: "6.0.0", // 配置了版本但 client_name 空 → 仍不设 UA
+		ClientVersion: "6.0.0",
 	}
 	if _, _, err := c.UserResource(a); err != nil {
 		t.Errorf("userResource: %v", err)
 	}
-	if ua != "" {
-		t.Errorf("billing UA = %q want empty (client_name unset)", ua)
+	if ua != "WorkBuddy/6.0.0" {
+		t.Errorf("billing UA = %q want WorkBuddy/6.0.0 (default desktop fingerprint)", ua)
 	}
+	if got := c.billingUA(); got != "WorkBuddy/6.0.0" {
+		t.Errorf("billingUA() = %q want WorkBuddy/6.0.0", got)
+	}
+	// 显式 SaaS 还原旧行为（不设 UA）。
+	c.ClientName = "SaaS"
 	if got := c.billingUA(); got != "" {
-		t.Errorf("billingUA() = %q want empty", got)
+		t.Errorf("billingUA() SaaS = %q want empty", got)
 	}
 }
 

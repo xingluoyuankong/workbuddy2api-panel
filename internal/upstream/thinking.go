@@ -31,6 +31,16 @@ import (
 // 模型不支持 high 时自动落到 ≤high 的最高支持档。
 const defaultDeepSeekEffort = "high"
 
+// lookupDefaultEffort 从 FetchModels 缓存的 defaultEfforts 表按模型名查默认档。
+// nil map 或模型未缓存 → 空串（thinking.go 回退硬编码 high）。
+// 键为模型 ID 原样（与 efforts 缓存对齐：normalizeReasoningEffort 精确匹配 model）。
+func lookupDefaultEffort(defaultEfforts map[string]string, model string) string {
+	if len(defaultEfforts) == 0 || model == "" {
+		return ""
+	}
+	return defaultEfforts[model]
+}
+
 // isDeepSeekModel 模型名以 deepseek 为前缀（不区分大小写）。
 // 覆盖 deepseek-v4.1-flash / deepseek-v4-pro / deepseek-r1 等变体；
 // 前缀匹配对齐官方 thinkingFormat:"deepseek" 的判定口径，避免漏注。
@@ -107,7 +117,10 @@ func backfillReasoningContent(obj map[string]any) {
 //   - 显式 thinking.type 非空 → 客户端显式控制：enabled 缺 effort 时补默认档；
 //     disabled 尊重并删 reasoning_effort（snake/camel 双字段）。
 //   - 无 thinking / type 空 / 已有 effort → 注入 enabled 并补默认档（已有 effort 不覆盖）。
-func injectThinking(obj map[string]any) {
+//
+// defaultEffort 为该模型声明的默认档（来自 FetchModels 缓存 reasoning.defaultEffort）；
+// 空串时回退硬编码 defaultDeepSeekEffort（向后兼容）。
+func injectThinking(obj map[string]any, defaultEffort string) {
 	model, _ := obj["model"].(string)
 	if !isDeepSeekModel(model) {
 		return
@@ -125,7 +138,7 @@ func injectThinking(obj map[string]any) {
 			delete(obj, "reasoningEffort")
 			return // disabled：关思考且不带任何 effort（照抄客户端 case 行为）
 		}
-		ensureDeepSeekEffort(obj) // 显式 enabled 缺 effort → 补默认档
+		ensureDeepSeekEffort(obj, defaultEffort) // 显式 enabled 缺 effort → 补默认档
 		return
 	}
 	// 无 thinking（或 thinking 非法非对象值）或 thinking 对象 type 缺失/为空：
@@ -136,12 +149,13 @@ func injectThinking(obj map[string]any) {
 	} else {
 		th["type"] = "enabled"
 	}
-	ensureDeepSeekEffort(obj)
+	ensureDeepSeekEffort(obj, defaultEffort)
 }
 
 // ensureDeepSeekEffort 缺 effort 档位时补默认档（snake 优先，camel 兜底）。
 // 已有任一 effort → 不覆盖（显式档位不做任何改写，降级交给 normalizeReasoningEffort）。
-func ensureDeepSeekEffort(obj map[string]any) {
+// defaultEffort 空串 → 回退 defaultDeepSeekEffort（硬编码 "high"）。
+func ensureDeepSeekEffort(obj map[string]any, defaultEffort string) {
 	_, hasSnake := obj["reasoning_effort"]
 	if hasSnake {
 		return
@@ -150,5 +164,8 @@ func ensureDeepSeekEffort(obj map[string]any) {
 	if hasCamel {
 		return
 	}
-	obj["reasoning_effort"] = defaultDeepSeekEffort
+	if defaultEffort == "" {
+		defaultEffort = defaultDeepSeekEffort
+	}
+	obj["reasoning_effort"] = defaultEffort
 }

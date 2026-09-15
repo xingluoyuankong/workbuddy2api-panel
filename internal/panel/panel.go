@@ -242,6 +242,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			"supported_efforts":    mi.Efforts,
 			"can_disable_thinking": mi.CanDisableThinking,
 			"supports_reasoning":   mi.SupportsReasoning,
+			"supports_images":      mi.SupportsImages,
 			"credits":              mi.Credits,
 		})
 	}

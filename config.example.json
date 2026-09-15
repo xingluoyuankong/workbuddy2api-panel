@@ -40,7 +40,7 @@
     "sanitize_blacklist_fingerprints": true
   },
   "prompt": {
-    "mode": "custom",
+    "mode": "passthrough",
     "file": ""
   },
   "upstash": {
@@ -53,7 +53,8 @@
     "breaker_cooldown": "30m",
     "breaker_cooldown_max": "6h",
     "idle_weight_per_hour": 0.5,
-    "idle_weight_max": 5.0
+    "idle_weight_max": 5.0,
+    "expiring_soon": "168h"
   },
   "session_sticky": {
     "enabled": true,

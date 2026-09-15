@@ -35,6 +35,15 @@ type Pool struct {
 	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
+	// pickSeq 单调递增的选号序号：每次 pick 选中账号时自增并记到 entry.usedSeq，
+	// 为 LRU 兜底/防惊群提供与 time.Now() 精度无关的严格全序（Windows ~0.5ms 精度下
+	// lastUsed 墙钟会全等）。仅 pick 写锁路径读写，无需 atomic。
+	pickSeq uint64
+	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
+	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
+	stopCh chan struct{}
+	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
+	closeOnce sync.Once
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -53,6 +62,19 @@ func New(stateFp string) *Pool {
 		p.startFlusher()
 	}
 	return p
+}
+
+// Close 停止后台落盘 goroutine 并做最后一次落盘（幂等）。
+// 进程退出前调用，消除 startFlusher 的 goroutine 泄漏；不调用也不影响正确性
+// （进程退出即回收），仅是生命周期卫生。
+func (p *Pool) Close() {
+	if p.stopCh == nil {
+		return
+	}
+	p.closeOnce.Do(func() {
+		close(p.stopCh)
+	})
+	p.Flush()
 }
 
 // SetBreaker 注入熔断器参数（main 从 config 解析后调用）。非正值保留原值（用默认）。

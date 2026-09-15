@@ -145,3 +145,69 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 		})
 	}
 }
+
+// TestPrepareBodyStreamOptions body 未显式带 stream_options 时注入
+// {include_usage: true}（D7，官方 CLI 流式必发）；body 已带则不覆盖。
+func TestPrepareBodyStreamOptions(t *testing.T) {
+	out := PrepareBodyOptWithEfforts([]byte(`{"model":"glm-5.2","messages":[]}`), false, nil)
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v (out=%s)", err, out)
+	}
+	so, ok := obj["stream_options"].(map[string]any)
+	if !ok {
+		t.Fatalf("stream_options not injected: %v", obj["stream_options"])
+	}
+	if so["include_usage"] != true {
+		t.Errorf("stream_options.include_usage = %v want true", so["include_usage"])
+	}
+
+	out2 := PrepareBodyOptWithEffertsPreserve(t, `{"model":"glm-5.2","messages":[],"stream_options":{"include_usage":false}}`)
+	obj2, err := decodeBody(out2)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	so2, ok := obj2["stream_options"].(map[string]any)
+	if !ok {
+		t.Fatalf("stream_options lost: %v", obj2["stream_options"])
+	}
+	if so2["include_usage"] != false {
+		t.Errorf("stream_options.include_usage = %v want false (not overwritten)", so2["include_usage"])
+	}
+}
+
+// PrepareBodyOptWithEffertsPreserve helper：PrepareBodyOptWithEfforts 包装。
+func PrepareBodyOptWithEffertsPreserve(t *testing.T, body string) []byte {
+	t.Helper()
+	return PrepareBodyOptWithEfforts([]byte(body), false, nil)
+}
+
+// decodeBody helper：解析 body JSON。
+func decodeBody(b []byte) (map[string]any, error) {
+	var obj map[string]any
+	err := json.Unmarshal(b, &obj)
+	return obj, err
+}
+
+// TestPrepareBodyDeterministic 序列化稳定性：同输入跑多遍出站字节级一致
+// （prompt_cache_key 前缀命中的前提——链中不得注入时间/随机/ID 类不确定源）。
+func TestPrepareBodyDeterministic(t *testing.T) {
+	inputs := []string{
+		`{"model":"glm-5.2","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"你好"}],"reasoning_effort":"high"}`,
+		`{"model":"deepseek-v4","messages":[{"role":"user","content":"写个函数"}],"tool_choice":{"type":"auto"},"tools":[{"type":"function","function":{"name":"f"}}]}`,
+		`{"model":"glm-5.3","messages":[{"role":"developer","content":"sys"},{"role":"user","content":[{"type":"text","text":"hi"}]}]}`,
+	}
+	for i, in := range inputs {
+		var first []byte
+		for round := 0; round < 5; round++ {
+			out := PrepareBodyOptWithEfforts([]byte(in), true, map[string][]string{"glm-5.2": {"off", "low", "high"}})
+			if round == 0 {
+				first = out
+				continue
+			}
+			if string(out) != string(first) {
+				t.Fatalf("input #%d round %d differs from round 0:\n%s\n%s", i, round, first, out)
+			}
+		}
+	}
+}

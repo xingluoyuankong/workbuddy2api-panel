@@ -625,18 +625,17 @@ func TestMaxBodyEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptDefaultCustom 默认 prompt.mode=custom 且 PromptText 为内置默认（非空）。
-func TestPromptDefaultCustom(t *testing.T) {
+// TestPromptDefaultPassthrough 默认 prompt.mode=passthrough（对齐上游：透传客户端
+// 原始 system 是更保守的缺省）；custom 由用户显式选择，此时 PromptText 为内置默认（非空）。
+func TestPromptDefaultPassthrough(t *testing.T) {
 	c, err := Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Prompt.Mode != "custom" {
-		t.Errorf("prompt.mode=%q want custom", c.Prompt.Mode)
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("prompt.mode=%q want passthrough", c.Prompt.Mode)
 	}
-	if c.PromptText == "" {
-		t.Error("PromptText should be non-empty (built-in default)")
-	}
+	// passthrough 不加载提示词文本（透传客户端 system）；切 custom 时 normalize 会加载。
 }
 
 // TestPromptExplicitPassthrough passthrough 模式不加载文本（透传客户端原始 system）。
@@ -710,7 +709,7 @@ func TestPromptEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 仍 custom。
+// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 缺省 passthrough。
 func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
@@ -719,8 +718,8 @@ func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Prompt.Mode != "custom" {
-		t.Errorf("legacy config should default to custom, got %q", c.Prompt.Mode)
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("legacy config should default to passthrough, got %q", c.Prompt.Mode)
 	}
 	if c.Listen != ":9999" {
 		t.Errorf("listen=%q", c.Listen)
