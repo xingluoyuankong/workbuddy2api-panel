@@ -618,10 +618,10 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		return fmt.Errorf("no refreshToken")
 	}
 
-	url := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
+	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
 	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
 	if err != nil {
 		return err
 	}
@@ -706,8 +706,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		prepared = ensureConsoleSystem(prepared)
 	}
 	for attempt, path := range c.chatPaths(a) {
-		url := c.chatBase(a) + path
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
+		endpoint := c.chatBase(a) + path
+		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
 		if err != nil {
 			return nil, 0, nil, err
 		}
@@ -786,6 +786,7 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 // CLI 三段式 WorkBuddy UA 会拿到精简目录（flash 输出 128K、无 supportedEfforts）；
 // 官方 IDE 头 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 才返回完整能力
 // （flash：393216 + low/high/max）。
+// 版本号需随上游 IDE 发版跟进：UAn 版本过旧时该端点可能同样返回精简目录。
 const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
 
 // FetchModels 调上游动态模型接口。
@@ -793,8 +794,9 @@ const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
 // CLI 目录（/console/enterprises/personal/models）决定「能调哪些模型」；
 // IDE /v3/config 覆盖同名模型的窗口 / 思考档（失败则静默保留 CLI 字段）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
-	url := c.chatBase(a) + "/console/enterprises/personal/models"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	// 局部变量名避开 url（本包已 import net/url，同名会造成阅读混淆）。
+	endpoint := c.chatBase(a) + "/console/enterprises/personal/models"
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
