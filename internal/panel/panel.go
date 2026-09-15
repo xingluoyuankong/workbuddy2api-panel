@@ -59,10 +59,10 @@ type Panel struct {
 	started time.Time
 	logs    *Ring
 
-	// logins 进行中的 OAuth 设备授权会话（state → 创建时刻）。
+	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
 	loginMu sync.Mutex
-	logins  map[string]time.Time
+	logins  map[string]loginSession
 
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
@@ -105,6 +105,12 @@ func (p *Panel) unlockAccount(uid string) {
 // 防止"开了添加账号弹窗就走开"的会话永久滞留。
 const loginTTL = 15 * time.Minute
 
+// loginSession 进行中的 OAuth 会话：创建时刻 + realm（cn/global，用于落盘与端点切换）。
+type loginSession struct {
+	created time.Time
+	realm   string // "cn" / "global"，缺省 cn
+}
+
 // New 构建面板。
 func New(cfg Config) *Panel {
 	if cfg.RedisMode == "" {
@@ -115,7 +121,7 @@ func New(cfg Config) *Panel {
 		mux:     http.NewServeMux(),
 		started: time.Now(),
 		logs:    NewRing(500),
-		logins:  map[string]time.Time{},
+		logins:  map[string]loginSession{},
 	}
 	p.routes()
 	return p
@@ -132,6 +138,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
+	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))

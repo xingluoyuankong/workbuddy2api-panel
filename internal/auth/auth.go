@@ -111,6 +111,25 @@ func (a *Auth) BackfillRealm() (bool, string) {
 // RealmStored 直读持久化的 realm 标识（可能为空 = 未 backfill 的旧文件，Realm() 会 fallback）。
 func (a *Auth) RealmStored() string { return a.realm }
 
+// BackfillRealmFor 显式写入 realm 标识（包外登录路径使用：panel login 已知用户选了
+// global，直接落盘 realm=global，不依赖 domain 后缀推断）。realm 需为 cn/global，
+// 非法值报错（防写脏）。返回是否发生变更。
+func BackfillRealmFor(a *Auth, realm string) (bool, error) {
+	if a == nil {
+		return false, fmt.Errorf("nil auth")
+	}
+	switch strings.TrimSpace(realm) {
+	case "cn", "global":
+	default:
+		return false, fmt.Errorf("realm must be cn/global, got %q", realm)
+	}
+	if a.realm == realm {
+		return false, nil
+	}
+	a.realm = realm
+	return true, nil
+}
+
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
 func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 

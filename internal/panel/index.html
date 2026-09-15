@@ -227,6 +227,9 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
+.realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
+.realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
+.realm-opt input { accent-color: var(--accent); margin: 0; }
 .num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .usage-cell { min-width: 268px; }
 .usage-line {
@@ -672,7 +675,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="hint">浏览器完成腾讯账号登录，网关自动接续签到并载入账号池，无需重启。</div>
     </header>
     <div class="body">
-      <div id="addLoad" class="state"><span class="dots">正在获取授权链接</span></div>
+      <div id="addPick">
+        <div class="realm-row">
+          <span class="hint" style="font-size:12px">版本：</span>
+          <label class="realm-opt"><input type="radio" name="addRealm" value="cn" checked> 国内版（CN）</label>
+          <label class="realm-opt"><input type="radio" name="addRealm" value="global"> 国际版（Global）</label>
+        </div>
+        <div class="hint" style="font-size:12px;margin-top:2px">国际版账号需先在 web 端完成注册地区选择；登录后网关自动激活并领取试用额度。</div>
+      </div>
+      <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
       <div id="addReady" hidden>
         <div class="state">在浏览器打开以下链接并登录：</div>
         <div class="url" id="addUrl"></div>
@@ -683,6 +694,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     </div>
     <footer>
       <span class="grow"></span>
+      <button id="btnStartLogin" class="primary">获取授权链接</button>
       <button id="btnCopyUrl" hidden>复制链接</button>
       <button id="btnOpenUrl" class="primary" hidden>在浏览器打开</button>
       <button id="btnCloseAdd">关闭</button>
