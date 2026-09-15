@@ -20,6 +20,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
 // Config handler 依赖。
@@ -58,6 +59,11 @@ type Config struct {
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
+
+	// Usage 逐请求用量记录器（可选；nil = 不记录）。
+	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
+	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
+	Usage *usage.Recorder
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -461,6 +467,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			delta.TokensPerSecond = float64(delta.CompletionTokens) * 1000 / float64(latencyMs)
 		}
 		h.cfg.Pool.RecordTokenUsage(uid, delta)
+
+		// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试
+		// 没拿到任何 token 统计（传输错误 / >=400 / 解析失败），计为失败尝试。
+		// 失败也计入请求数——否则重试放大在「用量」视图里看不见。
+		if h.cfg.Usage != nil {
+			realm := "cn"
+			if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
+				realm = a.Realm
+			}
+			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
+				PromptTokens:     delta.PromptTokens,
+				HasPromptTokens:  delta.HasPromptTokens,
+				CompletionTokens: delta.CompletionTokens,
+				HasCompletion:    delta.HasCompletionTokens,
+				TotalTokens:      delta.TotalTokens,
+				HasTotal:         delta.HasTotalTokens,
+				LatencyMs:        delta.LatencyMs,
+				HasLatency:       delta.HasLatencyMs,
+				TokensPerSecond:  delta.TokensPerSecond,
+				HasTPS:           delta.HasTokensPerSecond,
+			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
+		}
 	}
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。

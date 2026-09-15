@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1066,6 +1067,99 @@ func mergeModelCapabilities(base []ModelInfo, overlay map[string]ModelInfo) []Mo
 // UserResource 查询账号积分余额与总额度（所有套餐聚合）。remain 负值钳 0；
 // total 取与 remain 同源的额度字段（CycleCapacitySize 优先，无周期额度退
 // CapacitySize），上游缺 size 的套餐按 remain 兜底，保证百分比不超 100%。
+// CreditPackage 单个积分包的构成明细（面板「积分构成」用）。
+//
+// 两个账号即使任务完成度完全一致，余额也可能相差上千——差别藏在包的**面额与
+// 来源**里（「国内运营裂变包」「拉新权益包」按次发放，面额 6~1500 不等）。
+// 只看聚合值看不出这件事，所以把逐包明细暴露出来。
+type CreditPackage struct {
+	Name    string `json:"name"`
+	Remain  int64  `json:"remain"`
+	Used    int64  `json:"used"`
+	Size    int64  `json:"size"`
+	EndTime string `json:"end_time,omitempty"`
+	// Cycle 为 true 表示按周期发放的包（读 Cycle* 字段），否则读 Capacity*。
+	Cycle bool `json:"cycle,omitempty"`
+}
+
+// CreditPackages 返回账号当前的逐包构成。remain/size 为各包求和。
+//
+// 字段选择与 UserResourceDetailed 的聚合口径一致：CycleCapacitySize > 0 时按
+// 周期字段算，否则按 Capacity 字段算——两条路径不能混，否则同一个包会被算两次。
+func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, error) {
+	now := time.Now()
+	body := map[string]any{
+		"PageNumber":               1,
+		"PageSize":                 100,
+		"ProductCode":              "p_tcaca",
+		"Status":                   []int{0, 3},
+		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
+		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
+	}
+	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	// 注意层级：doJSON 已经解过 apiEnvelope 并返回 env.Data，所以这里从
+	// Response 开始解析——**不能**再套一层 Code/Data，否则 Accounts 恒为空，
+	// 表现为「每个号都 0 个包」（实测踩过）。
+	var resp struct {
+		Response struct {
+			Data struct {
+				Accounts []struct {
+					PackageName         string `json:"PackageName"`
+					CapacityRemain      int64  `json:"CapacityRemain"`
+					CapacityUsed        int64  `json:"CapacityUsed"`
+					CapacitySize        int64  `json:"CapacitySize"`
+					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
+					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
+					// 到期时间字段名在上游同时存在两种口径，都读，谁有值用谁。
+					ExpiredTime    string `json:"ExpiredTime"`
+					PackageEndTime string `json:"PackageEndTime"`
+				} `json:"Accounts"`
+			} `json:"Data"`
+		} `json:"Response"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, 0, 0, fmt.Errorf("packages parse: %w", err)
+	}
+	packs := resp.Response.Data.Accounts
+	out := make([]CreditPackage, 0, len(packs))
+	var sumRemain, sumSize int64
+	for _, p := range packs {
+		cp := CreditPackage{Name: p.PackageName}
+		if p.ExpiredTime != "" {
+			cp.EndTime = p.ExpiredTime
+		} else {
+			cp.EndTime = p.PackageEndTime
+		}
+		if p.CycleCapacitySize > 0 {
+			cp.Cycle = true
+			cp.Remain, cp.Size = p.CycleCapacityRemain, p.CycleCapacitySize
+			cp.Used = cp.Size - cp.Remain
+			if p.CycleCapacityUsed > cp.Used {
+				cp.Used = p.CycleCapacityUsed
+				cp.Remain = cp.Size - cp.Used
+			}
+			if cp.Remain < 0 {
+				cp.Remain = 0
+			}
+		} else {
+			cp.Remain, cp.Used, cp.Size = p.CapacityRemain, p.CapacityUsed, p.CapacitySize
+			if cp.Used == 0 && cp.Size > cp.Remain {
+				cp.Used = cp.Size - cp.Remain
+			}
+		}
+		sumRemain += cp.Remain
+		sumSize += cp.Size
+		out = append(out, cp)
+	}
+	// 面额降序：大包一眼可见，正是差异最可能出现的地方。
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Size > out[j].Size })
+	return out, sumRemain, sumSize, nil
+}
+
 func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
 	remain, total, _, err = c.UserResourceDetailed(a, 0)
 	return remain, total, err

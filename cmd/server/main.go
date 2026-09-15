@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -25,10 +26,21 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 const appVersion = "1.8.1-panel"
+
+// usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
+// 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
+func usagePathFor(stateFile string) string {
+	dir := filepath.Dir(stateFile)
+	if dir == "" || dir == "." {
+		return "usage.json"
+	}
+	return filepath.Join(dir, "usage.json")
+}
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
@@ -191,8 +203,17 @@ func main() {
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 	})
+	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
+	// datapath 由 state 文件路径推出，避免再加一个配置项。
+	usagePath := usagePathFor(cfg.StateFile)
+	rec := usage.New(usagePath)
+	rec.Start()
+	defer rec.Stop()
+	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
+		Usage:       rec,
 		Upstream:    up,
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
@@ -222,6 +243,7 @@ func main() {
 		SoftCooldown: cfg.SoftRateDur,
 		Panel:        pn,
 		Live:         live,
+		Usage:        rec,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
