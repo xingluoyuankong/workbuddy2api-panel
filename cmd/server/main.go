@@ -34,12 +34,16 @@ const appVersion = "1.8.1-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
-func usagePathFor(stateFile string) string {
+func usagePathFor(stateFile string) string { return stateSibling(stateFile, "usage.json") }
+
+// stateSibling 返回与 state 文件同目录的指定文件名路径（相对路径场景回落当前目录）。
+// usage.json（用量记录）与 output_probes.json（模型上限探测）共用本规则。
+func stateSibling(stateFile, name string) string {
 	dir := filepath.Dir(stateFile)
 	if dir == "" || dir == "." {
-		return "usage.json"
+		return name
 	}
-	return filepath.Join(dir, "usage.json")
+	return filepath.Join(dir, name)
 }
 
 func main() {
@@ -227,6 +231,9 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
+		// 与 state 文件同目录，缺省 data/output_probes.json。
+		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath:  *cfgPath,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)

@@ -55,6 +55,11 @@ type Config struct {
 
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
+
+	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
+	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
+	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
+	ProbeFile string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -169,6 +174,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
+	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
@@ -263,6 +269,46 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out
+// 写入的契约文件），供前端在「模型与档位」的实测列做风险标注。
+//
+// 设计边界：纯只读透传——文件缺失/未配置返回空集（面板退化为无标注，与历史行为
+// 一致），网关自身不解析字段语义、不据此做任何路由或出站决策；上游改了限制后
+// 重跑一次工具、下次查询即刷新，无需重启网关。
+func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{"probes": map[string]json.RawMessage{}, "exists": false}
+	if p.cfg.ProbeFile == "" {
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	raw, err := os.ReadFile(p.cfg.ProbeFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "read probes: "+err.Error())
+		return
+	}
+	var f struct {
+		Version int                        `json:"version"`
+		Probes  map[string]json.RawMessage `json:"probes"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		writeErr(w, http.StatusBadGateway, "parse probes: "+err.Error())
+		return
+	}
+	if f.Probes == nil {
+		f.Probes = map[string]json.RawMessage{}
+	}
+	out["probes"] = f.Probes
+	out["exists"] = true
+	if fi, err := os.Stat(p.cfg.ProbeFile); err == nil {
+		out["updated_at"] = fi.ModTime().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ---------------------------------------------------------------------------

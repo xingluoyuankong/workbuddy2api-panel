@@ -274,13 +274,48 @@ $('btnActivityAll').onclick = async () => {
 };
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
+/* 实测上限标注：scripts/probe_max_tokens.py --panel-out 写入探测结果，
+   /panel/api/model_probes 只读透传。探测键带域前缀（cn:glm-5.2），模型表
+   显示裸名，按「精确命中或 :后缀」关联。无数据时本列退回上游声称值。 */
+function fmtK(n) { n = Number(n || 0); return n >= 1000 ? Math.round(n / 1000) + 'K' : String(n); }
+function probeDays(ts) {
+  if (!ts) return null;
+  const t = new Date(String(ts).replace(' ', 'T'));
+  const d = (Date.now() - t.getTime()) / 86400000;
+  return isNaN(d) ? null : Math.floor(d);
+}
+function outCell(m, pr) {
+  if (!pr) return '<td class="num">' + (m.max_output_tokens ? fmtK(m.max_output_tokens) : '—') + '</td>';
+  const tip = '声称 ' + (pr.claimed ? fmtK(pr.claimed) : '?') + ' · 实测 ' + (pr.measured ? fmtK(pr.measured) : '?') +
+    (pr.note ? ' · ' + pr.note : '') + (pr.tested_at ? ' · 探测于 ' + pr.tested_at : '');
+  const days = probeDays(pr.tested_at);
+  const stale = days !== null && days > 30 ? ' · ' + days + ' 天前' : '';
+  if (pr.verdict === 'clamped' && pr.measured) {
+    if (pr.claimed && pr.measured < pr.claimed) {
+      const x = pr.claimed / pr.measured;
+      const xs = (x >= 10 ? Math.round(x) : Math.round(x * 10) / 10) + '×';
+      return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--warn);font-weight:600">' +
+        fmtK(pr.measured) + ' ⚠</span><div class="note">钳制 ' + xs + stale + '</div></td>';
+    }
+    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ok)">' + fmtK(pr.measured) +
+      (pr.claimed && pr.measured > pr.claimed ? ' ↑' : ' ✓') + '</span></td>';
+  }
+  if (pr.verdict === 'at_least' && pr.measured)
+    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">≥' + fmtK(pr.measured) + '</span></td>';
+  return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">?</span><div class="note">未测出' + stale + '</div></td>';
+}
+
 async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
-    const d = await api('models');
+    // 探测数据是可选增强：拉取失败不影响模型列表本身
+    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
     const list = d.models || [];
     if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
+    const probes = pr.probes || {};
+    const probeKeys = Object.keys(probes);
+    const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
     tb.innerHTML = list.map(m => {
       const eff = (m.supported_efforts || []).slice();
       if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
@@ -291,9 +326,10 @@ async function loadModels() {
         '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="efs" style="white-space:normal">' + effs + '</td>' +
         '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
-        '<td class="num">' + (m.max_output_tokens ? Math.round(m.max_output_tokens / 1000) + 'K' : '—') + '</td></tr>';
+        outCell(m, probeOf(m.id)) + '</tr>';
     }).join('');
-    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存';
+    const hit = list.filter(m => probeOf(m.id)).length;
+    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
