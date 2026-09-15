@@ -556,7 +556,11 @@ func (c *Client) billingBase(a *auth.Auth) string {
 }
 
 // webBase 返回官网域（任务领奖类接口；未注入时回落默认）。
-func (c *Client) webBase() string {
+// realm 感知：global 账号切国际站 workbuddy.ai，CN 用 workbuddy.cn。
+func (c *Client) webBase(a *auth.Auth) string {
+	if c.globalOn(a) {
+		return defaultGlobalBase
+	}
 	if c.WebBaseCN != "" {
 		return c.WebBaseCN
 	}

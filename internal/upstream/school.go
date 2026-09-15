@@ -28,7 +28,7 @@ func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]a
 	if body != nil {
 		raw, _ = json.Marshal(body)
 	}
-	req, err := http.NewRequest(method, c.BillingBaseCN+schoolBase+path, bytes.NewReader(raw))
+	req, err := http.NewRequest(method, c.billingBase(a)+schoolBase+path, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}

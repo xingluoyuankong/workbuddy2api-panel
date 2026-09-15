@@ -88,6 +88,10 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			}
 			it := &items[i]
 			it.UID, it.Nickname = uid, a.Nickname
+			// D4 门控：global 账号无 CN 成长/开学季任务体系，不发起任何上游调用。
+			if a.IsGlobal() {
+				return
+			}
 			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
 				it.GrowthErr = err.Error()
 			} else {
@@ -202,6 +206,10 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 		go func(a *auth.Auth, wantSchool bool) {
 			defer wg.Done()
 			one := queueAccount{a: a}
+			// D4 门控：global 账号无 CN 成长/开学季任务体系，不发起任何上游调用。
+			if a.IsGlobal() {
+				return
+			}
 			if body.Growth {
 				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
 					for _, t := range tasks {
@@ -481,6 +489,14 @@ func (p *Panel) schoolStatus(w http.ResponseWriter, r *http.Request) {
 		go func(a *auth.Auth) {
 			defer wg.Done()
 			v := acctView{UID: a.UID, Nickname: a.Nickname}
+			// D4 门控：global 账号无开学季活动，不发起任何上游调用。
+			if a.IsGlobal() {
+				v.Err = "global realm（无开学季活动）"
+				mu.Lock()
+				out = append(out, v)
+				mu.Unlock()
+				return
+			}
 			tasks, inPeriod, err := p.cfg.Upstream.SchoolTasks(a)
 			if err != nil {
 				v.Err = err.Error()

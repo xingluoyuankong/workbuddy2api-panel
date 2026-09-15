@@ -276,7 +276,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.WebBaseCN+"/v2/report", bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, c.webBase(a)+"/v2/report", bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -284,7 +284,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-client-platform", "web")
-	req.Header.Set("Origin", c.WebBaseCN)
+	req.Header.Set("Origin", c.webBase(a))
 	req.Header.Set("Referer", pageURL)
 	req.Header.Set("User-Agent", ua)
 	if a.UID != "" {

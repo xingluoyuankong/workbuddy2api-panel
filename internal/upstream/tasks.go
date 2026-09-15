@@ -139,7 +139,7 @@ func (c *Client) AcceptTasks(a *auth.Auth, taskCodes []string) error {
 // 本实现返回 (credit, energy, err)：credit/energy 为本次到账奖励（已领取过时为 0）。
 func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int64, err error) {
 	req, err := http.NewRequest(http.MethodPost,
-		c.webBase()+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", nil)
+		c.webBase(a)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", nil)
 	if err != nil {
 		return 0, 0, err
 	}
