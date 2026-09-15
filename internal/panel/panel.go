@@ -15,6 +15,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
 // Config 面板依赖（main 装配注入）。
@@ -49,6 +52,9 @@ type Config struct {
 
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
+
+	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
+	Usage *usage.Recorder
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -160,6 +166,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
+	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
+	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
@@ -418,6 +427,94 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// usage 返回逐请求用量聚合。hours 查询参数控制小时粒度时序窗口（默认 72，
+// 上限 1440=60 天）；更早的数据自动折叠为日点，因此长期趋势不会丢。
+func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Usage == nil {
+		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
+		return
+	}
+	hours := 72
+	if v := r.URL.Query().Get("hours"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
+	if hours > 1440 {
+		hours = 1440
+	}
+	// 昵称仅用于展示，取自池快照（不含任何凭证）。
+	nicks := map[string]string{}
+	for _, s := range p.cfg.Pool.List() {
+		if s.Nickname != "" {
+			nicks[s.UID] = s.Nickname
+		}
+	}
+	writeJSON(w, http.StatusOK, p.cfg.Usage.Snapshot(hours, nicks))
+}
+
+// usageSave 立即把内存中的用量桶落盘（正常由后台 30s 防抖刷新负责）。
+func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Usage == nil {
+		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
+		return
+	}
+	p.cfg.Usage.Save()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// packages 返回全部账号的积分包构成，供「积分构成」视图对比。
+//
+// 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
+// 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
+func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
+	accts := p.cfg.Pool.List()
+	type row struct {
+		UID      string                   `json:"uid"`
+		Nickname string                   `json:"nickname"`
+		Realm    string                   `json:"realm"`
+		Remain   int64                    `json:"remain"`
+		Size     int64                    `json:"size"`
+		Packages []upstream.CreditPackage `json:"packages"`
+		Error    string                   `json:"error,omitempty"`
+	}
+	out := make([]row, len(accts))
+
+	sem := make(chan struct{}, 3)
+	var wg sync.WaitGroup
+	for i, s := range accts {
+		wg.Add(1)
+		go func(i int, s pool.Status) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+			a := p.cfg.Pool.AuthByUID(s.UID)
+			if a == nil {
+				it.Error = "account not loaded"
+				out[i] = it
+				return
+			}
+			packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
+			if err != nil {
+				it.Error = err.Error()
+				out[i] = it
+				return
+			}
+			it.Packages = packs
+			it.Remain = remain
+			it.Size = size
+			out[i] = it
+		}(i, s)
+	}
+	wg.Wait()
+
+	// 余额降序：多的在前，便于和少的对比。
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)
