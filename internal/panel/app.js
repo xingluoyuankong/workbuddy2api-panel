@@ -798,15 +798,17 @@ function copyText(text) {
 
 function vcCard(v) {
   const expired = v.valid_to && new Date(v.valid_to) < new Date();
-  return '<div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line-soft)">' +
-    '<span class="tag ' + (expired ? 'bad' : 'ok') + '">' + esc(v.prize_name || v.sku_code || '券') + '</span>' +
-    '<code style="font:600 13.5px var(--mono);letter-spacing:.5px">' + esc(v.code || '-') + '</code>' +
-    '<button class="xs ghost" data-copy="' + esc(v.code || '') + '">复制</button>' +
-    '<span class="note" style="margin-left:auto">' +
-      (expired ? '<span style="color:var(--bad)">已过期</span> · ' : '') +
-      (v.valid_to ? '有效期至 ' + esc(v.valid_to) : '') +
+  return '<div class="vc' + (expired ? ' expired' : '') + '">' +
+    '<div class="hd"><span class="nm">' + esc(v.prize_name || v.sku_code || '券') + '</span>' +
+    (expired ? '<span class="tag bad">已过期</span>' : '<span class="tag ok">可使用</span>') + '</div>' +
+    '<div class="meta">' +
+      (v.valid_to ? '有效期至 ' + esc(v.valid_to) : '长期有效') +
       (v.granted_at ? ' · ' + esc(v.granted_at.slice(0, 10)) + ' 抽中' : '') +
-    '</span></div>';
+    '</div>' +
+    '<div class="sep"></div>' +
+    '<div class="ft"><span class="lab">券码</span><code>' + esc(v.code || '-') + '</code>' +
+    '<button class="xs ghost" data-copy="' + esc(v.code || '') + '">复制</button></div>' +
+    '</div>';
 }
 
 async function loadSchoolVouchers() {
@@ -820,10 +822,10 @@ async function loadSchoolVouchers() {
     const ok = arr.filter(a => !a.error);
     const total = ok.reduce((n, a) => n + (a.vouchers || []).length, 0);
     body.innerHTML = ok.filter(a => (a.vouchers || []).length).map(a =>
-      '<div style="margin-bottom:6px"><div class="note" style="margin:0 0 2px">' +
-      esc(a.nickname || a.uid) + ' · ' + a.vouchers.length + ' 张</div>' +
-      a.vouchers.map(vcCard).join('') + '</div>'
-    ).join('') || '<div class="empty">还没有抽到券</div>';
+      '<div class="vc-acct"><span class="nm">' + esc(a.nickname || a.uid) + '</span>' +
+      '<span>' + a.vouchers.length + ' 张</span></div>' +
+      a.vouchers.map(vcCard).join('')
+    ).join('') || '<div class="empty"><div class="big">🎟️</div>还没有抽到券</div>';
     $('vcNote').textContent = total ? total + ' 张券 · ' + ok.filter(a => !(a.vouchers || []).length).length + ' 个账号未抽中' : '';
     const errs = arr.filter(a => a.error);
     if (errs.length) {
