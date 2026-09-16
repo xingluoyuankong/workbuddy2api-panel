@@ -114,6 +114,7 @@ func (p *Pool) load() {
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
+	now := time.Now()
 	for uid, s := range accounts {
 		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
@@ -121,21 +122,60 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if int64(s.ErrCount) > errTotal {
 			errTotal = int64(s.ErrCount)
 		}
-		p.byUID[uid] = &entry{
-			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:      s.Credits,
-			creditsTotal: s.CreditsTotal,
-			disabled:     s.Disabled,
-			reason:       s.Reason,
-			until:        s.Until,
-			coolKind:     s.CoolKind,
-			successCount: s.SuccessCount,
-			errTotal:     errTotal,
-			lastErr:      s.LastErr,
-			lastSuccess:  s.LastSuccess,
-			tokenUsage:   s.TokenUsage,
-			softStreak:   s.SoftStreak,
+		e := &entry{
+			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:          s.Credits,
+			creditsTotal:     s.CreditsTotal,
+			creditsExpiring:  s.CreditsExpiring,
+			disabled:         s.Disabled,
+			reason:           s.Reason,
+			until:            s.Until,
+			coolKind:         s.CoolKind,
+			successCount:     s.SuccessCount,
+			errTotal:         errTotal,
+			lastErr:          s.LastErr,
+			lastSuccess:      s.LastSuccess,
+			tokenUsage:       s.TokenUsage,
+			softStreak:       s.SoftStreak,
+			sessionDeadFails: s.SessionDeadFails,
+			consecutiveFails: s.ConsecutiveFails,
 		}
+		// 熔断器持久化恢复：breakerUntil 未过期才恢复（过期不复活），retryCount 仅在
+		// 熔断仍有效时保留（否则归零，不保留无用退避指数）。
+		if s.BreakerUntil != nil && now.Before(*s.BreakerUntil) {
+			e.breakerUntil = *s.BreakerUntil
+			e.retryCount = s.RetryCount
+		}
+		// 连败降权：未过期才恢复（过期/零值不写不复活）。
+		if s.DegradeUntil != nil && now.Before(*s.DegradeUntil) {
+			e.degradeUntil = *s.DegradeUntil
+		}
+		// 模型级独立冷却（6004 重置墙钟 / 11102 负缓存）：惰性过滤已过期条目。
+		if len(s.ModelCooldowns) > 0 {
+			for m, mc := range s.ModelCooldowns {
+				if mc.Until.IsZero() || !now.Before(mc.Until) {
+					continue
+				}
+				if e.modelCooldowns == nil {
+					e.modelCooldowns = map[string]modelCooldown{}
+				}
+				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason}
+			}
+		}
+		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
+		// （负 per1k / 零 LastSeen——上游异常或旧文件手改产生的脏数据）。
+		if len(s.ModelCosts) > 0 {
+			for m, mc := range s.ModelCosts {
+				if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL || mc.CostPer1k < 0 {
+					continue
+				}
+				if e.modelCost == nil {
+					e.modelCost = map[string]modelCostEntry{}
+				}
+				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+			}
+		}
+		p.byUID[uid] = e
 	}
 }
 
@@ -196,22 +236,62 @@ func (p *Pool) notePersistFail(err error) {
 
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
+	now := time.Now()
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
-		sf.Accounts[uid] = stateAccount{
-			Credits:      e.credits,
-			CreditsTotal: e.creditsTotal,
-			Disabled:     e.disabled,
-			Reason:       e.reason,
-			Until:        e.until,
-			CoolKind:     e.coolKind,
-			SuccessCount: e.successCount,
-			ErrTotal:     e.errTotal,
-			LastSuccess:  e.lastSuccess,
-			LastErr:      e.lastErr,
-			TokenUsage:   e.tokenUsage,
-			SoftStreak:   e.softStreak,
+		s := stateAccount{
+			Credits:          e.credits,
+			CreditsTotal:     e.creditsTotal,
+			Disabled:         e.disabled,
+			Reason:           e.reason,
+			Until:            e.until,
+			CoolKind:         e.coolKind,
+			SuccessCount:     e.successCount,
+			ErrTotal:         e.errTotal,
+			LastSuccess:      e.lastSuccess,
+			LastErr:          e.lastErr,
+			TokenUsage:       e.tokenUsage,
+			SoftStreak:       e.softStreak,
+			SessionDeadFails: e.sessionDeadFails,
+			ConsecutiveFails: e.consecutiveFails,
+			CreditsExpiring:  e.creditsExpiring,
 		}
+		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
+		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+			u := e.breakerUntil
+			s.BreakerUntil = &u
+			s.RetryCount = e.retryCount
+		}
+		// 连败降权截止：仅未过期才落盘。
+		if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
+			u := e.degradeUntil
+			s.DegradeUntil = &u
+		}
+		// 模型级独立冷却：惰性过滤已过期条目（Hits 不落盘，重启后 11102 退避从基数重学）。
+		if len(e.modelCooldowns) > 0 {
+			for m, mc := range e.modelCooldowns {
+				if mc.Until.IsZero() || !now.Before(mc.Until) {
+					continue
+				}
+				if s.ModelCooldowns == nil {
+					s.ModelCooldowns = map[string]stateModelCooldown{}
+				}
+				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason}
+			}
+		}
+		// 成本账本：惰性过滤过期观测（modelCostTTL 外不写——陈旧价格不复活）。
+		if len(e.modelCost) > 0 {
+			for m, mc := range e.modelCost {
+				if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+					continue
+				}
+				if s.ModelCosts == nil {
+					s.ModelCosts = map[string]stateModelCost{}
+				}
+				s.ModelCosts[m] = stateModelCost{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+			}
+		}
+		sf.Accounts[uid] = s
 	}
 	return sf
 }

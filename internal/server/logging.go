@@ -74,7 +74,10 @@ type chatStatsReader struct {
 	hasPromptTokens     bool
 	hasCompletionTokens bool
 	hasTotalTokens      bool
-	pend                []byte // 已读未返回的行缓存
+	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
+	hasCredit bool
+	credit    float64
+	pend      []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -87,6 +90,12 @@ func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.completionTokens, s.hasCompletionTokens }
+
+// Credit 返回末帧 usage.credit（本次真实扣费积分）与是否缺失。
+func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
+
+// TotalTokens 返回末帧 usage.total_tokens 与是否缺失。
+func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.hasTotalTokens }
 
 // Usage 返回流式响应中已收到的 token usage 字段。
 func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
@@ -116,9 +125,10 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	var chunk struct {
 		Usage *struct {
-			PromptTokens     *int `json:"prompt_tokens"`
-			CompletionTokens *int `json:"completion_tokens"`
-			TotalTokens      *int `json:"total_tokens"`
+			PromptTokens     *int     `json:"prompt_tokens"`
+			CompletionTokens *int     `json:"completion_tokens"`
+			TotalTokens      *int     `json:"total_tokens"`
+			Credit           *float64 `json:"credit"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -135,6 +145,10 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if chunk.Usage.TotalTokens != nil {
 		s.hasTotalTokens = true
 		s.totalTokens = *chunk.Usage.TotalTokens
+	}
+	if chunk.Usage.Credit != nil {
+		s.hasCredit = true
+		s.credit = *chunk.Usage.Credit
 	}
 }
 
