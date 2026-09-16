@@ -779,6 +779,63 @@ $('btnSchoolRunAll').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 
+/* ── 开学季券码查询 ────────────────────────────────────────────────── */
+/* copyText：clipboard API 只在 secure context（https/localhost）可用，
+   远程 http 面板会拿不到 navigator.clipboard → 降级 execCommand。 */
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy') ? resolve() : reject(new Error('copy failed')); }
+    catch (e) { reject(e); }
+    finally { ta.remove(); }
+  });
+}
+
+async function loadSchoolVouchers() {
+  const box = $('schoolVouchers');
+  box.hidden = false;
+  box.innerHTML = '<div class="note">券码查询中…（逐账号向上游实时查询）</div>';
+  try {
+    const d = await api('school/vouchers');
+    const arr = d.accounts || [];
+    const withErr = arr.filter(a => a.error);
+    const rows = arr.filter(a => !a.error && (a.vouchers || []).length).map(a => {
+      const cards = a.vouchers.map(v => {
+        const expired = v.valid_to && new Date(v.valid_to) < new Date();
+        return '<div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line-soft)">' +
+          '<span class="tag ' + (expired ? 'bad' : 'ok') + '">' + esc(v.prize_name || v.sku_code || '券') + '</span>' +
+          '<code style="font:600 13px var(--mono);letter-spacing:.5px">' + esc(v.code || '-') + '</code>' +
+          '<button class="xs ghost" data-copy="' + esc(v.code || '') + '">复制</button>' +
+          '<span class="note" style="margin-left:auto">' +
+            (expired ? '<span style="color:var(--bad)">已过期</span> · ' : '') +
+            (v.valid_to ? '有效期至 ' + esc(v.valid_to) : '') +
+            (v.granted_at ? ' · ' + esc(v.granted_at.slice(0, 10)) + ' 抽中' : '') +
+          '</span></div>';
+      }).join('');
+      return '<div style="margin-top:10px"><div class="note" style="margin:0 0 2px">' +
+        esc(a.nickname || a.uid) + ' · ' + a.vouchers.length + ' 张</div>' + cards + '</div>';
+    }).join('');
+    const none = arr.filter(a => !a.error && !(a.vouchers || []).length);
+    box.innerHTML = (rows || '') +
+      (none.length ? '<div class="note" style="margin-top:8px">' + esc(none.map(a => a.nickname || a.uid.slice(0, 8)).join('、')) + ' 暂无券（未抽中或未抽）</div>' : '') +
+      (withErr.length ? '<div class="note" style="color:var(--warn);margin-top:6px">查询失败：' +
+        withErr.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(a.error) + '）').join('、') + '</div>' : '') +
+      (!rows && !none.length && !withErr.length ? '<div class="note">没有账号</div>' : '');
+    box.querySelectorAll('button[data-copy]').forEach(b => b.onclick = async () => {
+      try { await copyText(b.dataset.copy); toast('券码已复制', 'ok'); }
+      catch (e) { toast('复制失败，请手动选择券码', 'err'); }
+    });
+  } catch (e) {
+    box.innerHTML = '<div class="note" style="color:var(--warn)">券码查询失败：' + esc(e.message) + '</div>';
+  }
+}
+$('btnSchoolVouchers').onclick = loadSchoolVouchers;
+
 /* 成长任务队列。lastQueueSeq 记录本页启动过的队列代次：执行结束后的残留 items
    （running=false 但 seq 停在旧值）不再回写视图——否则扫描结果 3 秒后被上一轮
    队列状态覆盖。 */

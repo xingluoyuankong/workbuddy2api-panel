@@ -468,11 +468,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>开学季 <span class="hint">09-13 ~ 09-24 · 每日重置</span></h3>
           <span class="grow"></span>
           <span class="note" id="schoolSummary"></span>
+          <button class="xs" id="btnSchoolVouchers">查询券码</button>
           <button class="xs" id="btnSchoolRefresh">刷新</button>
           <button class="xs primary" id="btnSchoolRunAll">全部账号执行闭环</button>
         </header>
         <div class="state" id="schoolState"><span class="dots">加载中</span></div>
         <div id="schoolList"></div>
+        <div id="schoolVouchers" class="pad" hidden></div>
       </div>
 
       <div class="box">
