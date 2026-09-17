@@ -1260,8 +1260,13 @@ function renderUsage(d) {
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟');
 
-  $('usNote').textContent = (d.buckets || 0) + ' 个分桶 · ' +
-    (d.since ? '自 ' + d.since.slice(0, 10) : '无数据') +
+  // 卡片与表格给的是**全部历史**的累计值，只有下面的时序图按所选窗口展示。
+  //
+  // 这是后端的既定口径（Snapshot 的注释：「聚合当前全部桶。hours 控制时序返回
+  // 多少个小时点」），不是缺陷——但界面上不写明，切 24 小时 / 30 天时这几个数字
+  // 纹丝不动，就会被读成「没生效」。所以把口径差异直接写在标题栏。
+  $('usNote').textContent = '卡片为累计值（自启用起，不随窗口变化）· ' +
+    (d.buckets || 0) + ' 个分桶' +
     (d.file_bytes ? ' · ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
 
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
@@ -1278,55 +1283,135 @@ function renderUsage(d) {
   renderUsageChart(d.series || []);
 }
 
-/* renderUsageChart 画堆叠柱状图。日点与小时点混用 x 轴，因此按数据序号等距
-   排布（不按真实时间比例），并在标签上区分粒度——用量面板看的是相对高低，
-   不是精确的时间刻度。 */
+/* renderUsageChart 画堆叠柱状图。
+ *
+ * x 轴是**真实时间轴**，不是按序号等距。这一点很重要：数据里存在 1 小时的
+ * 间隔，也存在 6~8 小时的断档（没请求的时段不产生桶），等距排布会把 8 小时
+ * 画得和 1 小时一样宽，让「什么时候用的」完全失真。
+ *
+ * 另外不再用 preserveAspectRatio="none"：那会把 760 宽的 viewBox 横向拉伸到
+ * 容器宽度，柱子和文字都变形。改为固定比例、按容器宽度自适应高度。
+ *
+ * 时间轴用本地时间解析（后端返回的就是本地时区），day 点按当天 00:00 参与定位，
+ * 与 hour 点在同一个连续轴上——日桶本来就是他那天所有小时的聚合。
+ */
+
+/* parsePointTime 把后端的 t 解析成毫秒时间戳。 */
+function parsePointTime(p) {
+  // hour: "2026-09-16T13"  day: "2026-09-16"
+  const s = p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00';
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d.getTime();
+}
+
 function renderUsageChart(series) {
   const host = $('usChart');
-  if (!series.length) {
+
+  // 丢掉时间解析不出来的点，而不是让 NaN 传染整张图。
+  const pts = [];
+  for (const p of series) {
+    const t = parsePointTime(p);
+    if (t === null) continue;
+    const pt = Number(p.prompt_tokens || 0);
+    const ct = Number(p.completion_tokens || 0);
+    pts.push({ t, scope: p.scope, raw: p.t, pt, ct, tt: Number(p.total_tokens || 0) || (pt + ct),
+               req: p.requests || 0 });
+  }
+  if (!pts.length) {
     host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
     return;
   }
-  const W = 760, H = 170, PL = 46, PR = 10, PT = 12, PB = 26;
+
+  const W = 760, H = 180, PL = 52, PR = 12, PT = 12, PB = 30;
   const iw = W - PL - PR, ih = H - PT - PB;
 
-  const max = Math.max(1, ...series.map(p => Number(p.total_tokens || 0)));
-  const bw = Math.max(2, Math.min(26, iw / series.length - 3));
+  const t0 = pts[0].t;
+  const t1 = pts[pts.length - 1].t;
+  const span = Math.max(1, t1 - t0);
 
-  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img">';
-  // y 轴网格 + 刻度（4 档）
+  const max = Math.max(1, ...pts.map(p => p.tt));
+
+  // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
+  // 变细，但不会细到看不见。
+  let minGap = Infinity;
+  for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
+  if (!isFinite(minGap) || minGap <= 0) minGap = span;
+  const slot = iw * (minGap / span);
+  const bw = Math.max(1.5, Math.min(30, slot * 0.7));
+
+  const xOf = t => PL + (t - t0) / span * iw;
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
+            'preserveAspectRatio="xMidYMid meet">';
+
+  // y 轴网格 + 刻度
   for (let i = 0; i <= 4; i++) {
-    const v = max * i / 4;
     const y = PT + ih - (ih * i / 4);
-    out += '<line class="gl" x1="' + PL + '" y1="' + y + '" x2="' + (W - PR) + '" y2="' + y + '"/>';
-    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5) + '" text-anchor="end">' + fmtTok(v) + '</text>';
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+           '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
+           '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
   }
-  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
 
-  const step = iw / series.length;
-  series.forEach((p, i) => {
-    const pt = Number(p.prompt_tokens || 0), ct = Number(p.completion_tokens || 0);
-    const tt = Number(p.total_tokens || 0) || (pt + ct);
-    const x = PL + i * step + (step - bw) / 2;
-    const hTot = ih * (tt / max);
-    const hP = tt ? hTot * (pt / tt) : 0;
-    const hC = Math.max(tt && ct ? 1 : 0, hTot - hP);
+  // 柱子
+  for (const p of pts) {
+    const cx = xOf(p.t);
+    const x = cx - bw / 2;
+    const hTot = ih * (p.tt / max);
+    const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
+    const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
     const yBase = PT + ih;
-    if (hP > 0) out += '<rect x="' + x.toFixed(1) + '" y="' + (yBase - hP).toFixed(1) +
-      '" width="' + bw.toFixed(1) + '" height="' + hP.toFixed(1) + '" fill="var(--accent)" rx="1.5"/>';
-    if (hC > 0) out += '<rect x="' + x.toFixed(1) + '" y="' + (yBase - hP - hC).toFixed(1) +
-      '" width="' + bw.toFixed(1) + '" height="' + hC.toFixed(1) + '" fill="var(--ok)" rx="1.5"/>';
-    // 只给稀疏的几根画标签，避免拥挤
-    const every = Math.ceil(series.length / 8);
-    if (i % every === 0) {
-      const lab = p.scope === 'day' ? p.t.slice(5) : p.t.slice(11) + ':00';
-      out += '<text class="tk" x="' + (x + bw / 2).toFixed(1) + '" y="' + (H - 8) +
-        '" text-anchor="middle">' + esc(lab) + '</text>';
+    if (hP > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hP.toFixed(2) +
+      '" fill="var(--accent)" rx="1.5"/>';
+    if (hC > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
+      '" fill="var(--ok)" rx="1.5"/>';
+    out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
+           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+  }
+
+  // x 轴基线画在柱子之后，避免压在柱底
+  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) +
+         '" y2="' + (PT + ih) + '"/>';
+
+  // x 轴刻度：按真实时间等距取 6 个位置，取该位置**最近的实际柱子**做标签，
+  // 所以标签永远落在有数据的点上，不会指到空档里。
+  const TICKS = Math.min(6, pts.length);
+  const usedLabel = new Set();
+  for (let k = 0; k < TICKS; k++) {
+    const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
+    let bi = 0, best = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const d = Math.abs(pts[i].t - target);
+      if (d < best) { best = d; bi = i; }
     }
-    out += '<title>' + esc(p.t) + ' (' + esc(p.scope) + ')  ' +
-      fmtTok(p.prompt_tokens) + ' prompt / ' + fmtTok(p.completion_tokens) + ' completion / ' +
-      (p.requests || 0) + ' 次</title>';
-  });
+    if (usedLabel.has(bi)) continue;
+    usedLabel.add(bi);
+    const p = pts[bi];
+    const d = new Date(p.t);
+    const lab = p.scope === 'day'
+      ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
+      : String(d.getHours()).padStart(2, '0') + ':00';
+    // 首尾标签靠边对齐，避免被裁掉
+    const cx = xOf(p.t);
+    const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
+    out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
+           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
+  }
+
+  // 跨天时补一条日期分隔线，让「日界」在长窗口里可见
+  let prevDay = null;
+  for (const p of pts) {
+    const d = new Date(p.t).getDate();
+    if (prevDay !== null && d !== prevDay) {
+      const x = xOf(p.t).toFixed(1);
+      out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
+             (PT + ih) + '" style="opacity:.45"/>';
+    }
+    prevDay = d;
+  }
+
   out += '</svg>';
   host.innerHTML = out;
 }
