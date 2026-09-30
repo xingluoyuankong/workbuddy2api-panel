@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -152,7 +153,7 @@ func TestUIDPrefix(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234)
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234, 0.08, true)
 	})
 	for _, want := range []string{
 		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
@@ -169,7 +170,7 @@ func TestLogChatRowFormat(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, 0, false)
 	})
 	for _, want := range []string{"TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
@@ -181,8 +182,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 0, true)
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 0, true)
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -290,5 +291,74 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+// TestLogChatRowCreditColumn 日志行的积分列（cr=）语义：
+//   - 有 credit 且 >0 → 显示数值（实际扣费）
+//   - 有 credit 且 ==0 → 显示 "0"（实测免费，不是"没数据"）
+//   - 无 credit → 显示 "-"（上游没下发）
+// 三者必须可区分：把"没数据"渲染成 0 会让人以为这些请求都免费。
+func TestLogChatRowCreditColumn(t *testing.T) {
+	cases := []struct {
+		name      string
+		credit    float64
+		hasCredit bool
+		want      string
+	}{
+		{"paid", 0.08, true, "cr=0.08"},
+		{"free", 0, true, "cr=0"},
+		{"missing", 0, false, "cr=-"},
+		{"tiny", 0.00115, true, "cr=0.0011"}, // %.4f 截断，够定位量级
+		{"large", 1234.5, true, "cr=1234"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			old := chatLogOut
+			chatLogOut = &buf
+			oldEnabled := chatLogEnabled
+			chatLogEnabled = true
+			defer func() { chatLogOut = old; chatLogEnabled = oldEnabled }()
+
+			logChatRow(0, time.Second, "m", "sync", "u", 200, 10, c.credit, c.hasCredit)
+			line := buf.String()
+			if !strings.Contains(line, c.want) {
+				t.Errorf("line = %q, want %q", line, c.want)
+			}
+		})
+	}
+}
+
+// TestHeadModelOfTruncatedBody 413 超限路径的 body 是被 LimitReader 截断的
+// （只读了 limit+1 字节），JSON 结构不完整 → json.Unmarshal 必失败、
+// parseModelFromBody 只能给 "-"，日志行的模型列因此是空白。
+// headModelOf 必须能从头部 4KB 拿到模型名——这是排查"哪个模型超了"的唯一线索
+// （2026-09-20 线上实测该列为空，故补此回归）。
+func TestHeadModelOfTruncatedBody(t *testing.T) {
+	// 截断形态：model 在前，messages 被切断（模拟 32MB 请求只读到 32MB+1）。
+	truncated := `{"model":"global:deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"` +
+		strings.Repeat("A", 8192)
+	if got := parseModelFromBody([]byte(truncated)); got != "-" {
+		t.Fatalf("前置断言：截断 body 不该被解析出模型（got %q）——headModelOf 的存在意义即为此", got)
+	}
+	if got := headModelOf([]byte(truncated)); got != "global:deepseek-v4.1-flash" {
+		t.Errorf("headModelOf=%q want global:deepseek-v4.1-flash", got)
+	}
+
+	// 键排在 4KB 之外 → 给 "-"（不编造，不越界扫描）。
+	late := `{"stream":true,"pad":"` + strings.Repeat("B", 8192) + `","model":"x"}`
+	if got := headModelOf([]byte(late)); got != "-" {
+		t.Errorf("model 键在 4KB 之外时应给 \"-\"，got %q", got)
+	}
+
+	// 完全取不到 → "-"。
+	if got := headModelOf([]byte("not json at all")); got != "-" {
+		t.Errorf("非 JSON 应给 \"-\"，got %q", got)
+	}
+
+	// 空 body → "-"（不 panic）。
+	if got := headModelOf(nil); got != "-" {
+		t.Errorf("空 body 应给 \"-\"，got %q", got)
 	}
 }

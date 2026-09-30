@@ -1,9 +1,9 @@
 // global 模型目录探测：纯动态产出模型名及其窗口 / 能力元数据（v3-config-merge）。
 //
-// 探测两路并发：/v3/config（主路，IDE UA 完整能力版）+ 企业端点家族
-// （/v2 → /console 补缺），并集 = v3 条目为主、企业端点补 v3 缺失的 id
-// （如 gpt-5.3-codex 只在 /v2 下发）。倍率字段（credits）虽随目录下发，但
-// 只透出展示，不注入 costTier、不参与选号。
+// 探测两路并发：/v3/config（主路，双 UA 并集——上游按 UA 分档下发目录，
+// IDE UA 拿到的是精简表）+ 企业端点家族（/v2 → /console 补缺），并集 = v3 条目
+// 为主、企业端点补 v3 缺失的 id 与空字段（如 gpt-5.3-codex 只在 /v2 下发）。
+// 倍率字段（credits）虽随目录下发，但只透出展示，不注入 costTier、不参与选号。
 //
 // 纯动态：不再回落任何静态名单——拉不出目录即意味着该域上游不可用，
 // 假名单只会让客户端选到 11102 的模型（产品决策：无兜底）。
@@ -159,11 +159,12 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 }
 
 // probeGlobalModels 发起一次 global 模型目录探测（v3-config-merge）：
-// /v3/config（主，IDE UA 完整能力版）与企业端点家族（/v2 → /console 兜底，补缺）
-// **并发**探测后并集合并。返回模型名列表（已合并、未再去重——去重在
-// fetchGlobalModelsOnce）、全字段 ModelInfo（对象形态；窄表为 nil）及 effort
-// 能力桶（supportedEfforts/defaultEffort，可为空）。合并口径：v3 条目为主
-// （credits 等字段以 v3 为准），企业端点只补 v3 缺失的模型 id；去重 key =
+// /v3/config（主路，**双 UA 并集**——UA 分档下发，见 fetchV3ConfigModelMap）
+// 与企业端点家族（/v2 → /console 兜底，补缺）**并发**探测后并集合并。返回模型名
+// 列表（已合并、未再去重——去重在 fetchGlobalModelsOnce）、全字段 ModelInfo
+// （对象形态；窄表为 nil）及 effort 能力桶（supportedEfforts/defaultEffort，可为空）。
+// 合并口径：v3 条目为主（值权威），企业端点既补 v3 缺失的 id、也补 v3 条目的**空字段**
+// （fillModelInfo：如 default-model 的 credits 在 v3 为空、企业端点有值）；去重 key =
 // 模型 id，输出顺序稳定。两路全失败才返回错误（等价原「家族端点全非 2xx」
 // 负缓存语义）；单路失败降级为另一路结果 + warn 日志，互不拖累。
 func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
@@ -288,8 +289,30 @@ func mergeGlobalCatalog(primaryNames []string, primaryInfos []ModelInfo, seconda
 		outInfos = make([]ModelInfo, 0, len(primaryInfos)+len(secondaryInfos))
 		outInfos = append(outInfos, primaryInfos...)
 	}
+	// id → outInfos 下标（补字段用）。主路同名条目重复时以首个为准。
+	idx := make(map[string]int, len(outInfos))
+	for i, mi := range outInfos {
+		if _, ok := idx[mi.ID]; !ok {
+			idx[mi.ID] = i
+		}
+	}
 	for _, id := range secondaryNames {
-		if id == "" || seen[id] {
+		if id == "" {
+			continue
+		}
+		// 已有条目：用 secondary 的非空字段补空（primary 权威值不被动，只填空）。
+		// 旧口径在此直接 continue，导致 v3 里 credits 为空的条目（如 global 的
+		// default-model）丢掉企业端点下发的 x0.79，倍率列凭空少值。
+		if i, ok := idx[id]; ok {
+			for _, mi := range secondaryInfos {
+				if mi.ID == id {
+					outInfos[i] = fillModelInfo(outInfos[i], mi)
+					break
+				}
+			}
+			continue
+		}
+		if seen[id] {
 			continue
 		}
 		seen[id] = true
@@ -298,6 +321,7 @@ func mergeGlobalCatalog(primaryNames []string, primaryInfos []ModelInfo, seconda
 		// infos 保持原样（调用方按 id 名单输出裸条目，不编造字段）。
 		for _, mi := range secondaryInfos {
 			if mi.ID == id {
+				idx[id] = len(outInfos)
 				outInfos = append(outInfos, mi)
 				break
 			}
@@ -349,7 +373,7 @@ func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, []ModelI
 	}
 	c.CommonHeaders(req, a) // 共享请求头（Origin/Referer/UA），与 FetchModels 同款
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpForA(a).Do(req)
 	if err != nil {
 		return nil, nil, err
 	}

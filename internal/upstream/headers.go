@@ -158,19 +158,78 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("X-CodeBuddy-Request", "1")
 	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
 	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
-	req.Header.Set("Accept-Language", acceptLanguageFor(a))
+	req.Header.Set("Accept-Language", c.acceptLanguageFor(a))
 	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
 	// injectAccountStableHeaders）。注入在 CommonHeaders——chat 经 ChatHeaders
 	// 叠加 CommonHeaders 天然继承；billing 域另行注入，全出站覆盖。
 	c.injectAccountStableHeaders(req, a)
 }
 
-// acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
-func acceptLanguageFor(a *auth.Auth) string {
+// acceptLanguageFor 返回出站 Accept-Language。
+//
+// 顺序：global 域账号 → en-US；绑了代理的账号 → 按**实测出口 IP 所在国家/地区**
+// 对齐；其余 → zh-CN（既有行为，零回归）。
+//
+// 为什么要按出口所在地对齐：语言标识与来源地不自洽是风控的经典打分项。账号
+// 走着一个美国住宅 IP，却以 zh-CN + Asia/Shanghai 的官方客户端形态出现，等于
+// 自己申报「我在用代理」；反之国内出口发 zh-CN 完全自洽。geo 来自出口探测的
+// ip-api 源（见 egress.go），拿不到时一律回落 zh-CN——宁可保守也不猜。
+func (c *Client) acceptLanguageFor(a *auth.Auth) string {
 	if a != nil && a.IsGlobal() {
 		return "en-US"
 	}
+	if c != nil && c.AccountProxy != nil && a != nil {
+		if cc, ok := c.AccountProxy.CountryCode(a.UID); ok && cc != "" {
+			switch cc {
+			case "CN", "HK", "TW", "MO":
+				// 华语区细分：HK/TW 用各自地区变体，CN 保持原样（零回归）。
+				if cc == "HK" {
+					return "zh-HK"
+				}
+				if cc == "TW" || cc == "MO" {
+					return "zh-TW"
+				}
+				return "zh-CN"
+			default:
+				// 非华语出口：按出口地给主流语言（en-US 兜底）。
+				return acceptLanguageForCountry(cc)
+			}
+		}
+	}
 	return "zh-CN"
+}
+
+// acceptLanguageForCountry 出口国家 → Accept-Language 取值表。
+// 只列常见出口地；未列出的统一 en-US（比空值/乱猜安全：en-US 上游必然接受）。
+func acceptLanguageForCountry(cc string) string {
+	switch cc {
+	case "JP":
+		return "ja-JP"
+	case "KR":
+		return "ko-KR"
+	case "DE":
+		return "de-DE"
+	case "FR":
+		return "fr-FR"
+	case "ES", "MX", "AR":
+		return "es-ES"
+	case "BR":
+		return "pt-BR"
+	case "RU":
+		return "ru-RU"
+	case "SG", "MY":
+		return "en-SG"
+	case "GB", "IE":
+		return "en-GB"
+	case "AU", "NZ":
+		return "en-AU"
+	case "CA":
+		return "en-CA"
+	case "IN":
+		return "en-IN"
+	default:
+		return "en-US"
+	}
 }
 
 // injectCodeBuddyRequest 在 req 注入 X-CodeBuddy-Request: 1。
@@ -231,7 +290,12 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// 用量归属头：默认伪造 WorkBuddy 桌面端指纹（client_name="SaaS" 还原旧行为）。
 	c.injectAttribution(req)
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
-	c.injectClientIP(req, clientIP)
+	// 例外：该账号正在走账号代理时一律不透传——代理出口已经是这个账号的对外
+	// 身份，再把真实客户端 IP 塞进 X-Forwarded-For，等于一次请求里给出两个
+	// 互相矛盾的来源（既泄漏客户端，又给风控送一个"来源不一致"的实锤）。
+	if c.AccountProxy == nil || a == nil || !c.AccountProxy.UsingProxy(a.UID) {
+		c.injectClientIP(req, clientIP)
+	}
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
 	c.injectDeviceToken(req, a)
 	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
@@ -376,7 +440,7 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
 	c.injectCodeBuddyRequest(req)
 	// Accept-Language 按 realm 切（D5，billing 域未走 CommonHeaders，单独注入）。
-	req.Header.Set("Accept-Language", acceptLanguageFor(a))
+	req.Header.Set("Accept-Language", c.acceptLanguageFor(a))
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	} else if ua := c.billingUA(); ua != "" {

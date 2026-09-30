@@ -13,6 +13,14 @@ services:
     user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       - TZ=Asia/Shanghai
+    # DNS 容错：默认走 Docker 内嵌 DNS（127.0.0.11 → 宿主 systemd-resolved），
+    # 宿主 stub 偶发 "server misbehaving" 时，上游域名解析直接失败、chat 全线 503
+    # （2026-09-27 00:47 实测两次）。显式指定公共 DNS 作为直连上游，
+    # 绕开宿主 stub 这一层，抖动面小很多。
+    dns:
+      - 223.6.6.6
+      - 119.29.29.29
+      - 8.8.8.8
     ports:
       - "7863:7863"
     volumes:
@@ -23,3 +31,16 @@ services:
       # 但前提是它能以文件形式写入 —— 挂载目录会挡住这条路径）。
       # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
       - ./config.json:/app/config.json
+    # 让容器能用 host.docker.internal 访问宿主上的 resin 代理网关（2268/2269）。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      # 与 warp 代理容器同网，供 global 域走代理出口（config: upstream.proxy_global）。
+      # 国际版上游对网关出口 IP 做 WAF 风控，直连会被 403 拦截页整片封停。
+      - warp_default
+networks:
+  default:
+  warp_default:
+    external: true
+    name: warp_default

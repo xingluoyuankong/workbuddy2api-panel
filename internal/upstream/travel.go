@@ -57,6 +57,7 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
 		return nil, err
 	}
 	c.BillingHeaders(req, a)
+	reqWithAccount(req, a) // per-account 出站：把账号绑定到请求上下文
 	return c.doJSON(req)
 }
 

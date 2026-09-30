@@ -18,6 +18,13 @@ type Snapshot struct {
 	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
+	OnlyVerified         bool          // /v1/models 只暴露实测可调用的模型
+
+	// PromptMode / PromptText 系统提示词（面板可在线编辑）。
+	// 空串表示"未设置"——调用方回退静态配置（config.json 启动时加载的那份），
+	// 这样未改过提示词的部署完全走旧路径，零行为变化。
+	PromptMode string // "custom" / "passthrough"
+	PromptText string // custom 模式下注入的系统提示词全文
 }
 
 // Holder 原子持有当前快照。

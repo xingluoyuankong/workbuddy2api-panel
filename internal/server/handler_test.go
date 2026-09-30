@@ -786,10 +786,36 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	if rec.Code != 503 {
 		t.Errorf("code=%d body=%s", rec.Code, rec.Body)
 	}
+	// 503 必须带 Retry-After：旧实现无退避信号，客户端（含官方 IDE）会以约
+	// 3 次/秒 的密度重打（实测一次故障窗口单客户端 298 次）。上游未明示时用缺省 5s。
+	if ra := rec.Header().Get("Retry-After"); ra != "5" {
+		t.Errorf("Retry-After=%q want 5 (503 default backoff)", ra)
+	}
 	var e map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &e)
 	if e["error"] == nil {
 		t.Errorf("want error envelope: %s", rec.Body)
+	}
+}
+
+// TestChatSoftRate429CarriesRetryAfter 限流 429 带 Retry-After 退避信号。
+// 缺省取 10s（比 503 的 5s 更保守：限流恢复通常更慢）；上游明示时优先上游值。
+func TestChatSoftRate429CarriesRetryAfter(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, `{"code":1,"msg":"rate limit"}`, false
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 429 {
+		t.Fatalf("code=%d body=%s (want 429)", rec.Code, rec.Body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "10" {
+		t.Errorf("Retry-After=%q want 10 (429 default backoff)", ra)
 	}
 }
 
@@ -1053,9 +1079,10 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 			t.Fatalf("req %d: code=%d body=%s", i, rec.Code, rec.Body)
 		}
 	}
-	// 一轮探测 = 2 次上游调用（企业端点 + /v3/config 并发，两路全失败才进负缓存）。
-	if calls != 2 {
-		t.Errorf("want 2 probes (console + v3), got %d", calls)
+	// 一轮探测 = 3 次上游调用（企业端点 + /v3/config **双 UA 并发**各 1 次，
+	// 两路全失败才进负缓存）。v3/config 走双 UA 是因上游按 UA 分档下发目录。
+	if calls != 3 {
+		t.Errorf("want 3 probes (console + 2x v3/config dual-UA), got %d", calls)
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
@@ -1067,8 +1094,8 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("after cooldown: code=%d", rec.Code)
 	}
-	if calls != 4 {
-		t.Errorf("want 4 probes after cooldown (2 rounds x 2), got %d", calls)
+	if calls != 6 {
+		t.Errorf("want 6 probes after cooldown (2 rounds x 3), got %d", calls)
 	}
 }
 

@@ -52,6 +52,11 @@ type Pool struct {
 	stopCh chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
+
+	// proxyGate 账号代理闸门（见 SetProxyGate）；nil = 不过滤。
+	proxyGate func(uid string) bool
+	// egressOf 出口信息提供者（见 SetEgressProvider）；nil = 不展示出口。
+	egressOf func(uid string) *EgressInfo
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -152,6 +157,53 @@ func (p *Pool) SetMaxInFlight(n int) {
 
 // SetMaxInFlightGlobal 注入 global 域单账号在途上限（WAF 403 修复 P1-1 分档）；
 // 0 = 未设置，global 账号回落 maxInFlight（不分档）。负值保留原值。
+// SetProxyGate 注入账号代理闸门（可选；nil = 不过滤）。
+//
+// 用途：账号级代理在「出口 IP 与声明不符 / 代理根本没生效」时，账号的对外身份
+// 已经不可信。on_mismatch=quarantine 的部署里应把这类账号直接摘出选号池，
+// 而不是让它继续用一个身份不明的出口去撞风控。
+// 闸门只做「跳过」这一件事，不改变账号的冷却/禁用状态（代理修好即自动回池）。
+func (p *Pool) SetProxyGate(fn func(uid string) bool) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.proxyGate = fn
+	p.mu.Unlock()
+}
+
+// SetEgressProvider 注入出口信息提供者（可选；nil = 账号池不展示出口）。
+//
+// 同 SetProxyGate 的风格：pool 不反向依赖 upstream 包（那会成环），由 main 在
+// 装配期把 upstream.AccountProxy 的查询能力包成闭包注入。返回 nil 表示该账号
+// 没有账号级代理，面板显示「直连」。
+func (p *Pool) SetEgressProvider(fn func(uid string) *EgressInfo) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.egressOf = fn
+	p.mu.Unlock()
+}
+
+// egressFor 取账号出口信息（未注入提供者时返回 nil）。
+// 调用方需已持 p.mu（只读闭包，不会回打 pool，无死锁）。
+func (p *Pool) egressFor(uid string) *EgressInfo {
+	if p.egressOf == nil {
+		return nil
+	}
+	return p.egressOf(uid)
+}
+
+// proxyGateOK 判定账号是否通过代理闸门（未注入闸门时恒 true）。
+// 调用方需已持 p.mu。
+func (p *Pool) proxyGateOK(uid string) bool {
+	if p.proxyGate == nil {
+		return true
+	}
+	return p.proxyGate(uid)
+}
+
 func (p *Pool) SetMaxInFlightGlobal(n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

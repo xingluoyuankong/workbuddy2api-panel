@@ -3,9 +3,11 @@
 package upstream
 
 import (
+	"net"
 	"bytes"
 	"context"
 	"encoding/json"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -39,6 +42,10 @@ const (
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
+	ErrKind520                       // 520 错误（Cloudflare 解析失败）→ 立即重试，0ms 退避
+	ErrTransport                     // 通用传输错误 → 正常退避（500ms·2^i 封顶 8s）
+	ErrTransportTimeout              // 传输层超时 → 重退避（1s·2^i 封顶 16s）
+	ErrTransportEOF                  // 传输层 EOF → 重退避（1s·2^i 封顶 16s）
 )
 
 func (k ErrKind) String() string {
@@ -67,6 +74,14 @@ func (k ErrKind) String() string {
 		return "account_fault"
 	case ErrClient:
 		return "client"
+	case ErrKind520:
+		return "520"
+	case ErrTransport:
+		return "transport"
+	case ErrTransportTimeout:
+		return "transport_timeout"
+	case ErrTransportEOF:
+		return "transport_eof"
 	default:
 		return "none"
 	}
@@ -82,6 +97,14 @@ type Error struct {
 	// 冷却时长回落调用方计算值。挂载点选在 Error 信封：Kind 决定「罚不罚」，
 	// RetryAfter 决定「罚多久」，同为上游响应的一等公民。
 	RetryAfter time.Duration
+
+	// ContentFilter 标记本次 ErrContentBlocked 来自上游「内容审核空流」
+	// （HTTP 200 + finish_reason=content_filter + 空正文，见 contentfilter.go），
+	// 而不是 HTTP 400 的内容策略拦截。handler 据此区分处置：
+	//   - 400 形态：既有的 system 指纹误报路径（仅 passthrough 粘性降级）；
+	//   - content_filter 形态：模型级输入审核（custom 模式也会撞），
+	//     允许在**本请求内**用中性提示词重试一次（不触发粘性降级）。
+	ContentFilter bool
 }
 
 func (e *Error) Error() string {
@@ -148,10 +171,44 @@ var contentBlockedMarkers = []string{
 	"illegal api invocation",
 }
 
-// badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
-// "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
-// 与账号健康无关——不罚号，但仍轮转（commit B）。
-var badParamsMarkerMsg = "Unmarshal chat params failed"
+// badParamsMarkers 请求体被上游**解析层**拒绝的关键词（HTTP 400 家族）。
+//
+// 实测三类（2026-09-19 直连上游，stream:true）：
+//   - "Unmarshal chat params failed"（11101）：body JSON 解析失败（issue #41）；
+//   - "Parse message failed"（11101）：content/part 结构不在白名单（未知 content
+//     type / image_url 不是对象 / part 缺 type）；网关侧已做方言归一化
+//     （见 image.go），此处是归一化覆盖不到的残余形态兜底；
+//   - "first message is not system prompt"（11128）：messages[0] 不是 system，
+//     网关侧已由 ensureLeadingSystem 兜底，此 marker 防漏网。
+//
+// 三者的共同点：**与账号健康完全无关** —— 同一份 body 换任何账号都被同样拒绝。
+// 因此归 ErrBadParams（不冷却/不熔断/不喂连败），handler 侧直接 400 透传上游原文
+// 并**终止轮转**（换号只会白烧健康号配额）。
+var badParamsMarkers = []string{
+	"Unmarshal chat params failed",
+	"Parse message failed",
+	"first message is not system prompt",
+}
+
+// badParamsCodes 与上同源的 code 字段形态（codeMarker 判定，容差口径统一）。
+var badParamsCodes = []string{"11101", "11128"}
+
+// badParamsBody 判定上游 400 body 是否属于「请求体本身被拒」（与账号无关）。
+// body 为上游原始响应体（原文，非小写）。
+func badParamsBody(body string) bool {
+	for _, m := range badParamsMarkers {
+		if strings.Contains(body, m) {
+			return true
+		}
+	}
+	lower := strings.ToLower(body)
+	for _, c := range badParamsCodes {
+		if codeMarker(lower, c) {
+			return true
+		}
+	}
+	return false
+}
 
 // promptTooLongMarkers 11115「prompt is too long」判定。
 // 定位：上下文超限是**请求的问题不是账号的问题**——同一个 body 换任何账号发都会
@@ -181,7 +238,6 @@ func isPromptTooLongStatus(status int) bool {
 // 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var alreadyCheckinMarkers = []string{"已签到", "already"}
-var badParamsMarkerCode = `"code":11101`
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -205,6 +261,45 @@ var (
 	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
 	reSoftRateReset  = regexp.MustCompile(softRateResetPattern)
 )
+
+// queueWaitCode 上游「排队等待」业务 code（实测 2026-09-22）。
+//
+//	{"code":6020,"msg":"queue.waiting.title","data":{"queue_position":2159,
+//	 "queue_size":"999+","retry_after":40,"estimated_wait":10795,...}}
+//
+// 语义：**不是账号被限流**，是该模型此刻在排大队（位置 2000+），账号本身健康、
+// 换模型立刻可用。必须按「模型级」而不是「账号级」处置——按账号级会让一个排队
+// 模型把整个账号池依次打成 600s 冷却，池空之后连别的模型一起 503
+// （2026-09-22 线上事故：483 次 429 + 146 次 uid=- 的 503，用户误以为"账号全废"）。
+const queueWaitCode = "6020"
+
+// queueWaitMarker 6020 的固定 msg（上游未本地化时原样透出的文案 key）。
+const queueWaitMarker = "queue.waiting"
+
+// reQueueWait code 字段形态判定（空格/字符串容差，口径同 reModelRateLimit）。
+var reQueueWait = regexp.MustCompile(`"code"\s*:\s*"?` + queueWaitCode + `"?`)
+
+// IsQueueWait 报告响应体是否为上游「排队等待」（6020 queue.waiting）。
+//
+// 双通道（code 6020 或 msg 含 queue.waiting）任一命中即算：宁宽勿漏——
+// 漏判的代价是整个账号池被误按账号级冷却（见 queueWaitCode 注释的事故）。
+func IsQueueWait(body string) bool {
+	return reQueueWait.MatchString(body) || strings.Contains(body, queueWaitMarker)
+}
+
+// ParseQueueWait 解析 6020 body 的建议等待时长（data.retry_after，单位秒）。
+// 缺失/非法/非正 → 0（冷却时长的夹取区间由策略层 handler 决定）。
+func ParseQueueWait(body string) time.Duration {
+	var v struct {
+		Data struct {
+			RetryAfter float64 `json:"retry_after"`
+		} `json:"data"`
+	}
+	if json.Unmarshal([]byte(body), &v) != nil || v.Data.RetryAfter <= 0 {
+		return 0
+	}
+	return time.Duration(v.Data.RetryAfter * float64(time.Second))
+}
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
@@ -492,12 +587,12 @@ func Classify(status int, body string) ErrKind {
 				return ErrContentBlocked
 			}
 		}
-		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
-		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
-		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-		// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
-		// 模型权限，值得再试一次）。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+		// 请求体被上游解析层拒绝（11101 / 11128 家族，见 badParamsMarkers）：
+		// 「发给上游的 body 有问题」。网关侧截断已由 413 消灭（issue #41 commit A）；
+		// 多模态方言已由 image.go 归一化；首条非 system 已由 ensureLeadingSystem 兜底。
+		// 剩下的残余形态仍归 ErrBadParams：不冷却/不熔断/不计错，且 handler 侧
+		// 直接 400 透传上游原文、**不轮转**（换号对这个 body 永远无效）。
+		if badParamsBody(body) {
 			return ErrBadParams
 		}
 		return ErrClient
@@ -521,6 +616,28 @@ type Client struct {
 	// Transport.ResponseHeaderTimeout 约束，流中空闲由 IdleTimeout 约束。
 	// 与 HTTP 共享同一个 *http.Transport 实例，连接池不重复。
 	ChatHTTP *http.Client
+
+	// HTTPGlobal / ChatHTTPGlobal 单代理模式下的 global 域专用 client。
+	// 仅在只配了一个代理时使用（保持向后兼容）；多代理时走 globalProxies。
+	//
+	// 背景：国际版上游对网关**出口 IP** 做 WAF 风控——10 秒内两个不同账号都撞
+	// 403 即判 IP 级封锁，整片请求 503，换账号完全无效（同 IP）。让 global 走
+	// 代理出口是最直接的解法；出口 IP 被盯上时换一个出口即可立刻恢复。
+	//
+	// 只作用于 global 域：CN 域保持直连——国内 IP 访问国内上游更稳、延迟更低，
+	// 而且 CN 域没有这个 WAF 问题。nil 时全局回退 HTTP/ChatHTTP（零行为变化）。
+	HTTPGlobal     *http.Client
+	ChatHTTPGlobal *http.Client
+
+	// realmProxies 按 realm 隔离的多代理出口池。
+	//   global：config upstream.proxy_global（静态）+ 订阅池刷新（动态，见 SubPool）
+	//   cn    ：仅订阅池刷新；无订阅时为空 → cn 恒直连（现状不变）。
+	// 两池互不互通：global 账号只从 global 池选路，cn 账号只从 cn 池选路。
+	// 每个请求轮询选一个出口；连续失败的出口临时降权跳过，其余继续可用——
+	// 单一出口被上游 WAF 盯上时不会整片不可用。
+	realmProxies map[string][]*proxyEntry
+	realmMu      sync.Mutex
+	proxyCursor   atomic.Uint32
 
 	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
 	HeaderTimeout time.Duration
@@ -583,6 +700,9 @@ type Client struct {
 	ChatBaseGlobal    string
 	BillingBaseGlobal string
 
+	// AccountProxy 账号级出站代理守卫（per-account 代理绑定 + 出口一致性校验）。
+	// nil = 未启用，所有出站行为与既有逻辑逐字一致。
+	AccountProxy *AccountProxy
 	// GlobalEnabled 是否启用 global realm 路由（config global.enabled，缺省 true）。
 	// false 时即便用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
@@ -613,6 +733,389 @@ func (c *Client) chatHTTP() *http.Client {
 		return c.ChatHTTP
 	}
 	return c.HTTP
+}
+
+// httpFor 按 realm 返回普通出站 client（global 走代理，其余直连）。
+func (c *Client) httpFor(realm string) *http.Client {
+	if e := c.pickProxy(realm); e != nil {
+		return e.http
+	}
+	return c.HTTP
+}
+
+// chatHTTPFor 按 realm 返回聊天出站 client（global 走代理，其余直连）。
+func (c *Client) chatHTTPFor(realm string) *http.Client {
+	if e := c.pickProxy(realm); e != nil {
+		return e.chat
+	}
+	return c.chatHTTP()
+}
+
+// proxyEntry 单个 global 域代理出口。
+type proxyEntry struct {
+	raw  string
+	http *http.Client
+	chat *http.Client
+	// fails 连续失败次数；deadUntil 在此之前跳过该出口（unix nano）。
+	// 用「临时降权」而不是永久剔除：免费代理池抖动很常见，几分钟后可能又好了。
+	fails     atomic.Int32
+	deadUntil atomic.Int64
+
+	// untrustedUntil TLS 劫持（MITM）嫌疑熔断截止。
+	//
+	// 与普通失败分开计：连不上/超时只是不可用，**证书校验失败 = 出口在劫持
+	// HTTPS**（实测 resin 免费池 2026-09-27 出现自签证书节点）。经过这种出口
+	// 的请求会把 Authorization Bearer token 明文交给劫持者，且响应可被篡改。
+	// 所以 MITM 嫌疑的出口必须长熔断（30min 起步、翻倍、封顶 6h），而不是
+	// 普通失败的 10s~2min——一次成功响应不能洗白它（聚合池背后是随机节点，
+	// 这次干净不代表下次干净），到期后重试再犯则继续翻倍。
+	untrustedUntil atomic.Int64
+	mitmHits       atomic.Int32
+
+	// latencyEWMA 成功请求「响应头耗时」的指数移动平均（毫秒；0 = 无样本）。
+	// 选路依据：resin 池节点延迟差 5 倍（实测 TTFB 5s~22s+），只看「是否失败」
+	// 会让慢节点（没失败但 TTFB 20s+）被反复选中——用户感知就是「卡死」。
+	// EWMA 平滑单次抖动；pickProxy 优先 EWMA 低的健康出口。
+	latencyEWMA atomic.Int64
+}
+
+// proxySkipFor 连续失败后跳过该出口的时长（按失败次数递增，封顶 2 分钟）。
+func proxySkipFor(fails int32) time.Duration {
+	d := 10 * time.Second
+	for i := int32(1); i < fails && d < 2*time.Minute; i++ {
+		d *= 2
+	}
+	if d > 2*time.Minute {
+		d = 2 * time.Minute
+	}
+	return d
+}
+
+func (e *proxyEntry) noteFail() {
+	n := e.fails.Add(1)
+	e.deadUntil.Store(time.Now().Add(proxySkipFor(n)).UnixNano())
+}
+
+// noteLatency 记录一次响应头耗时，更新 EWMA（α=0.3，兼顾响应速度与抗抖动）。
+// 只记样本不做惩罚——慢可能是模型长思考而非链路问题（误降权会饿死合法请求），
+// 惩罚交给选路：EWMA 高的健康出口在第一轮被自然跳过，流量流向快的出口。
+func (e *proxyEntry) noteLatency(d time.Duration) {
+	ms := d.Milliseconds()
+	if ms <= 0 {
+		return
+	}
+	old := e.latencyEWMA.Load()
+	var v int64
+	if old <= 0 {
+		v = ms
+	} else {
+		v = old*7/10 + ms*3/10
+	}
+	e.latencyEWMA.Store(v)
+}
+
+// slowLatencyMS 延迟可接受阈值（EWMA 超过它 = 出口慢，第一轮选路跳过）。
+// 实测 resin 池快节点 TTFB~5s、慢节点 20s+，20s 是「明显卡」的分界。
+const slowLatencyMS = 20000
+
+// noteUntrusted 记一次 TLS 劫持嫌疑：长熔断 + SECURITY 告警。
+// 日志只打 host（raw 里有凭据，不能进日志）。
+func (e *proxyEntry) noteUntrusted() {
+	n := e.mitmHits.Add(1)
+	backoff := 30 * time.Minute
+	for i := int32(1); i < n && backoff < 6*time.Hour; i++ {
+		backoff *= 2
+	}
+	// 乘后再 clamp：原条件在乘法前检查，4h<6h 会再乘成 8h，封顶失效。
+	if backoff > 6*time.Hour {
+		backoff = 6 * time.Hour
+	}
+	e.untrustedUntil.Store(time.Now().Add(backoff).UnixNano())
+	e.deadUntil.Store(e.untrustedUntil.Load())
+	e.fails.Store(1 << 20) // 让「健康优先」第一轮必然跳过
+	host := e.raw
+	if u, err := url.Parse(e.raw); err == nil && u.Host != "" {
+		host = u.Host
+	}
+	log.Printf("SECURITY: global 代理出口 %s 疑似 TLS 劫持（证书校验失败），熔断 %s（第 %d 次）。"+
+		"经过该出口的流量（含账号 token）可能已被截获——建议检查该出口来源，"+
+		"必要时重新登录经它用过的账号", host, backoff, n)
+}
+
+// untrusted 报告出口当前是否处于 MITM 嫌疑熔断期。
+func (e *proxyEntry) untrusted(now int64) bool {
+	return e.untrustedUntil.Load() > now
+}
+
+func (e *proxyEntry) noteSuccess() {
+	e.fails.Store(0)
+	e.deadUntil.Store(0)
+}
+
+// pickProxy 选择本次请求（指定 realm）的出口：健康优先，坏出口退为后备。
+// 三轮策略：健康（无失败+不在冷却+无 MITM 嫌疑）→ 冷却期外轮询 → 非 MITM 兜底。
+// 全部出口都在 MITM 熔断期 → 返回 nil 回落直连（把 token 交给劫持者比 403 更糟）。
+// realm 隔离：global 与 cn 各自独立成池，互不取用。
+func (c *Client) pickProxy(realm string) *proxyEntry {
+	key := realmKey(realm)
+	c.realmMu.Lock()
+	if c.realmProxies == nil {
+		c.realmProxies = map[string][]*proxyEntry{}
+	}
+	entries := c.realmProxies[key]
+	c.realmMu.Unlock()
+	n := len(entries)
+	if n == 0 {
+		return nil
+	}
+	if n == 1 {
+		return entries[0]
+	}
+	start := int(c.proxyCursor.Add(1)-1) % n
+	now := time.Now().UnixNano()
+	// mitmBan 永久剔除标记：劫持累计 >=3 次 = 该出口稳定在劫持（不是偶发），
+	// 6h 熔断到期后回来只会再劫持——任何轮次都不再选它。
+	// 剔除只影响选路，条目保留（订阅刷新时整体重建，人工可换链接救回）。
+	const mitmBan = 3
+	good := func(e *proxyEntry, now int64) bool { return e.mitmHits.Load() < mitmBan }
+	healthy := func(e *proxyEntry, now int64) bool {
+		return good(e, now) && e.fails.Load() == 0 && e.deadUntil.Load() <= now && !e.untrusted(now)
+	}
+
+	// 第一轮：健康 **且延迟可接受**（EWMA 未超阈值或无样本）→ 轮询分散。
+	// 这是「自动用稳定出口」的核心：慢节点（EWMA 20s+）不再被选中，流量自然
+	// 集中到快节点；全慢时落到第二轮，仍可用只是慢。
+	for i := 0; i < n; i++ {
+		if e := entries[(start+i)%n]; healthy(e, now) {
+			if l := e.latencyEWMA.Load(); l > 0 && l > slowLatencyMS {
+				continue
+			}
+			return e
+		}
+	}
+	// 第一轮落空（全慢/全冷却）→ 原健康轮询（延迟不设限，可用性优先）。
+	for i := 0; i < n; i++ {
+		if e := entries[(start+i)%n]; healthy(e, now) {
+			return e
+		}
+	}
+	// 第二轮：没有健康出口 → 跳过期外轮询（避开 MITM 嫌疑/永久剔除出口）。
+	for i := 0; i < n; i++ {
+		if e := entries[(start+i)%n]; good(e, now) && e.deadUntil.Load() <= now && !e.untrusted(now) {
+			return e
+		}
+	}
+	// 兜底：宁可试一个普通失败的（退避期几分钟自愈），也不放弃该 realm；
+	// 但永久剔除的（劫持 >=3 次）任何情况下都不选——把 token 交给已知劫持者
+	// 比一次 503 严重得多。
+	for i := 0; i < n; i++ {
+		if e := entries[(start+i)%n]; good(e, now) && !e.untrusted(now) {
+			return e
+		}
+	}
+	return nil
+}
+// proxyRT 包装出站 Transport，统计每个出口的成败（供 pickGlobalProxy 降权）。
+type proxyRT struct {
+	base  http.RoundTripper
+	entry *proxyEntry
+}
+
+func (t *proxyRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	start := time.Now()
+	resp, err := t.base.RoundTrip(req)
+	// 响应头耗时（不含 body）记入 EWMA——不管成败都记：失败请求的耗时同样是
+	// 该出口链路质量的信号。noteSuccess/noteFail 已处理成败语义，这里只补延迟。
+	lat := time.Since(start)
+	switch {
+	case err != nil && isTLSInterception(err):
+		// 证书校验失败 = 出口在劫持 HTTPS（MITM）：长熔断 + 告警，
+		// 绝不能当普通失败 10s 后就放它回来。
+		t.entry.noteUntrusted()
+	case err != nil:
+		t.entry.noteFail() // 连不上代理 / 代理连不上目标
+	case resp.StatusCode == http.StatusForbidden:
+		// 国际版 WAF 以 403 HTML 拦截页返回。把当前出口临时降权，
+		// 下一次 global 请求换另一个 resin/warp 出口；不要把 403 当成功，
+		// 否则代理池永远不会避开已被 WAF 盯上的出口。
+		t.entry.noteFail()
+	case resp.StatusCode == http.StatusBadGateway:
+		// 代理网关自己的 502 通常表示该池节点失效；503 可能是上游业务
+		// 失败（如 6004/服务暂时不可用），不能误杀当前出口。
+		t.entry.noteFail()
+	default:
+		// 429/503 等上游业务响应不等于代理坏：让 handler 按账号/模型语义处理。
+		t.entry.noteSuccess()
+	}
+	t.entry.noteLatency(lat)
+	return resp, err
+}
+
+// isTLSInterception 判定出站错误是否为 TLS 证书校验失败（劫持/MITM 特征）。
+// Go 会把 x509 错误包在 *url.Error 里，errors.As 能穿透包装逐层找。
+// 同时兜底匹配错误文本——不同 TLS 库版本的包装不完全一致，宁可多报不可漏报。
+func isTLSInterception(err error) bool {
+	if err == nil {
+		return false
+	}
+	var unknown x509.UnknownAuthorityError
+	if errors.As(err, &unknown) {
+		return true
+	}
+	var hostname x509.HostnameError
+	if errors.As(err, &hostname) {
+		return true
+	}
+	var invalid x509.CertificateInvalidError
+	if errors.As(err, &invalid) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "certificate is not valid for any names") ||
+		strings.Contains(msg, "self-signed certificate") ||
+		strings.Contains(msg, "certificate signed by unknown authority") ||
+		strings.Contains(msg, "certificate has expired") && strings.Contains(msg, "workbuddy")
+}
+
+func (t *proxyRT) CloseIdleConnections() {
+	if ci, ok := t.base.(closeIdler); ok {
+		ci.CloseIdleConnections()
+	}
+}
+
+// SetRealmProxy 设置指定 realm 的出站代理池（逗号分隔多条），返回错误与否。
+// 会**替换**该 realm 现有池（订阅刷新即以此重建）。空串 = 清除该 realm 池。
+// 代理不可用不会让启动失败——首次请求时才暴露（连接错误会被现有错误分类
+// 归为传输层失败并正常轮转），避免"代理挂掉导致网关起不来"。
+func (c *Client) SetRealmProxy(realm, rawURL string) error {
+	raw := strings.TrimSpace(rawURL)
+	key := realmKey(realm)
+	c.realmMu.Lock()
+	if c.realmProxies == nil {
+		c.realmProxies = map[string][]*proxyEntry{}
+	}
+	set := func(entries []*proxyEntry) {
+		c.realmProxies[key] = entries
+	}
+	c.realmMu.Unlock()
+
+	if raw == "" {
+		c.realmMu.Lock()
+		delete(c.realmProxies, key)
+		c.realmMu.Unlock()
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	entries := make([]*proxyEntry, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		e, err := newProxyEntry(p)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, e)
+	}
+	c.realmMu.Lock()
+	set(entries)
+	c.realmMu.Unlock()
+	// 旧字段兼容：global 单代理时填充 HTTPGlobal/ChatHTTPGlobal（既有调用方
+	// 与测试语义）；多代理时清空走池。cn 域无此遗留字段。
+	if key == "global" {
+		if len(entries) == 1 {
+			c.HTTPGlobal, c.ChatHTTPGlobal = entries[0].http, entries[0].chat
+		} else {
+			c.HTTPGlobal, c.ChatHTTPGlobal = nil, nil
+		}
+	}
+	return nil
+}
+
+// SetGlobalProxy 兼容包装：等价 SetRealmProxy("global", raw)。
+func (c *Client) SetGlobalProxy(rawURL string) error {
+	return c.SetRealmProxy("global", rawURL)
+}
+// newProxyEntry 解析一个代理 URL 并构造带成败统计的 client 对。
+func newProxyEntry(raw string) (*proxyEntry, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("proxy url %q: %w", raw, err)
+	}
+	host := u.Host
+	if host == "" {
+		return nil, fmt.Errorf("proxy url %q: missing host", raw)
+	}
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		return nil, fmt.Errorf("proxy url %q: host must be host:port", raw)
+	}
+
+	e := &proxyEntry{raw: raw}
+	var tr *http.Transport
+	switch strings.ToLower(u.Scheme) {
+	case "socks5", "socks5h":
+		d := &socks5Dialer{addr: host, forward: newDialer()}
+		if u.User != nil {
+			d.user = u.User.Username()
+			d.pass, _ = u.User.Password()
+		}
+		tr = newTransport()
+		tr.DialContext = d.DialContext
+	case "http", "https":
+		tr = newTransport()
+		tr.Proxy = http.ProxyURL(u)
+	default:
+		return nil, fmt.Errorf("proxy url %q: unsupported scheme %q (want socks5/http/https)", raw, u.Scheme)
+	}
+	rt := &proxyRT{base: tr, entry: e}
+	e.http = &http.Client{Timeout: 120 * time.Second, Transport: rt}
+	e.chat = &http.Client{Timeout: 0, Transport: rt}
+	return e, nil
+}
+
+// GlobalProxyActive 报告 global 域是否已启用代理出口（供 /status 与面板透出）。
+// GlobalProxyActive 报告 global 域是否已启用代理出口（供 /status 与面板透出）。
+func (c *Client) GlobalProxyActive() bool { return c.ProxyCount("global") > 0 }
+
+// GlobalProxyCount 返回当前 global 出口池数量。
+// handler 用它决定是否跳过单出口假设的 IP 级 WAF 门控：多出口时应换出口，
+// 而不是把整站 global 请求一起限住。
+// ProxyCount 指定 realm 的出口池条数（0 = 无池，该 realm 直连）。
+func (c *Client) ProxyCount(realm string) int {
+	c.realmMu.Lock()
+	defer c.realmMu.Unlock()
+	return len(c.realmProxies[realmKey(realm)])
+}
+
+// GlobalProxyCount 兼容包装（global 池条数）。
+func (c *Client) GlobalProxyCount() int { return c.ProxyCount("global") }
+
+// ProxySummary 返回指定 realm 出口池的健康摘要（面板/日志展示用，不含凭据）。
+// 返回形如 ["warp:1080 ok", "172.17.0.1:2269 fails=3 skip 40s"] 的列表。
+func (c *Client) ProxySummary(realm string) []string {
+	c.realmMu.Lock()
+	entries := c.realmProxies[realmKey(realm)]
+	c.realmMu.Unlock()
+	out := make([]string, 0, len(entries))
+	now := time.Now().UnixNano()
+	for _, e := range entries {
+		label := e.raw
+		if u, err := url.Parse(e.raw); err == nil && u.Host != "" {
+			label = u.Host // 去掉凭据
+		}
+		f := e.fails.Load()
+		switch {
+		case f == 0:
+			out = append(out, label+" ok")
+		case e.deadUntil.Load() > now:
+			left := time.Duration(e.deadUntil.Load()-now) / time.Second
+			out = append(out, fmt.Sprintf("%s fails=%d skip %s", label, f, left*time.Second))
+		default:
+			out = append(out, fmt.Sprintf("%s fails=%d (retrying)", label, f))
+		}
+	}
+	return out
 }
 
 // defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
@@ -647,15 +1150,57 @@ const (
 )
 
 // chatPaths 按 realm 返回 chat 端点路径候选序列：
-// global → [console, v2]（404/405 时 fallback）；cn → [v2]（现状逐字，零回归）。
+//
+//	global → [/v2/chat/completions, /console/chat/completions]
+//	cn     → [/v2/chat/completions]（逐字不变，零回归）
+//
+// 【为什么 global 首选 /v2 而不是 /console】2026-09-19 实测：www.workbuddy.ai
+// 前置的腾讯云 WAF，其内容规则**只覆盖 /console 路径**。global 首选 /console
+// 的代价是——只要 body 带攻击特征串（安全/SRC 类 Agent 的工具输出天然带），
+// 每个请求都要先撞一次 403 拦截页、白跑一个往返，再回退到 /v2 才成功
+// （实测 global 请求 TTFB 因此被拖到 68s）。
+//
+// 首选 /v2 后完全不碰 WAF，少一次注定失败的出站。
+//
+// 【等价性】切换前逐项实测 /console 与 /v2 形态完全一致：
+//   - 全部 23 个 global 模型：SSE + content + reasoning + tool 字段全齐，两路一致；
+//   - tools 真实调用：两路都正常返回 tool_calls；
+//   - 图片输入：两路报同一个上游错误（11128 first message is not system prompt），
+//     行为一致；
+//   - 多轮回传 reasoning_content、40 轮长上下文：两路均正常。
+//
+// /console 保留为 fallback（404/405 或 WAF 拦截页 403 时启用，见 chatPathFallback）。
 func (c *Client) chatPaths(a *auth.Auth) []string {
 	if c.globalOn(a) {
-		return []string{globalChatConsolePath, chatCompletionsPath}
+		return []string{chatCompletionsPath, globalChatConsolePath}
 	}
 	return []string{chatCompletionsPath}
 }
 
 func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
+
+// chatPathFallback 判定该响应是否应改走下一个候选路径。
+//
+// 除既有的 404/405（路径不存在）外，追加 **WAF 拦截页 403**：
+//
+// 实测（2026-09-19，global 域 www.workbuddy.ai，用用户真实抓包 body 验证）：
+// 国际版前置的腾讯云 WAF 规则**只覆盖 /console 路径**——同一份触发内容
+// （含 SQL 注入 / 路径穿越 / 命令执行等特征串的 Agent 工具输出）走
+// /console/chat/completions 被 403 整包拦下，改走同主机的 /v2/chat/completions
+// 则**正常进入业务层**（不再返回 WAF 页）。两条路径同一套后端，能力等价。
+//
+// 因此把「WAF 拦截页」也纳入路径回退条件，而不是把 403 当终局错误去冷却账号、
+// 轮转、最终回 503。global 已改为**首选 /v2**（见 chatPaths，正常流量不再碰 WAF），
+// 本回退作为保险保留：万一 WAF 规则将来扩到 /v2，仍会自动试 /console。
+//
+// 判定口径复用 IsWafBlocked（403 且无业务信封）：带业务信封的 403（11140 等）
+// 仍走既有分类链，不会被误当路径问题。
+func chatPathFallback(status int, body []byte) bool {
+	if chatFallbackHTTPStatus(status) {
+		return true
+	}
+	return IsWafBlocked(status, string(body))
+}
 
 // billing 域端点路径（billingBase + path）。balance/checkin 与 report（report.go）同域，
 // 统一走 billingJSON 发请求。
@@ -772,7 +1317,8 @@ func (c *Client) webBase(a *auth.Auth) string {
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+	// 账号感知出站：请求上下文里带账号时走该号绑定的代理，否则回落 c.HTTP（零变化）。
+	resp, err := c.httpForReq(req).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -847,6 +1393,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 I/O（锁外，30s 上限）。
+	reqWithAccount(req, a) // per-account 出站：把账号绑定到请求上下文
 	data, err := c.doJSON(req)
 	if err != nil {
 		return err
@@ -906,17 +1453,21 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // 原文）。判定为 ErrNone 的响应（理论上不存在，防御）err 为 nil，handler 按
 // respBody 自行兜底。
 //
-// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody
-// 后统一套用全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
+// ensureLeadingSystem 在 prepareBody 后统一套用：首条消息非 system 时前置兜底
+// system（防上游 code 11-128 "first message is not system prompt"，所有 realm）。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// global 首次路径 404/405 时换 fallback 路径重试。
+	// 首条消息 system 兜底对**所有 realm** 套用（不再只管 global）：
+	// 上游要求 messages[0] 必须是 system，否则 400 code=11128
+	// "first message is not system prompt"（实测见 ensureLeadingSystem）。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
-	if c.globalOn(a) {
-		prepared = ensureConsoleSystem(prepared)
-	}
+	prepared = ensureLeadingSystem(prepared)
+	// codex 系模型参数兼容（2026-09-27 实测）：global:gpt-5.4 / gpt-5.3-codex 对
+	// max_tokens / max_completion_tokens 一律 400 11133 model_param_invalid，
+	// 不带则 200。剥参代价 = 输出上限走模型默认，远好于整请求失败。
+	prepared = stripUnsupportedParamsForModel(prepared)
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
@@ -931,14 +1482,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
-		resp, err := c.chatHTTP().Do(req)
+		resp, err := c.chatHTTPForA(a).Do(req)
 		if err != nil {
 			cancel()
-			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+			log.Printf("ERR: [upstream] chat_stream uid=%s realm=%s model=%s: transport error: %v",
+				logfmt.UID8(a.UID), realmKey(a.Realm()), modelOf(prepared), err)
 			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能仍
 			// 留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期
 			// 不够，主动清池才断根。
-			roundTripCloseIdle(c.chatHTTP().Transport)
+			roundTripCloseIdle(c.chatHTTPForA(a).Transport)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -948,14 +1500,19 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
 			// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。
 			if rerr != nil {
-				log.Printf("ERR: [upstream] chat_stream uid=%s: read body: %v", logfmt.UID8(a.UID), rerr)
+				log.Printf("ERR: [upstream] chat_stream uid=%s realm=%s model=%s: read body: %v",
+					logfmt.UID8(a.UID), realmKey(a.Realm()), modelOf(prepared), rerr)
 				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
 			}
 			kind := Classify(resp.StatusCode, string(raw))
-			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
-				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
-			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
-			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
+			log.Printf("WARN: [upstream] chat_stream uid=%s realm=%s model=%s: upstream %d %s body=%s",
+				logfmt.UID8(a.UID), realmKey(a.Realm()), modelOf(prepared), resp.StatusCode, kind, truncate(string(raw), 200))
+			// global 首次路径 404/405 或 **WAF 拦截页 403** → 换 fallback 路径重试
+			// （见 chatPathFallback：WAF 规则只覆盖 /console，/v2 可直通）；其余状态码直接返回。
+			if attempt < len(c.chatPaths(a))-1 && chatPathFallback(resp.StatusCode, raw) {
+				log.Printf("WARN: [upstream] chat_stream uid=%s realm=%s model=%s: %s returned %d, retrying on %s",
+					logfmt.UID8(a.UID), realmKey(a.Realm()), modelOf(prepared), path, resp.StatusCode,
+					c.chatPaths(a)[attempt+1])
 				continue
 			}
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析）：
@@ -969,12 +1526,71 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			}
 			return nil, resp.StatusCode, raw, ue
 		}
+		// 内容审核空流嗅探（contentfilter.go）：上游 200 但 finish_reason=content_filter
+		// 且全程无正文时，原样透传会让客户端收到「空回复」（tok=0）且网关完全无感——
+		// 这正是 global 域「模型调不通但没有任何报错」的现场。命中即按内容拦截返回
+		// （Status 归 400，与 400 内容策略拦截同口径），账号不罚（内容问题非账号问题），
+		// 由 handler 决定「换中性提示词在本请求内重试」还是「回明确错误」。
+		// 未命中时 body 是回放式包装，对下游逐字节等价（见 sniffContentFilter）。
+		body, filtered := sniffContentFilter(resp.Body)
+		if filtered {
+			resp.Body.Close()
+			cancel()
+			log.Printf("WARN: [upstream] chat_stream uid=%s: content_filter (finish_reason=%s, empty completion) -> treated as content blocked",
+				logfmt.UID8(a.UID), contentFilteredFinish)
+			return nil, http.StatusBadRequest, []byte(ContentFilteredBody), &Error{
+				Kind:          ErrContentBlocked,
+				Status:        http.StatusBadRequest,
+				Msg:           ContentFilteredBody,
+				ContentFilter: true,
+			}
+		}
 		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
 		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
-		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
+		return monitorBody(body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 	}
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
+}
+
+// stripUnsupportedParamsForModel 剥掉特定模型不接受、会直接 400 的请求参数。
+//
+// 现状（2026-09-27 上游实测）：global 域 codex 系（gpt-5.3-codex / gpt-5.4）对
+// max_tokens / max_completion_tokens 一律返回 400 code=11133 model_param_invalid，
+// 两个参数去掉任何一个都仍然 11133，只有完全不带才 200。CN 域模型与 global 的
+// glm/hy4/kimi/deepseek 系实测无此限制。
+//
+// 规则：模型名含 codex 或以 gpt- 开头（OpenAI 系）→ 剥 max_tokens /
+// max_completion_tokens。误剥的代价是「输出上限走模型默认上限」，远好于整个
+// 请求被 400 打回；因此按名字前缀宽匹配，而不是维护一张精确名单。
+func stripUnsupportedParamsForModel(body []byte) []byte {
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	model, _ := m["model"].(string)
+	if model == "" {
+		return body
+	}
+	ml := strings.ToLower(model)
+	if !strings.Contains(ml, "codex") && !strings.HasPrefix(ml, "gpt-") {
+		return body
+	}
+	changed := false
+	for _, k := range []string{"max_tokens", "max_completion_tokens"} {
+		if _, ok := m[k]; ok {
+			delete(m, k)
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens + 上游模型对象全字段）。
@@ -1049,7 +1665,7 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 		DefaultEffort:      def,
 		SupportsImages:     m.SupportsImages,
 		Description:        m.Description,
-		Credits:            m.Credits,
+		Credits:            normalizeCredits(m.Credits),
 		Tags:               m.Tags,
 		Vendor:             m.Vendor,
 		IsDefault:          m.IsDefault,
@@ -1061,6 +1677,26 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 		ReasoningEffort:    m.Reasoning.Effort,
 		ReasoningSummary:   m.Reasoning.Summary,
 	}
+}
+
+// normalizeCredits 归一化上游 credits 倍率原文。
+//
+// 上游同一份目录里格式都不统一（实测 2026-09）：/v3/config 用 IDE UA 时返回纯
+// "x0.79"，用 WorkBuddy UA 时部分条目返回 "x0.34 credits"；企业端点
+// （/v2/enterprises/personal/models）整表带 " credits" 后缀。不归一化会让
+// /v1/models 透出 "x0.77 credits" 这类脏值（面板与客户端解析倍率时踩坑）。
+// 只裁后缀、不改数值，空值保持空（不编造）。
+func normalizeCredits(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if v, ok := strings.CutSuffix(s, "credits"); ok {
+		s = v
+	} else if v, ok := strings.CutSuffix(s, "credit"); ok {
+		s = v
+	}
+	return strings.TrimSpace(s)
 }
 
 // nonChatModel 判定是否非对话模型（应从模型列表过滤掉）。
@@ -1151,28 +1787,41 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
-// mergeModelInfos 合并两路模型目录：primary 为主（同 id 以 primary 条目为准——
-// credits 等字段以主端点为权威），secondary 只补 primary 缺失的 id。
+// mergeModelInfos 合并两路模型目录：primary 为主（同 id 以 primary 条目为权威），
+// secondary 既补 primary 缺失的 id，也补 primary 条目里的**空字段**
+// （fillModelInfo：权威值不被动，只填空）。
+//
+// 为什么不再"同 id 直接丢弃 secondary"：/v3/config 与企业端点的字段完整度互有胜负——
+// 例：global 的 default-model 在 v3 里 credits 为空、在企业端点里是 x0.79；旧口径
+// 会让倍率列凭空少值（面板/客户端显示空白）。
 // 去重 key = 模型 id；输出顺序 = primary 原序在前、secondary 补充项（secondary 原序）
 // 在后——稳定输出，不依赖 map 迭代序。
 func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
 	if len(secondary) == 0 {
 		return primary
 	}
-	seen := make(map[string]bool, len(primary)+len(secondary))
+	idx := make(map[string]int, len(primary)+len(secondary))
 	out := make([]ModelInfo, 0, len(primary)+len(secondary))
 	for _, mi := range primary {
-		if mi.ID == "" || seen[mi.ID] {
+		if mi.ID == "" {
 			continue
 		}
-		seen[mi.ID] = true
+		if i, ok := idx[mi.ID]; ok {
+			out[i] = fillModelInfo(out[i], mi)
+			continue
+		}
+		idx[mi.ID] = len(out)
 		out = append(out, mi)
 	}
 	for _, mi := range secondary {
-		if mi.ID == "" || seen[mi.ID] {
+		if mi.ID == "" {
 			continue
 		}
-		seen[mi.ID] = true
+		if i, ok := idx[mi.ID]; ok {
+			out[i] = fillModelInfo(out[i], mi)
+			continue
+		}
+		idx[mi.ID] = len(out)
 		out = append(out, mi)
 	}
 	return out
@@ -1189,7 +1838,10 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
-	resp, err := c.HTTP.Do(req)
+	// 出站走 realm 感知 client：global 账号必须经 global 出口池（国际版上游对网关
+	// 本机出口 IP 做 WAF 风控，直连会拿到 403 拦截页 / 500，模型目录随之整体拉不出）。
+	// 与 globalModelsOnce 同口径；cn 账号 httpFor 返回 c.HTTP，行为零变化。
+	resp, err := c.httpForA(a).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1317,9 +1969,115 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 	return "copilot.tencent.com"
 }
 
-// fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。
-// 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
+// fetchV3ConfigModelMap 拉官方配置目录，按模型 id 建能力表（双 UA 并发并集）。
+//
+// UA 敏感（实测 2026-09）：/v3/config 按 UA 分档下发目录，且当前方向与早先
+// 注释里的假设**相反**——
+//   - `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0`：精简目录（global 13 条 / CN 22 条）
+//   - `WorkBuddy/<ver> <platform>/<ver> CLI/<ver>`：完整目录（global 22 条 / CN 51 条）
+//
+// 官方桌面客户端实际用的是后者。此前写死 IDE UA，导致 deepseek-v4.1-flash、
+// deepseek-v4.1-flash-sg、gpt-6-astra、hy4-preview、kimi-k2.8-preview、
+// minimax-m2.5 等模型在 /v1/models 里整体缺失（客户端能看到、网关看不到）。
+// 两路并发取并集：任一 UA 因上游再次改版退化时，另一路仍能兜住完整目录。
+// 无版本号的 UA（curl/Mozilla）→ 400 code=12403，故不做无 UA 尝试。
 func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, error) {
+	// 顺序即优先级：WorkBuddy 三段式（官方桌面端真实形态）作基底，IDE UA 只补前者缺失。
+	uas := []string{c.userAgent(a), codeBuddyIDEUA}
+	type probeRes struct {
+		m   map[string]ModelInfo
+		err error
+	}
+	ch := make(chan probeRes, len(uas))
+	for _, ua := range uas {
+		go func(ua string) {
+			m, err := c.fetchV3ConfigOnce(a, ua)
+			ch <- probeRes{m: m, err: err}
+		}(ua)
+	}
+	merged := make(map[string]ModelInfo)
+	var lastErr error
+	okCount := 0
+	for range uas {
+		r := <-ch
+		if r.err != nil {
+			lastErr = r.err
+			continue
+		}
+		okCount++
+		for id, mi := range r.m {
+			if prev, seen := merged[id]; seen {
+				merged[id] = fillModelInfo(prev, mi)
+			} else {
+				merged[id] = mi
+			}
+		}
+	}
+	if okCount == 0 {
+		return nil, lastErr
+	}
+	if len(merged) == 0 {
+		return nil, fmt.Errorf("v3/config returned empty models")
+	}
+	return merged, nil
+}
+
+// fillModelInfo 用 src 的非空字段填补 dst 的空字段（dst 已有值不动），布尔能力位取或。
+//
+// 用于多源目录合并（双 UA / v3 × 企业端点）：dst 是权威源，src 只做补缺。
+// 关键是不能让「精简源的零值」抹掉「完整源的有效值」——例：global 的
+// default-model 在 /v3/config 里 credits 为空、在企业端点里是 x0.79，旧口径
+// （同 id 只认主源）会把 x0.79 丢掉，倍率列显示为空。
+// 布尔位取或是刻意宽松：任一路声明支持即视为支持，不因精简目录丢能力位。
+func fillModelInfo(dst, src ModelInfo) ModelInfo {
+	if dst.Name == "" {
+		dst.Name = src.Name
+	}
+	if dst.ContextWindow == 0 {
+		dst.ContextWindow = src.ContextWindow
+	}
+	if dst.MaxTokens == 0 {
+		dst.MaxTokens = src.MaxTokens
+	}
+	if dst.MaxAllowedSize == 0 {
+		dst.MaxAllowedSize = src.MaxAllowedSize
+	}
+	if len(dst.Efforts) == 0 {
+		dst.Efforts = src.Efforts
+	}
+	if dst.DefaultEffort == "" {
+		dst.DefaultEffort = src.DefaultEffort
+	}
+	if dst.Description == "" {
+		dst.Description = src.Description
+	}
+	if dst.Credits == "" {
+		dst.Credits = src.Credits
+	}
+	if len(dst.Tags) == 0 {
+		dst.Tags = src.Tags
+	}
+	if dst.Vendor == "" {
+		dst.Vendor = src.Vendor
+	}
+	if dst.ReasoningEffort == "" {
+		dst.ReasoningEffort = src.ReasoningEffort
+	}
+	if dst.ReasoningSummary == "" {
+		dst.ReasoningSummary = src.ReasoningSummary
+	}
+	dst.IsDefault = dst.IsDefault || src.IsDefault
+	dst.SupportsReasoning = dst.SupportsReasoning || src.SupportsReasoning
+	dst.SupportsToolCall = dst.SupportsToolCall || src.SupportsToolCall
+	dst.OnlyReasoning = dst.OnlyReasoning || src.OnlyReasoning
+	dst.SupportsImages = dst.SupportsImages || src.SupportsImages
+	dst.CanDisableThinking = dst.CanDisableThinking || src.CanDisableThinking
+	return dst
+}
+
+// fetchV3ConfigOnce 用指定 UA 拉一次 /v3/config，按模型 id 建能力表。
+// 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
+func (c *Client) fetchV3ConfigOnce(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
 	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
 	if err != nil {
 		return nil, err
@@ -1332,9 +2090,10 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 	}
 	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("User-Agent", codeBuddyIDEUA)
+	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)
-	resp, err := c.HTTP.Do(req)
+	// realm 感知出站：global 走 global 出口池（见 fetchEnterpriseModels 注释）。
+	resp, err := c.httpForA(a).Do(req)
 	if err != nil {
 		return nil, err
 	}

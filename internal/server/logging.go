@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -38,17 +40,30 @@ type chatStat struct {
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
+	// credit 本次请求实际消耗的工作积分（上游 usage.credit，权威口径）。
+	// hasCredit=false 表示上游没下发（失败请求/旧上游），日志显示 "-"，
+	// 与"实测为 0（免费模型）"区分开。
+	credit    float64
+	hasCredit bool
 
 	logged bool
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
 func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
+	return newChatStatWithModel(now, parseModelFromBody(body), stream)
+}
+
+// newChatStatWithModel 用**已知的** model/stream 构造统计对象。
+//
+// 给已经 peek 过 model 的路径用（413 超限分支）：那里 body 可能几十 MB，
+// 再调一次 parseModelFromBody 等于为一个日志字段白解析整份 JSON。
+func newChatStatWithModel(now time.Time, model string, stream bool) *chatStat {
 	mode := "sync"
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	return &chatStat{start: now, model: model, mode: mode, toks: -1}
 }
 
 // done 幂等落一行表格日志。
@@ -57,7 +72,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.credit, s.hasCredit)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -191,6 +206,36 @@ func rewriteModel(body []byte, bare string) []byte {
 	return out
 }
 
+// injectEffortIfAbsent 在 outbound body 未显式携带思考档位时补入档位（面板手动指定值）。
+//
+// 语义：客户端显式档位 > 面板手动档位 > 上游/静态默认档。
+// 只写 snake_case 的 reasoning_effort（与 payload.go normalizeReasoningEffort 的
+// 首选键一致）；camelCase 的 reasoningEffort 若已存在同样视为「显式」而不动，
+// 避免同一请求里两个键打架。
+// body 不可解析 / 已带档位 / 档位为空 → 原样返回（不二次错误化）。
+func injectEffortIfAbsent(body []byte, effort string) []byte {
+	if len(body) == 0 || effort == "" {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	for _, k := range []string{"reasoning_effort", "reasoningEffort"} {
+		if v, ok := obj[k]; ok {
+			if s, isStr := v.(string); isStr && strings.TrimSpace(s) != "" {
+				return body // 客户端显式指定，不覆盖
+			}
+		}
+	}
+	obj["reasoning_effort"] = effort
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // parseModelFromBody 从请求 JSON 取 model 字段，缺省标 "-"。
 func parseModelFromBody(body []byte) string {
 	var obj struct {
@@ -200,6 +245,30 @@ func parseModelFromBody(body []byte) string {
 		return "-"
 	}
 	return obj.Model
+}
+
+// headModelRe 头部扫描用的 model 键值正则（截断容错，见 headModelOf）。
+var headModelRe = regexp.MustCompile(`"model"\s*:\s*"([^"]{1,200})"`)
+
+// headModelOf 从**可能被截断**的请求体头部提取 model，仅用于日志显示。
+//
+// 为什么单独一个函数：413 超限路径的 body 只读了 limit+1 字节（LimitReader 的
+// 探测手法），JSON 结构必然不完整 → json.Unmarshal 一定失败、parseModelFromBody
+// 只能返回 "-"，于是日志行里"哪个模型超了"变成空白——而这恰恰是排查时最需要的
+// 字段（2026-09-20 实测：413 行 model 列为空）。
+//
+// 客户端几乎都把 "model" 放在 JSON 最外层靠前位置，扫头部 4KB 即可拿到。
+// 只用于显示、不参与路由（选号仍用 json.Unmarshal 的 peek.Model）。
+// 取不到返回 "-"（不编造）。
+func headModelOf(body []byte) string {
+	head := body
+	if len(head) > 4096 {
+		head = head[:4096]
+	}
+	if m := headModelRe.FindSubmatch(head); m != nil {
+		return string(m[1])
+	}
+	return "-"
 }
 
 // usageDeltaFromResponse 从非流式聚合响应中提取明确存在的 token 字段。
@@ -255,6 +324,28 @@ func completionTokens(resp map[string]any) int {
 	return int(v)
 }
 
+// trimCredit 积分紧凑格式化：去掉无意义的尾随零，保持日志列宽稳定。
+// 0 → "0"；0.0800 → "0.08"；0.00115 → "0.0012"；12.30 → "12.3"。
+func trimCredit(v float64) string {
+	if v == 0 {
+		return "0"
+	}
+	abs := v
+	if abs < 0 {
+		abs = -abs
+	}
+	switch {
+	case abs < 0.01:
+		return strconv.FormatFloat(v, 'f', 4, 64)
+	case abs < 1:
+		return strconv.FormatFloat(v, 'f', 3, 64)
+	case abs < 1000:
+		return strconv.FormatFloat(v, 'f', 2, 64)
+	default:
+		return strconv.FormatFloat(v, 'f', 0, 64)
+	}
+}
+
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
 func uidPrefix(uid string) string {
 	if uid == "" {
@@ -266,15 +357,29 @@ func uidPrefix(uid string) string {
 	return uid
 }
 
+// chatLogModelWidth 表格日志里模型列的显示宽度（超出截断）。
+// 取值见 logChatRow 内注释：必须能完整放下 "global:deepseek-v4.1-flash"（26 字符），
+// 否则跨域/同前缀的模型名会被截成同一个字符串，日志失去排障价值。
+const chatLogModelWidth = 26
+
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
 // toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+// credit/hasCredit 为本次请求真实消耗的工作积分（上游 usage.credit）：
+// hasCredit=false 显示 "-"（上游没下发），credit==0 显示 "0"（实测免费）。
+// 两者必须分开——把"没数据"显示成 0 会让人误以为这些请求都免费。
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int, credit float64, hasCredit bool) {
 	if !chatLogEnabled {
 		return
 	}
 	seq := chatSeq.Add(1)
-	if len(model) > 11 {
-		model = model[:11]
+	// 模型列宽 26（历史值 11）。
+	//
+	// 为什么改：11 会把 "global:deep-model" 与 "global:deepseek-v4.1-flash" 一并截成
+	// "global:deep" —— 两者在日志里完全无法分辨，排障时据此定位模型必然张冠李戴
+	// （2026-09-19 实际踩过：按截断名认定是 deep-model，真实失败模型是
+	// deepseek-v4.1-flash）。26 足以放下现役最长模型名 global:deepseek-v4.1-flash。
+	if len(model) > chatLogModelWidth {
+		model = model[:chatLogModelWidth]
 	}
 	tokField := "-"
 	tokpsField := "-"
@@ -290,7 +395,15 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	// 积分列：3 种语义必须可区分
+	//   "-"  → 上游没下发 credit（失败请求 / 旧上游）
+	//   "0"  → 实测免费
+	//   "0.08" → 实际扣费
+	creditField := "-"
+	if hasCredit {
+		creditField = trimCredit(credit)
+	}
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | cr=%s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -300,6 +413,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		ttfbMS,
 		tokField,
 		tokpsField,
+		creditField,
 		total.Seconds(),
 	)
 }
