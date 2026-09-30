@@ -180,6 +180,15 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	if per1k < 0 {
 		per1k = 0
 	}
+	// 样本质量门槛（「标 0/千token（免费）却实际扣 1~3 积分」的根因修复）：
+	//   ① credit<=0 不记账 —— 0 扣费不含单价信息。真免费模型以**上游标称
+	//      credits=x0** 为准（面板 free_declared），账本只记收费观测；
+	//      缓存全命中导致的 0 扣费更不该把收费模型洗成「免费」。
+	//   ② tokens<200 不记账 —— 每日模型刷新的 16-token 探测样本会把
+	//      per1k 抬高/压低一两个数量级，方差大到毫无统计意义。
+	if credit <= 0 || tokens < 200 {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -210,12 +219,17 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
 		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束。
 		if prev.CostPer1k <= 0 && per1k > 0 {
-			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
-		}
-		e.modelCost[model] = modelCostEntry{
-			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
-			LastSeen:  time.Now(),
-			Samples:   prev.Samples + 1,
+			// 免费(假0/真限免)→收费：**立即采用新值**。EMA 从 0 爬到真值要
+			// 十几次请求，期间面板一直显示低价、选号一直把流量导进这个
+			// 实际收费的模型——「标 0 却酷酷消耗」的直接帮凶。
+			log.Printf("[pool] model %s on uid %s: cost观测从免费转收费，直接采用 %.3f credits/1k", model, logfmt.UID8(uid), per1k)
+			e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: prev.Samples + 1}
+		} else {
+			e.modelCost[model] = modelCostEntry{
+				CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
+				LastSeen:  time.Now(),
+				Samples:   prev.Samples + 1,
+			}
 		}
 	}
 	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
@@ -334,6 +348,10 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// 账号代理闸门：隔离中的账号即便被粘性会话点名也不出池。
+	if !p.proxyGateOK(uid) {
+		return nil
+	}
 	e, ok := p.byUID[uid]
 	if !ok {
 		return nil
@@ -498,6 +516,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		}
 		st.CoolKind = e.coolKind.String()
 	}
+	// 出口信息（账号代理实测快照）：面板账号池列表直接展示，「直连」与
+	// 「走代理但出口不对」在列表上就能分辨，不必切到代理页。
+	st.Egress = p.egressFor(uid)
 	return st
 }
 

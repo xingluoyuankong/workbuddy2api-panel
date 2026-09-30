@@ -70,8 +70,14 @@ func TestIndexReferencesExternalScript(t *testing.T) {
 	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
 	body := rec.Body.String()
 
-	if !strings.Contains(body, `<script src="app.js"></script>`) {
-		t.Error("index.html must load app.js externally (inline script is blocked by CSP)")
+	// 允许（并要求）带内容指纹的查询串：app.js?v=<hash>。
+	// 指纹保证 HTML 与 JS 版本严格绑定——只匹配裸 "app.js" 会漏掉缓存修复，
+	// 而那正是"页面白屏/模型看不到"的根因（旧 app.js + 新 HTML）。
+	if !strings.Contains(body, `<script src="app.js?v=`) {
+		t.Error("index.html must load app.js externally with a content-hash query (inline script is blocked by CSP)")
+	}
+	if strings.Contains(body, `<script src="app.js"></script>`) {
+		t.Error("app.js must carry the content-hash query string, otherwise stale caches stay broken")
 	}
 	// 反例保护：出现内联 <script>...</script> 内容块即为回归
 	if strings.Contains(body, "<script>\n") || strings.Contains(body, "<script> ") {

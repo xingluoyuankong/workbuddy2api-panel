@@ -106,12 +106,37 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+
+		// ProxyGlobal global 域出站代理，如 "socks5://warp:1080" 或
+		// "http://127.0.0.1:7890"；空 = 直连。
+		//
+		// 用途：国际版上游对网关**出口 IP** 做 WAF 风控（10 秒内两个不同账号都撞
+		// 403 即判 IP 级封锁，整片 503，换账号无效——同 IP）。挂一个代理出口即可
+		// 绕开。只作用于 global 域：CN 域恒直连（国内 IP 访问国内上游更快更稳，
+		// 且没有这个 WAF 问题）。
+		//
+		// 代理地址在 Docker 部署下通常写容器名（如 socks5://warp:1080），
+		// 需要 wb2api 与代理容器在同一 Docker 网络。
+		ProxyGlobal string `json:"proxy_global"`
 	} `json:"upstream"`
 
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
+
+	Models struct {
+		// OnlyVerified /v1/models 只暴露「实测调用成功」的模型。
+		// 默认 false（兼容性优先）：未跑过验证时若默认 true 会返回空列表，
+		// 直接打挂所有下游客户端。开启前请先在面板「模型与映射」跑一次验证。
+		// 运行期可在面板热切换（不落盘，重启回落到本静态值）。
+		OnlyVerified bool `json:"only_verified"`
+
+		// DailyRefresh 每天 00:00 自动刷新模型目录（credits 倍率）与实测消耗。
+		// 默认 true。刷新会真实调用上游模型（每个约几百 token），
+		// 想完全避免这部分开销时显式设为 false。
+		DailyRefresh *bool `json:"daily_refresh"`
+	} `json:"models"`
 
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
@@ -154,6 +179,45 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
+	// AccountProxy 账号级出站代理（per-account 代理绑定 + 出口一致性守卫）。
+	//
+	// 与 upstream.proxy_global 的关系：proxy_global 是「所有 global 请求共用一个出口
+	// 池」；本段是「一个账号一条固定出口」。风控按 IP 聚号时，前者只是把风险平移到
+	// 代理 IP，后者才是真正的隔离。两者并存时账号代理优先，失配按 on_mismatch 回落
+	// 到 proxy_global / 直连。
+	AccountProxy struct {
+		// Enabled 总开关（缺省 true）。false = 完全不加载绑定表，出站行为零变化。
+		Enabled bool `json:"enabled"`
+		// File 绑定表路径；空 = 默认 <state_file 同目录>/proxy.json。
+		File string `json:"file"`
+		// CheckInterval 后台出口校验周期，默认 "30m"；空/"0"/"off" = 只在启动与手动时校验。
+		CheckInterval string `json:"check_interval"`
+		// ProbeTimeout 单账号单次校验总上限，默认 "20s"（含多源并行探测 + 直连对照）。
+		ProbeTimeout string `json:"probe_timeout"`
+		// Quorum 出口 IP 交叉验证一致源数门槛，默认 2（两个独立源给出同一 IP 才采信）。
+		Quorum int `json:"quorum"`
+		// OnMismatch 失配处置：
+		//   fallback（默认）不用该代理，回落 realm 默认出口；
+		//   ignore    仍走该代理，只告警（排障期观察上游反应时用）；
+		//   quarantine 连账号一起隔离，不参与选号（强约束部署）。
+		OnMismatch string `json:"on_mismatch"`
+		// LockFirstIP 【已废弃】出口一致性不再做「首次锁定 + 漂移即失配」——
+		// 聚合代理出口实时轮换是正常行为，漂移判死刑会把轮换池判死。
+		// 现语义：调用确实走这条代理链路即一致；强校验请显式填 expected_ip。
+		// 字段保留只为兼容旧 config（normalize 不再读取）。
+		// 关掉等于允许出口轮换——账号每次从不同 IP 出现，是风控高危信号。
+		LockFirstIP bool `json:"lock_first_ip"`
+		// MaxPerIP 同一出口 IP 允许承载的账号数上限（0 = 不限）。
+		MaxPerIP int `json:"max_per_ip"`
+		// MaxPerIPAction 超过 MaxPerIP 时的动作：
+		//   warn（默认）只在日志/面板标记；
+		//   quarantine 把多出来的账号隔离出选号池（按 uid 排序保留前 MaxPerIP 个）。
+		MaxPerIPAction string `json:"max_per_ip_action"`
+		// MinInterval 同一账号两次出站之间的最小间隔（如 "500ms" / "1s"）；
+		// 空 = 不节流。上限 5s（normalize 校验）——再大就把并发转成排队延迟了。
+		MinInterval string `json:"min_interval"`
+	} `json:"account_proxy"`
+
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
@@ -165,6 +229,11 @@ type Config struct {
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
+
+	// 解析后的账号代理参数（cmd/server/main.go 构造 upstream.AccountProxyOptions 用）。
+	AccountProxyCheckInterval time.Duration `json:"-"` // 0 = 不启动后台周期校验
+	AccountProxyProbeTimeout  time.Duration `json:"-"` // <=0 回落 20s
+	AccountProxyMinInterval   time.Duration `json:"-"` // 0 = 不节流
 }
 
 // Default 默认配置。
@@ -218,6 +287,16 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// 账号代理缺省开启（开关语义同 schedule：键缺席时保留 true，只有显式 false 才关）。
+	// 未给任何账号配代理时它不影响任何出站——没有绑定就没有行为变化。
+	c.AccountProxy.Enabled = true
+	c.AccountProxy.CheckInterval = "30m"
+	c.AccountProxy.ProbeTimeout = "20s"
+	c.AccountProxy.Quorum = 2
+	c.AccountProxy.OnMismatch = "fallback"
+	c.AccountProxy.LockFirstIP = true
+	c.AccountProxy.MaxPerIPAction = "warn" // 同 IP 超限默认只告警（隔离是强动作，要显式开）
+	// MinInterval 缺省空 = 不节流（节流是双刃剑：并发高时会把延迟转成排队）
 	return c
 }
 
@@ -478,6 +557,62 @@ func (c *Config) normalize() error {
 		}
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
 	}
+	// ── account_proxy ──────────────────────────────────────────────────
+	if c.AccountProxy.Enabled {
+		switch strings.ToLower(strings.TrimSpace(c.AccountProxy.CheckInterval)) {
+		case "", "0", "off", "disabled":
+			c.AccountProxyCheckInterval = 0 // 只启动校验 + 手动校验
+		default:
+			if c.AccountProxyCheckInterval, err = time.ParseDuration(c.AccountProxy.CheckInterval); err != nil {
+				return fmt.Errorf("account_proxy.check_interval: %w", err)
+			}
+			if c.AccountProxyCheckInterval < time.Minute {
+				return fmt.Errorf("account_proxy.check_interval: %s 过短（最小 1m）", c.AccountProxy.CheckInterval)
+			}
+		}
+		if strings.TrimSpace(c.AccountProxy.ProbeTimeout) == "" {
+			c.AccountProxy.ProbeTimeout = "20s"
+		}
+		if c.AccountProxyProbeTimeout, err = time.ParseDuration(c.AccountProxy.ProbeTimeout); err != nil {
+			return fmt.Errorf("account_proxy.probe_timeout: %w", err)
+		}
+		if c.AccountProxyProbeTimeout < 3*time.Second {
+			return fmt.Errorf("account_proxy.probe_timeout: %s 过短（最小 3s，多源探测跑不完）", c.AccountProxy.ProbeTimeout)
+		}
+		switch strings.ToLower(strings.TrimSpace(c.AccountProxy.OnMismatch)) {
+		case "", "fallback":
+			c.AccountProxy.OnMismatch = "fallback"
+		case "ignore":
+			c.AccountProxy.OnMismatch = "ignore"
+		case "quarantine":
+			c.AccountProxy.OnMismatch = "quarantine"
+		default:
+			return fmt.Errorf("account_proxy.on_mismatch: %q 非法（fallback / ignore / quarantine）", c.AccountProxy.OnMismatch)
+		}
+		if c.AccountProxy.Quorum <= 0 {
+			c.AccountProxy.Quorum = 2
+		}
+		switch strings.ToLower(strings.TrimSpace(c.AccountProxy.MaxPerIPAction)) {
+		case "", "warn":
+			c.AccountProxy.MaxPerIPAction = "warn"
+		case "quarantine":
+			c.AccountProxy.MaxPerIPAction = "quarantine"
+		default:
+			return fmt.Errorf("account_proxy.max_per_ip_action: %q 非法（warn / quarantine）", c.AccountProxy.MaxPerIPAction)
+		}
+		if v := strings.TrimSpace(c.AccountProxy.MinInterval); v != "" {
+			if c.AccountProxyMinInterval, err = time.ParseDuration(v); err != nil {
+				return fmt.Errorf("account_proxy.min_interval: %w", err)
+			}
+			if c.AccountProxyMinInterval <= 0 {
+				return fmt.Errorf("account_proxy.min_interval: %s 必须为正", v)
+			}
+			if c.AccountProxyMinInterval > 5*time.Second {
+				return fmt.Errorf("account_proxy.min_interval: %s 过长（上限 5s，再大并发会堆成排队延迟）", v)
+			}
+		}
+	}
+
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}

@@ -122,6 +122,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
+	reqWithAccount(req, a) // per-account 出站：把账号绑定到请求上下文
 	_, err = c.doJSON(req)
 	return err
 }
@@ -221,6 +222,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
+	reqWithAccount(req, a) // per-account 出站：把账号绑定到请求上下文
 	_, err = c.doJSON(req)
 	return err
 }
@@ -290,6 +292,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
+	reqWithAccount(req, a) // per-account 出站：把账号绑定到请求上下文
 	_, err = c.doJSON(req)
 	return err
 }
@@ -402,6 +405,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	var out struct {
 		Experts []MarketExpert `json:"experts"`
 	}
+	reqWithAccount(req, a) // per-account 出站：把账号绑定到请求上下文
 	data, err := c.doJSON(req)
 	if err != nil {
 		return nil, err
@@ -462,7 +466,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 			fmt.Printf("[dbg] %s: %s\n", k, req.Header.Get(k))
 		}
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpForA(a).Do(req)
 	if err != nil {
 		return "", "", err
 	}

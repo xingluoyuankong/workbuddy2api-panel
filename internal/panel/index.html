@@ -69,6 +69,13 @@ body {
 .ln .lch.c-chat { background: var(--ok-soft); color: var(--ok); }
 .ln .lch.c-sys { background: var(--surface-2); color: var(--ink-3); }
 
+/* 状态徽章（代理页/账号池状态列）：圆角软底色，一眼区分健康/异常 */
+.st-badge { display: inline-block; font-size: 11px; line-height: 1; padding: 3px 8px; border-radius: 5px; font-weight: 600; }
+.st-ok { background: var(--ok-soft); color: var(--ok); }
+.st-warn { background: #d2992222; color: #d29922; }
+.st-bad { background: #f8514922; color: #f85149; }
+.st-idle { background: var(--surface-2); color: var(--ink-3); }
+
 /* 任务中心 */
 .tc-empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 42px 16px; color: var(--ink-3); }
 .tc-empty svg { width: 42px; height: 42px; opacity: .55; margin-bottom: 6px; }
@@ -177,16 +184,29 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
 .stats {
-  display: grid; grid-template-columns: repeat(6, 1fr);
+  display: grid;
+  /* auto-fit：卡片数量变了（如用量页新增积分卡）自动重排列数，
+     固定 repeat(N) 会在卡片数 ≠ N 时把最后一行挤扁、数值被 overflow 裁掉。 */
+  grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
   border: 1px solid var(--line); border-radius: 11px; background: var(--surface);
-  overflow: hidden; margin-bottom: 20px; box-shadow: var(--shadow);
+  margin-bottom: 20px; box-shadow: var(--shadow);
 }
-@media (max-width: 980px) { .stats { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
 .stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
-.stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
+.stat { min-width: 0; }
+.stat .v { font: 600 clamp(15px, 1.55vw, 26px)/1.15 var(--mono); font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
 .stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
+/* 积分卡的「/总额」小一号字：与账号表 .cred .n .of 同一视觉语言，
+   一个数字里区分「剩余」与「总额」，同时把宽度压到窄卡片不折行。 */
+.stat .v .of { font-size: .68em; font-weight: 500; color: var(--ink-3); }
+/* .rl realm 徽标：CN 用 ok 绿、国际版用 accent 蓝，与账号表 .realm-tag 同色系。
+   两个域的额度必须一眼可分（否则会误读成"额度还很宽裕"）。 */
+.stat .k .rl { display: inline-block; padding: 0 5px; border-radius: 4px;
+  font-size: 10.5px; font-weight: 600; vertical-align: 1px; }
+.stat .k .rl.cn { color: var(--ok); background: var(--ok-soft); }
+.stat .k .rl.gl { color: var(--accent); background: var(--accent-soft); }
 
 /* ── 面板块 ───────────────────────────────────────────────────────── */
 .box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
@@ -200,6 +220,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* ── 账号表（签名元素：健康色条 + 积分量条）───────────────────────── */
 .tbl-wrap { overflow-x: auto; }
 .acc { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 640px; }
+/* 账号表 10 列（v1.10 起含出口 IP 列）：给足宽度避免表头互相挤压。 */
+.acc:not(.md):not(.us):not(.mm) { min-width: 880px; }
 .acc th {
   text-align: left; font-weight: 500; font-size: 11.5px; color: var(--ink-3);
   padding: 9px 11px; border-bottom: 1px solid var(--line); white-space: nowrap;
@@ -214,6 +236,22 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .acc .mark i { display: block; width: 3px; height: 100%; min-height: 36px; background: var(--ok); }
 .acc tbody tr.cool .mark i { background: var(--warn); }
 .acc tbody tr.off .mark i { background: var(--bad); }
+/* 出口 IP 列：IP 用等宽字体（数字对齐，扫一列时更容易看出哪几行相同），
+   地区/异常标记用次要字号贴在右侧。两种形态共用一个单元格，避免为「直连」
+   单独占一列造成大量空列。 */
+.acc .egress { white-space: nowrap; font-size: 12px; }
+.acc .egress .eg-ip {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px; letter-spacing: -.2px;
+  display: inline-block; max-width: 150px; overflow: hidden;
+  text-overflow: ellipsis; vertical-align: bottom;
+}
+.acc .egress .eg-geo { margin-left: 7px; color: var(--ink-3); font-size: 11.5px; }
+.acc .egress .eg-cmp { margin-left: 7px; font-size: 11.5px; font-weight: 550; }
+.acc .egress .eg-same { color: var(--ok, #3fb950); }
+.acc .egress .eg-diff { color: var(--bad, #f85149); }
+.acc .egress .eg-idle { color: var(--ink-3); }
+
 /* 模型表无色条（健康指示只属于账号表）。 */
 .acc.md .mark { display: none; }
 /* 操作列用 width:1px + nowrap 的经典技巧：列宽恰为内容宽，其余列按内容自适应 */
@@ -223,6 +261,25 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .acc .efs .tag { margin: 1px 0; }
 /* 模型表：紧凑一些，7 列在常见窗口下尽量免横向滚动 */
 .acc.md { min-width: 700px; }
+/* 用量表 12 列：min-width 必须够大，否则列被压扁后 nowrap 的表头会互相覆盖
+   （表现为"内容被挡住"）。宽度不够时由 .tbl-wrap 横向滚动兜住。 */
+.acc.us { min-width: 1180px; }
+.acc.us th, .acc.us td { padding: 8px 10px; }
+/* 模型与映射表 12 列（含两个下拉 + 备注输入框）：同理给足宽度。 */
+.acc.mm { min-width: 1560px; }
+/* 首列粘住：横向滚动时行标签不跟着滚走，长表也能读 */
+.tbl-wrap { position: relative; }
+.acc.us td:nth-child(2), .acc.us th:nth-child(2),
+.acc.mm td:nth-child(2), .acc.mm th:nth-child(2) {
+  position: sticky; left: 0; z-index: 1; background: var(--surface);
+  box-shadow: 1px 0 0 var(--line-soft);
+}
+.acc.us tbody tr:hover td:nth-child(2),
+.acc.mm tbody tr:hover td:nth-child(2) { background: var(--surface-2); }
+/* 横向滚动提示条：内容比容器宽时才由 JS 显示 */
+.scroll-hint { display: none; align-items: center; gap: 6px; padding: 6px 12px;
+  font-size: 11.5px; color: var(--ink-3); border-top: 1px solid var(--line-soft); }
+.scroll-hint.on { display: flex; }
 .acc.md th, .acc.md td { padding: 10px 9px; }
 .who { min-width: 118px; max-width: 200px; }
 #taskTable .who { max-width: 360px; }
@@ -230,6 +287,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
+/* CN 徽标：原来只有 global 打「国际版」标签，CN 行没有任何标识 → 表格里
+   看不出这个账号属于哪个域，额度也就无法按域对账。补齐后一行一眼可辨。 */
+.realm-tag.cn { margin-left: 0; color: var(--ok); background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 22%, transparent); }
+.who .nm .realm-tag.cn { margin-left: 6px; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
@@ -404,6 +465,114 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .pk-legend span { display: flex; align-items: center; gap: 5px; }
   .pk-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
 
+  /* ── 身份提示词编辑区 ─────────────────────────────────────────── */
+  .prompt-box { border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+    background: color-mix(in srgb, var(--surface-2) 45%, transparent); }
+  .prompt-hd { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 12px; border-bottom: 1px solid var(--line-soft); font-size: 13px; }
+  .prompt-hd .grow { flex: 1; }
+  .prompt-hd .note { color: var(--ink-3); font-size: 11.5px; }
+  .prompt-meta { padding: 8px 12px; font-size: 11.5px; color: var(--ink-3); line-height: 1.6; }
+  .prompt-meta strong { color: var(--ok); }
+  .prompt-ta { display: block; width: 100%; min-height: 260px; resize: vertical;
+    border: none; border-bottom: 1px solid var(--line-soft); padding: 12px;
+    font: 12.5px/1.65 var(--mono); background: var(--surface); color: var(--ink);
+    box-sizing: border-box; }
+  .prompt-ta:focus { outline: none; background: var(--surface); }
+  .prompt-foot { display: flex; align-items: center; gap: 8px; padding: 9px 12px;
+    font-size: 11.5px; flex-wrap: wrap; }
+  .prompt-foot .lb { color: var(--ink-3); }
+  .prompt-file { flex: 1; min-width: 240px; font: 12px var(--mono); padding: 3px 7px; }
+
+  /* ── 粘性会话管理 ─────────────────────────────────────────────── */
+  .stat.sticky { position: relative; }
+  .sticky-acts { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
+  .sticky-panel { margin: 0 0 20px; border: 1px solid var(--line); border-radius: 11px;
+    background: var(--surface); box-shadow: var(--shadow); overflow: hidden; }
+  .sticky-hd { display: flex; align-items: center; gap: 10px; padding: 11px 15px;
+    border-bottom: 1px solid var(--line-soft); background: var(--surface-2); font-size: 13px; }
+  .sticky-hd .grow { flex: 1; }
+  .sticky-hd .note { color: var(--ink-3); font-size: 12px; }
+
+  /* ── 模型与映射（mm）：卡片布局，永不横向滚动 ─────────────────── */
+  .mm-list { display: grid; gap: 10px; padding: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(430px, 1fr)); }
+  @media (max-width: 900px) { .mm-list { grid-template-columns: 1fr; } }
+  .mm-card { border: 1px solid var(--line); border-radius: 10px; background: var(--surface);
+    overflow: hidden; display: flex; flex-direction: column; }
+  .mm-card.free { border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+  .mm-card.gone { opacity: .55; }
+  .mm-card-hd { display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+    padding: 9px 11px; border-bottom: 1px solid var(--line-soft); background: var(--surface-2); }
+  .mm-card-hd .nm { font-weight: 600; font-size: 13px; font-family: var(--mono); }
+  .mm-card-hd .grow { flex: 1; }
+  .mm-card-hd .xs { padding: 1px 8px; font-size: 11.5px; }
+  .mm-card-bd { padding: 9px 11px; display: grid; gap: 6px;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+  .mm-kv { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 12px; }
+  .mm-kv > .lb { color: var(--ink-3); font-size: 11px; flex: none; min-width: 56px; }
+  .mm-kv code { font: 11.5px/1.5 var(--mono); background: var(--surface-2); padding: 1px 5px;
+    border-radius: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    flex: 1; min-width: 0; }
+  .mm-kv button { padding: 0 6px; font-size: 11px; line-height: 17px; flex: none; }
+  .mm-card-ctl { padding: 9px 11px; border-top: 1px solid var(--line-soft);
+    display: grid; gap: 7px 10px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    background: color-mix(in srgb, var(--surface-2) 55%, transparent); }
+  .mm-ctl { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .mm-ctl > .lb { font-size: 10.5px; color: var(--ink-3); }
+  .mm-ctl select, .mm-ctl input { width: 100%; font-size: 12px; padding: 2px 5px; min-width: 0; }
+  .mm-card .note-line { grid-column: 1 / -1; font-size: 11.5px; color: var(--ink-3);
+    line-height: 1.5; white-space: normal; }
+  .mm-card .note-line.err { color: #b3261e; }
+  .mm-free { display: inline-block; font: 600 10.5px/1.6 var(--sans); padding: 0 6px;
+    border-radius: 4px; background: #e7f6ec; color: #177245; }
+  .mm-save { font-size: 11px; color: var(--ok); opacity: 0; transition: opacity .2s; }
+  .mm-save.on { opacity: 1; }
+  .mm-verify-out { margin: 0 12px 12px; padding: 10px 12px; border: 1px solid var(--line);
+    border-radius: 9px; background: var(--surface-2); font-size: 12px; line-height: 1.7; }
+  .mm-verify-out b.ok { color: var(--ok); } .mm-verify-out b.bad { color: #b3261e; }
+  .mm-verify-out .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
+  .mm-verify-out code { font: 11px var(--mono); }
+
+  /* ── 模型与映射（旧宽表样式保留给其它表复用） ──────────────────── */
+  .mm-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px;
+    padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  .mm-bar .chips { flex: none; }
+  .mm-search { min-width: 190px; padding: 3px 9px; font-size: 12.5px; }
+  .mm-sort { padding: 3px 6px; font-size: 12.5px; }
+  .mm-toggle { display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+  table.mm { font-size: 12.5px; }
+  table.mm th, table.mm td { padding: 5px 8px; vertical-align: middle; }
+  table.mm .mm-pick, table.mm .mm-pick input { width: 26px; text-align: center; }
+  .mm-realm { display: inline-block; font: 600 10px/1.5 var(--mono); padding: 0 5px;
+    border-radius: 4px; margin-right: 5px; letter-spacing: .3px; }
+  .mm-realm.cn { background: var(--accent-soft); color: var(--accent); }
+  .mm-realm.global { background: var(--warn-soft, #fff4e5); color: #b26a00; }
+  .mm-copy { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; }
+  .mm-copy code { font: 12px/1.4 var(--mono); background: var(--surface-2);
+    padding: 1px 5px; border-radius: 4px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; max-width: 210px; }
+  .mm-copy button { padding: 0 5px; font-size: 11px; line-height: 18px; }
+  .mm-st { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px;
+    border-radius: 999px; white-space: nowrap; }
+  .mm-st.verified { background: #e7f6ec; color: #177245; }
+  .mm-st.failed { background: #fdeaea; color: #b3261e; }
+  .mm-st.unverified { background: var(--surface-2); color: var(--ink-3); }
+  .mm-note { font-size: 11.5px; color: var(--ink-3); line-height: 1.4;
+    max-width: 300px; white-space: normal; }
+  .mm-note-in { width: 100%; min-width: 160px; font-size: 11.5px; padding: 2px 6px; }
+  .mm-effort { font-size: 11.5px; padding: 1px 4px; }
+  .mm-eff { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 3px; }
+  .mm-eff .tag { font-size: 10.5px; }
+  .mm-orphan { color: #b3261e; font-size: 10.5px; font-weight: 600; }
+  .mm-legend { padding: 9px 12px; font-size: 11.5px; color: var(--ink-3);
+    line-height: 1.7; border-top: 1px solid var(--line); }
+  .mm-legend b { color: var(--ink-2); }
+  .mm-legend code { font: 11px var(--mono); background: var(--surface-2);
+    padding: 1px 4px; border-radius: 3px; }
+  .mm-meas { font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
 </style>
 </head>
 <body>
@@ -429,6 +598,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
+      <li><a href="#proxies" data-view="proxies">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="4.5" cy="11.5" r="2.2"/><circle cx="11.5" cy="4.5" r="2.2"/><path d="M6.4 9.9 9.6 6.1"/></svg>
+        代理出口</a></li>
       <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
@@ -439,6 +611,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <div class="sig">
       <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
       <div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span></div>
+      <div class="row" style="margin-top:5px" id="navProxyRow" hidden><span style="color:#f85149" id="navProxy"></span></div>
     </div>
   </nav>
 
@@ -462,8 +635,35 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
         <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
-        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
-        <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
+        <!-- 积分按 realm 分开显示（不合并）：合计数字会严重误导——实测
+             CN 4823/10044 而 global 仅 190/710，合并成 5013/10754 看着很宽裕，
+             实际 global 快见底了。两个域的钱不能互相花，必须分开看。 -->
+        <div class="stat"><div class="v" id="sCreditsCn">-</div><div class="k"><span class="rl cn">CN</span> 积分剩余 / 总额</div></div>
+        <div class="stat"><div class="v" id="sCreditsGlobal">-</div><div class="k"><span class="rl gl">国际版</span> 积分剩余 / 总额</div></div>
+        <div class="stat sticky">
+          <div class="v" id="sSticky">-</div><div class="k">粘性会话</div>
+          <div class="sticky-acts">
+            <button class="xs" id="btnStickyView" title="查看当前会话绑定在哪个账号">查看</button>
+            <button class="xs" id="btnStickyClear" title="重置全部粘性会话：对话下次请求会重新分配账号">重置</button>
+            <button class="xs" id="btnStickyGC" title="清理已过期（超过 TTL）的绑定">清过期</button>
+          </div>
+        </div>
+      </div>
+      <div class="sticky-panel" id="stickyPanel" hidden>
+        <div class="sticky-hd">
+          <b>粘性会话绑定</b>
+          <span class="note" id="stickyNote"></span>
+          <span class="grow"></span>
+          <button class="xs" id="btnStickyClose">关闭</button>
+        </div>
+        <div class="tbl-wrap">
+          <table class="acc md">
+            <thead><tr>
+              <th>会话</th><th>绑定账号</th><th>空闲</th><th class="c-acts">操作</th>
+            </tr></thead>
+            <tbody id="stickyBody"></tbody>
+          </table>
+        </div>
       </div>
 
       <div class="box">
@@ -480,7 +680,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <table class="acc">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
+            <th>账号</th><th>状态</th><th>出口 IP</th><th>积分</th>
             <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
@@ -531,20 +731,56 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </section>
 
-    <!-- 模型与档位 -->
+    <!-- 模型与映射 -->
     <section class="view" id="view-models" hidden>
       <div class="box">
         <header>
-          <h3>模型能力 <span class="hint">官方返回的最大输出仅为参考——实测多数模型实际被限制在 40K 左右（如 deepseek-v4.1-flash 仅 32K），配置 max_tokens 时请自行留意，以免长输出被静默截断</span></h3>
+          <h3>模型与映射 <span class="hint">官方返回的最大输出仅为参考——实测多数模型实际被限制在 40K 左右（如 deepseek-v4.1-flash 仅 32K），配置 max_tokens 时请自行留意，以免长输出被静默截断</span></h3>
           <span class="grow"></span>
           <span class="note" id="mdNote">实时查询上游</span>
           <button class="xs" id="btnModels">重新获取</button>
         </header>
-        <div class="tbl-wrap">
-        <table class="acc md">
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
-          <tbody id="mdBody"></tbody>
-        </table>
+
+        <div class="mm-bar">
+          <div class="chips" id="mmRealm">
+            <button class="chip on" data-realm="">全部域</button>
+            <button class="chip" data-realm="cn">CN</button>
+            <button class="chip" data-realm="global">GLOBAL</button>
+          </div>
+          <div class="chips" id="mmStatus">
+            <button class="chip on" data-st="">全部状态</button>
+            <button class="chip" data-st="verified">已验证</button>
+            <button class="chip" data-st="failed">不可调用</button>
+            <button class="chip" data-st="unverified">未验证</button>
+            <button class="chip" data-st="hidden">已隐藏</button>
+            <button class="chip" data-st="removed">已删除</button>
+          </div>
+          <input class="mm-search" id="mmSearch" type="search" placeholder="搜索模型 / 展示名 / 上游真实名" />
+          <label class="mm-toggle"><input type="checkbox" id="mmPickAll" title="全选当前筛选出的模型" /> 全选</label>
+          <select class="mm-sort" id="mmSort">
+            <option value="id">排序：模型 ID</option>
+            <option value="realm">排序：域 + ID</option>
+            <option value="status">排序：状态</option>
+            <option value="category">排序：分类</option>
+            <option value="credit">排序：实测积分</option>
+            <option value="ctx">排序：上下文</option>
+          </select>
+          <label class="mm-toggle"><input type="checkbox" id="mmFreeOnly" /> 只看免费</label>
+          <span class="grow"></span>
+          <label class="mm-toggle"><input type="checkbox" id="mmOnlyVerified" /> /v1/models 只暴露已验证模型</label>
+          <button class="xs" id="btnMmVerify">验证全部</button>
+          <button class="xs" id="btnMmVerifySel">验证选中</button>
+          <button class="xs" id="btnMmExport">导出 JSON</button>
+          <button class="xs" id="btnMmPurge" title="删除实测确认上游没有的模型（11102）；限流/无账号等临时失败不会被清">清理幽灵模型</button>
+        </div>
+
+        <div class="mm-list" id="mmList"></div>
+        <div class="mm-verify-out" id="mmVerifyOut" hidden></div>
+        <div class="mm-legend">
+          <b>sg 后缀</b>：Singapore（新加坡节点）区域变体，仅 global 可用，上游归一化为基模型（<code>deepseek-v4.1-flash-sg</code> → <code>deepseek-v4.1-flash</code>）。
+          <b>别名</b>：上游把请求名映射成另一模型（<code>cn:deep-model</code> → <code>glm-5.3</code>）。
+          <b>幽灵</b>：目录里有但调用报 11102（<code>cn:default-model</code>）。
+          <b>遗留</b>：目录里没有但调用成功（<code>hunyuan-2.0-instruct</code>）。
         </div>
       </div>
     </section>
@@ -561,6 +797,66 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="pad"><div class="pk-grid" id="pkSummary"></div></div>
       </div>
       <div id="pkDetail"></div>
+    </section>
+
+    <!-- 账号代理出口 -->
+    <section class="view" id="view-proxies" hidden>
+      <div class="box">
+        <header>
+          <h3>账号代理出口</h3>
+          <span class="grow"></span>
+          <span class="note" id="pxNote">—</span>
+          <button class="xs" id="btnPxBulk">批量导入</button>
+          <button class="xs" id="btnPxRefresh">刷新</button>
+          <button class="xs primary" id="btnPxCheckAll">全部校验</button>
+        </header>
+        <div class="pad">
+          <div class="note" style="margin-bottom:12px;line-height:1.7">
+            每个账号可绑一条独立代理：socks5://user:pass@host:port 或 http://user:pass@host:port。
+            「校验」会实测三件事——① 走这条代理的真实出口 IP（多源交叉，防单源被缓存）；
+            ② 与本机直连出口比对，出口 = 直连即判定<b>代理没生效</b>；
+            ③ 与声明 IP 比对，不符或多源不一致（出口轮换）即按 account_proxy.on_mismatch 处置。
+          </div>
+          <div class="hr"></div>
+          <details id="spDetails" style="margin-bottom:12px">
+            <summary style="cursor:pointer;user-select:none;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)">
+              <b>订阅链接池</b>
+              <span class="note" id="spSummaryInfo" style="margin-left:8px">global 与 cn 各自独立（两池不互通），点击展开管理</span>
+            </summary>
+            <div style="padding:12px 10px 4px">
+              <div class="note" style="margin-bottom:10px;line-height:1.6">global 与 cn 各自独立的订阅 URL 列表（两池不互通）。每 6 小时自动拉取，解析出的代理链接进入对应 realm 的出口池；出口出问题（失败/TLS 劫持）自动降权切换，优先使用稳定且无劫持记录的链接。<b>可直接粘贴代理链接</b>（带凭据的 http/socks5，立即入池），也可粘贴订阅 URL 自动拉取；vmess/vless 暂不支持。</div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+            <div>
+              <div style="margin-bottom:6px"><b>global 池</b> <span class="note" id="spGlobalInfo"></span></div>
+              <textarea id="spGlobalSubs" rows="4" style="width:100%" placeholder="每行一条：代理链接（http://key@host:port 或 socks5://...，直接入池）或订阅 URL（http 地址，自动拉取）"></textarea>
+              <div style="margin-top:6px;display:flex;gap:8px">
+                <button class="xs primary" id="btnSpSaveGlobal">保存并刷新</button>
+                <button class="xs" id="btnSpRefreshGlobal">仅刷新</button>
+              </div>
+            </div>
+            <div>
+              <div style="margin-bottom:6px"><b>cn 池</b> <span class="note" id="spCnInfo"></span></div>
+              <textarea id="spCnSubs" rows="4" style="width:100%" placeholder="每行一条：代理链接或订阅 URL（留空 = cn 账号走直连）"></textarea>
+              <div style="margin-top:6px;display:flex;gap:8px">
+                <button class="xs primary" id="btnSpSaveCn">保存并刷新</button>
+                <button class="xs" id="btnSpRefreshCn">仅刷新</button>
+              </div>
+            </div>
+          </div>
+            </div>
+          </details>
+          <div class="hr"></div>
+          <div class="tbl-wrap">
+            <table class="acc md">
+              <thead><tr>
+                <th>账号</th><th>代理链接</th><th>声明出口 IP</th><th>实测出口 IP</th>
+                <th>地区</th><th>状态</th><th class="num">延迟</th><th class="c-acts">操作</th>
+              </tr></thead>
+              <tbody id="pxBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- 用量 -->
@@ -595,44 +891,50 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header><h3>按账号</h3><span class="grow"></span>
           <span class="note">请求数含失败尝试</span></header>
         <div class="tbl-wrap">
-          <table class="acc">
+          <table class="acc us">
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>账号</th><th>域</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">积分消耗</th><th class="num">千token积分</th>
               <th class="num">均延迟</th><th class="num">均速率</th>
             </tr></thead>
             <tbody id="usAccBody"></tbody>
           </table>
         </div>
+        <div class="scroll-hint" data-for="usAccBody">↔ 表格可横向滚动查看全部列</div>
       </div>
 
       <div class="box">
         <header><h3>按模型</h3></header>
         <div class="tbl-wrap">
-          <table class="acc">
+          <table class="acc us">
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>模型</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">积分消耗</th><th class="num">千token积分</th>
             </tr></thead>
             <tbody id="usModelBody"></tbody>
           </table>
         </div>
+        <div class="scroll-hint" data-for="usModelBody">↔ 表格可横向滚动查看全部列</div>
       </div>
 
       <div class="box">
         <header><h3>按域</h3></header>
         <div class="tbl-wrap">
-          <table class="acc">
+          <table class="acc us">
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>realm</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">积分消耗</th><th class="num">千token积分</th>
             </tr></thead>
             <tbody id="usRealmBody"></tbody>
           </table>
         </div>
+        <div class="scroll-hint" data-for="usRealmBody">↔ 表格可横向滚动查看全部列</div>
       </div>
     </section>
 
@@ -694,6 +996,54 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input type="checkbox" name="balance_refresh_enabled"></div>
               <label class="fld"><span class="lb">刷新间隔（分钟）</span>
                 <input name="balance_refresh_minutes" type="number" min="1" placeholder="5"></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>账号代理（每账号一条出口）</h3><span class="grow"></span><span class="note">除开关外均需重启进程</span></header>
+          <div class="pad">
+            <div class="grid2">
+              <div class="switch"><span class="lb">启用账号级代理</span>
+                <input type="checkbox" name="ap_enabled"></div>
+              <label class="fld"><span class="lb">失配处置</span>
+                <select name="ap_on_mismatch">
+                  <option value="fallback">fallback（回落默认出口）</option>
+                  <option value="quarantine">quarantine（账号一并隔离）</option>
+                  <option value="ignore">ignore（仍用，只告警）</option>
+                </select>
+                <span class="hint">出口与声明不符 / 代理没生效时的动作</span></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">出口校验周期</span>
+                <input name="ap_check_interval" placeholder="30m">
+                <span class="hint">0 / off = 只启动时校验</span></label>
+              <label class="fld"><span class="lb">单次校验上限</span>
+                <input name="ap_probe_timeout" placeholder="20s"></label>
+              <label class="fld"><span class="lb">交叉验证源数</span>
+                <input name="ap_quorum" type="number" min="1" max="6" placeholder="2">
+                <span class="hint">几个回显源一致才采信</span></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">单 IP 最多承载账号</span>
+                <input name="ap_max_per_ip" type="number" min="0" placeholder="1">
+                <span class="hint">0 = 不限制</span></label>
+              <label class="fld"><span class="lb">超限时动作</span>
+                <select name="ap_max_per_ip_action">
+                  <option value="warn">warn（只告警）</option>
+                  <option value="quarantine">quarantine（隔离多余账号）</option>
+                </select></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">同账号最小请求间隔</span>
+                <input name="ap_min_interval" placeholder="留空 = 不节流，如 500ms / 1s">
+                <span class="hint">上限 5s；并发高时会转成排队延迟</span></label>
+              <div class="note" style="align-self:end">
+                绑定表本身不在这里配：去「代理出口」页逐账号填写或批量导入（绑定表落 data/proxy.json）。
+              </div>
             </div>
           </div>
         </div>
@@ -779,6 +1129,32 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="prompt_file" placeholder="留空 = 内置默认提示词">
                 <span class="hint">需重启</span></label>
             </div>
+
+            <!-- 身份提示词：在线编辑区（保存即热生效，无需重启） -->
+            <div class="hr"></div>
+            <div class="prompt-box">
+              <div class="prompt-hd">
+                <b>身份提示词（系统提示词）</b>
+                <span class="tag" id="promptSource">—</span>
+                <span class="note" id="promptNote"></span>
+                <span class="grow"></span>
+                <button type="button" class="xs" id="btnPromptReload">重新载入</button>
+                <button type="button" class="xs" id="btnPromptBuiltin">恢复内置</button>
+                <button type="button" class="xs primary" id="btnPromptSave">保存提示词</button>
+              </div>
+              <div class="prompt-meta">
+                保存后<strong>立即生效</strong>（写在内存快照里，下一个请求就用新提示词）；
+                同时落盘到下方路径与 config.json，重启也不会丢。
+                custom 模式会用它替换客户端发来的 system / developer 消息。
+              </div>
+              <textarea id="promptText" class="prompt-ta" spellcheck="false"
+                placeholder="留空 = 使用内置默认提示词"></textarea>
+              <div class="prompt-foot">
+                <span class="lb">落盘路径</span>
+                <input id="promptFile" class="prompt-file" placeholder="/app/data/prompt-src-hunter.md">
+                <span class="hint">只允许 /app/data/ 或 /app/auths/ 下的路径</span>
+              </div>
+            </div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
@@ -845,6 +1221,54 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 开学季券码 -->
+<div class="veil" id="pxBulkVeil">
+  <div class="dlg" style="width:720px">
+    <header>
+      <h3>批量导入代理</h3>
+      <div class="hint">每行一条：<b>uid 代理链接 [声明出口IP] [备注]</b>。分隔符支持空格 / Tab / 逗号；第三列是 IP 就当声明出口 IP，否则当备注；<code>#</code> 开头为注释。逐条返回成功/失败，不会因一行拼错回滚其余。</div>
+    </header>
+    <div class="body">
+      <textarea id="pxBulkText" rows="12" style="width:100%;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px"
+        placeholder="abb0a664-76e7-4178-a2b8-797c364ef3bd socks5://user:pass@1.2.3.4:60000 1.2.3.4 美西住宅-01&#10;d98bf163-f75f-4987-99cc-ba7d56ba763e socks5://user:pass@5.6.7.8:60000 5.6.7.8 美西住宅-02"></textarea>
+      <div class="state" id="pxBulkMsg" style="margin-top:10px"></div>
+    </div>
+    <footer>
+      <span class="hint" id="pxBulkNote"></span>
+      <span class="grow"></span>
+      <button class="xs" id="pxBulkCancel">取消</button>
+      <button class="xs primary" id="pxBulkSave">导入并校验</button>
+    </footer>
+  </div>
+</div>
+
+<div class="veil" id="pxVeil">
+  <div class="dlg" style="width:640px">
+    <header>
+      <h3>配置代理 <span class="hint" id="pxWho"></span></h3>
+      <div class="hint"><b>声明出口 IP 一般留空</b>：聚合代理的出口会实时轮换，系统每次校验都实测最新出口、验证调用确实走这条代理。仅当你确定出口固定不变（固定 IP 住宅代理）才填写，填写后出口不符将按失配策略处置。代理链接里的 host 是<b>入口</b>，与出口无关，别把入口 IP 填进来。</div>
+    </header>
+    <div class="body">
+      <div style="display:grid;grid-template-columns:112px 1fr;gap:10px;align-items:center">
+        <label>代理链接</label>
+        <input id="pxProxy" placeholder="socks5://user:pass@1.2.3.4:60000" style="width:100%">
+        <label>声明出口 IP</label>
+        <input id="pxExpect" placeholder="1.2.3.4（可留空）" style="width:100%">
+        <label>备注</label>
+        <input id="pxLabel" placeholder="美国-洛杉矶-住宅-01" style="width:100%">
+        <label>启用</label>
+        <label style="display:flex;align-items:center;gap:7px"><input type="checkbox" id="pxEnabled" checked> 该账号走此代理出口</label>
+      </div>
+      <div class="state" id="pxMsg" style="margin-top:12px"></div>
+    </div>
+    <footer>
+      <button class="xs" id="pxDelete">删除绑定</button>
+      <span class="grow"></span>
+      <button class="xs" id="pxCancel">取消</button>
+      <button class="xs primary" id="pxSave">保存并校验</button>
+    </footer>
+  </div>
+</div>
+
 <div class="veil" id="vcVeil">
   <div class="dlg">
     <header>

@@ -48,6 +48,11 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
+	// 多模态 part 归一化（见 image.go）：Anthropic / Responses 方言、裸字符串
+	// image_url、缺失 type、base64 折行——全部翻译成上游唯一接受的形态。
+	// 上游对白名单外的 content type 直接整单 400（11101），而真实客户端发的
+	// 恰好都是方言，这是「图片输入失败」的根因。与 sanitize 解耦（协议兼容）。
+	normalizeImageParts(obj)
 	// tool 配对两步（见 tool_pairing.go）：先重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
 	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
@@ -113,6 +118,23 @@ func translateMaxCompletionTokens(obj map[string]any) {
 			obj["max_tokens"] = int64(v)
 		}
 	}
+}
+
+// modelOf 从出站请求体提取 model 字段，仅供错误日志标注。
+//
+// 为什么需要：chat 出错时的日志（transport error / upstream 4xx-5xx）只带 uid 与
+// 状态码，不带模型名。一个网关里同名前缀的模型很多（global:deep-model 与
+// global:deepseek-v4.1-flash 在旧表格日志里都被截成 "global:deep"），
+// 排障时无法确定到底是哪个模型失败（2026-09-19 实际踩过）。
+// 只在错误路径调用（非热路径）；解析失败/缺字段 → "-"（不编造）。
+func modelOf(body []byte) string {
+	var obj struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil || strings.TrimSpace(obj.Model) == "" {
+		return "-"
+	}
+	return obj.Model
 }
 
 // effortRank 档位从低到高。
@@ -213,11 +235,25 @@ func normalizeRoles(obj map[string]any) {
 	}
 }
 
-// ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：
-// 首条消息非 system 时在 messages 最前补一条 fallback system（"You are a helpful assistant."）。
-// 仅对 global 请求调用（CN 现状不动；即使首条就是 system 也不重复注入）。
-// body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不在这里二次错误化）。
-func ensureConsoleSystem(body []byte) []byte {
+// ensureLeadingSystem 首条消息 system 兜底注入（吸收上游 PR #45）。
+//
+// 上游硬约束（2026-09-19 直连实测，stream:true）：messages[0] 必须是 system，
+// 否则整单拒绝：
+//
+//	HTTP 400 code=11128 "first message is not system prompt"
+//
+// 触发条件与消息内容无关——首条是 user/assistant/tool 一律 11128（无图片、
+// 带图片都同样命中）。这正是「图片输入报 11128」的真身：客户端某条请求首条
+// 不是 system，图片只是恰好同时在场。
+//
+// 原实现只对 global 请求套用（函数名 ensureConsoleSystem），CN 与
+// global-disabled 的请求没有这层兜底 —— 一旦客户端不带 system 消息
+// （或第一轮把 system 放在别处），就直接把 11128 透给用户。
+//
+// 现对**所有 realm** 生效：补一条极简 fallback system。首条已是 system 时不注入
+// （不覆盖、不重复、不动用户内容）。body 不可解析时原样返回（坏 body 不在这里
+// 二次错误化，交给上游按原语义报错）。
+func ensureLeadingSystem(body []byte) []byte {
 	if len(body) == 0 {
 		return body
 	}

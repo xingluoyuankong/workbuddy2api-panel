@@ -165,6 +165,7 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 		req.Header.Set("X-Domain", a.Domain)
 	}
 
+	reqWithAccount(req, a) // per-account 出站：把账号绑定到请求上下文
 	data, err := c.doJSON(req)
 	if err != nil {
 		return 0, 0, err

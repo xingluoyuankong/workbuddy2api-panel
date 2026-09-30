@@ -38,6 +38,7 @@ func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]a
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
+	reqWithAccount(req, a) // per-account 出站：把账号绑定到请求上下文
 	data, err := c.doJSON(req)
 	if err != nil {
 		return err
@@ -185,6 +186,7 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 	req.Header.Set("X-Client-Version", "2.4.0")
 	req.Header.Set("X-Client-Platform", "mp-weixin")
 	req.Header.Set("X-Platform", "wechatmp")
+	reqWithAccount(req, a) // per-account 出站：把账号绑定到请求上下文
 	_, err = c.doJSON(req)
 	return err
 }

@@ -139,8 +139,9 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 					t.Errorf("personal/models UA = %q want FetchAgent/2", got)
 				}
 			case strings.HasSuffix(r.URL.Path, "/v3/config"):
-				if got := r.Header.Get("User-Agent"); got != codeBuddyIDEUA {
-					t.Errorf("v3/config UA = %q want %s", got, codeBuddyIDEUA)
+				// 双 UA 并发探测：配置 UA（FetchAgent/2）与 IDE UA 各一路。
+				if got := r.Header.Get("User-Agent"); got != codeBuddyIDEUA && got != "FetchAgent/2" {
+					t.Errorf("v3/config UA = %q want %s or FetchAgent/2", got, codeBuddyIDEUA)
 				}
 				return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
 			default:

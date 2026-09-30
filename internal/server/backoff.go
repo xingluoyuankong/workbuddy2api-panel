@@ -7,6 +7,8 @@ import (
 	"context"
 	"math/rand/v2"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // rotateBackoffBase 轮转退避基数（对齐官方 intl CLI computeRequestRetryDelayMs
@@ -38,9 +40,35 @@ func jitterDur(d time.Duration) time.Duration {
 }
 
 // backoffAfter 返回第 n 次轮转（0 基：首次失败换号前 n=0）前应等待的退避时长：
-// base·2^n 封顶 rotateBackoffCap，再施加 ±25% 抖动。base 置 0（测试）时恒 0。
-// 用逐次翻倍而非位移：base 调整后无需同步维护移位上限，溢出由封顶比较兜底。
-func backoffAfter(n int) time.Duration {
+// 按错误类型差异化：
+//   - 520/5xx 瞬时故障 → 立即重试（0ms）：上游瞬时故障，退避无意义
+//   - timeout/EOF → 重退避（1s·2^n 封顶 16s）：链路卡，让恢复
+//   - 其他 → 正常退避（500ms·2^n 封顶 8s）
+// base 置 0（测试）时恒 0。用逐次翻倍而非位移：base 调整后无需同步维护移位上限，
+// 溢出由封顶比较兜底。
+func backoffAfter(n int, kind upstream.ErrKind) time.Duration {
+	// 5xx 瞬时故障：立即重试（不退避）
+	if kind == upstream.ErrKind520 || kind == upstream.ErrServer {
+		return 0
+	}
+	
+	// timeout/EOF：链路卡，重退避（1s·2^n 封顶 16s）
+	if kind == upstream.ErrTransportTimeout || kind == upstream.ErrTransportEOF {
+		base := time.Second
+		d := base
+		for k := 0; k < n && d < 16*time.Second; k++ {
+			d *= 2
+			if d <= 0 { // 翻倍溢出成非正数：直接按封顶处理
+				return jitterDur(16 * time.Second)
+			}
+		}
+		if d > 16*time.Second {
+			d = 16 * time.Second
+		}
+		return jitterDur(d)
+	}
+	
+	// 其他：正常退避（500ms·2^n 封顶 8s）
 	d := rotateBackoffBase
 	if d <= 0 {
 		return 0

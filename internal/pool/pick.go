@@ -61,6 +61,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
+		if !p.proxyGateOK(uid) {
+			continue // 账号代理隔离（quarantine）：出口不可信的账号不参与出池
+		}
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
@@ -210,6 +213,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if p.inFlightFull(e) {
 			continue
+		}
+		if !p.proxyGateOK(uid) {
+			continue // 同上：代理隔离的账号连兜底也不参与（否则闸门形同虚设）
 		}
 		exp := e.expiry(now)
 		if exp.IsZero() {

@@ -44,3 +44,11 @@ docs/
 /cmd/desktopverify*/
 *.zip
 server.exe
+
+# 备份文件（含 config.json.bak*——里面有 api_key/token，绝不能进仓库）
+*.bak
+*.bak-*
+*.bak.*
+
+# 本地编译产物（Go 构建输出）
+/workbuddy2api

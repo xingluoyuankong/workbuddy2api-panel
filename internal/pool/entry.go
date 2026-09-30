@@ -57,6 +57,10 @@ type TokenUsageDelta struct {
 	LatencyMs           int64
 	HasTokensPerSecond  bool
 	TokensPerSecond     float64
+	// Credit 本次请求实际消耗的工作积分（上游 usage.credit，权威口径）。
+	// 与 token 数不是一回事：不同模型倍率差几十倍，只看 token 看不出真实成本。
+	HasCredit bool
+	Credit    float64
 }
 
 // Status 单个账号对外暴露的状态（脱敏）。
@@ -99,6 +103,44 @@ type Status struct {
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
+
+	// Egress 该账号当前出口信息（账号代理实测结果）。nil = 未绑定代理，
+	// 账号走 realm 默认出口（CN 直连 / global 代理池）——面板据此显示「直连」
+	// 而不是留空，避免把"没配"误读成"没测出来"。
+	Egress *EgressInfo `json:"egress,omitempty"`
+}
+
+// EgressInfo 单账号出口摘要（面板账号池列表用，不参与任何调度判定）。
+//
+// 数据来自账号代理守卫的实测快照（upstream.AccountProxyStatus），由 main 注入
+// 的提供者填充。字段刻意保持扁平：面板列表只需要"出口在哪、可不可信"。
+type EgressInfo struct {
+	// Source 出口来源："proxy" = 账号代理；"direct" = 未绑代理，走本机直连出口。
+	Source string `json:"source,omitempty"`
+	// IP 实测出口 IP（空 = 尚未探测成功）。
+	IP string `json:"ip,omitempty"`
+	// Declared 声明/锁定的出口 IP（空 = 未声明，首次校验后自动锁定）。
+	Declared string `json:"declared,omitempty"`
+	// DirectIP 本机直连出口 IP（对照基准：IP == DirectIP 即代理没生效）。
+	DirectIP string `json:"direct_ip,omitempty"`
+	// Country / CountryCode / ASN 出口地理与运营方。
+	Country     string `json:"country,omitempty"`
+	CountryCode string `json:"country_code,omitempty"`
+	ASN         string `json:"asn,omitempty"`
+	// CallIP 最近一次「调用时实测出口」（NoteCall 异步采样；空 = 尚未采样）。
+	// 与 IP 比对 = 「显示的出口与调用实际出口是否一致」。
+	CallIP string `json:"call_ip,omitempty"`
+	// State 代理状态机取值（ok/unchecked/unreachable/not_effective/rotating/
+	// mismatch/leak/disabled），语义见 upstream.accountproxy.go。
+	State string `json:"state"`
+	// ProxyHost 代理入口 host:port（不含凭据，可安全展示）。
+	ProxyHost string `json:"proxy_host,omitempty"`
+	// Label 绑定备注（如「美西住宅-01」）。
+	Label string `json:"label,omitempty"`
+	// SharedBy 同一出口 IP 上共承载几个账号（>1 = 聚号风险）。
+	SharedBy int `json:"shared_by,omitempty"`
+	// CheckedAt 最近一次校验时刻（unix ms）。
+	CheckedAt int64 `json:"checked_at,omitempty"`
 }
 
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。

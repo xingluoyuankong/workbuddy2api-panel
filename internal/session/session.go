@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -238,6 +239,85 @@ func (r *Router) Count() int {
 	defer r.mu.RUnlock()
 	return len(r.entries)
 }
+
+// BindInfo 一条粘性绑定的观测快照（面板展示用）。
+type BindInfo struct {
+	Key        string    `json:"key"`         // 会话 key（面板展示时由调用方脱敏）
+	UID        string    `json:"uid"`         // 绑定的账号 uid
+	LastActive time.Time `json:"last_active"` // 最近活跃时刻
+	Idle       string    `json:"idle"`        // 距上次活跃时长（人类可读，如 "3m12s"）
+}
+
+// List 返回当前全部绑定的快照（按最近活跃倒序，便于面板看"当前粘在哪个号"）。
+//
+// 为什么需要：粘性会话把某个对话长期钉在一个账号上。账号出问题（冷却/限流/
+// 被 6004 限额）时，用户会看到"这个对话一直失败但别的对话正常"——只有能看到
+// 绑定关系才能判断，也才能手动解开。
+func (r *Router) List() []BindInfo {
+	now := time.Now()
+	r.mu.RLock()
+	out := make([]BindInfo, 0, len(r.entries))
+	for key, e := range r.entries {
+		out = append(out, BindInfo{
+			Key:        key,
+			UID:        e.uid,
+			LastActive: e.lastActive,
+			Idle:       now.Sub(e.lastActive).Round(time.Second).String(),
+		})
+	}
+	r.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LastActive.After(out[j].LastActive)
+	})
+	return out
+}
+
+// Clear 解除**全部**绑定，返回清除条数（手动"重置粘性会话"入口）。
+//
+// 语义：等价于对每个 key 调 Unbind —— 内存与 redisstore 双向都清，
+// 否则重启后又会从 Redis 恢复回来，用户会以为"重置没生效"。
+func (r *Router) Clear() int {
+	r.mu.Lock()
+	keys := make([]string, 0, len(r.entries))
+	for key := range r.entries {
+		keys = append(keys, key)
+	}
+	for _, key := range keys {
+		delete(r.entries, key)
+	}
+	r.mu.Unlock()
+	for _, key := range keys {
+		r.cfg.Store.DelBind(key)
+	}
+	return len(keys)
+}
+
+// ClearUID 解除所有绑定到指定账号的会话，返回清除条数。
+// 用途：某个账号出问题时，一次性把所有钉在它上面的会话解开，
+// 让它们重新分配到健康账号（比整池清空更精准）。
+func (r *Router) ClearUID(uid string) int {
+	if uid == "" {
+		return 0
+	}
+	r.mu.Lock()
+	var keys []string
+	for key, e := range r.entries {
+		if e.uid == uid {
+			keys = append(keys, key)
+			delete(r.entries, key)
+		}
+	}
+	r.mu.Unlock()
+	for _, key := range keys {
+		r.cfg.Store.DelBind(key)
+	}
+	return len(keys)
+}
+
+// GCNow 立即执行一次过期清理（不等下一个 GC 周期），返回清理条数。
+// 面板"清理已过期"按钮用：TTL 是 30 分钟，GC 每 5 分钟跑一次，
+// 手动触发可以让用户立刻看到数字回落，而不是干等。
+func (r *Router) GCNow() int { return r.gcOnce(time.Now()) }
 
 // gcOnce 清理 TTL 过期的绑定，并镜像删除。
 func (r *Router) gcOnce(now time.Time) int {

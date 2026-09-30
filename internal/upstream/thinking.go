@@ -155,6 +155,19 @@ func injectThinking(obj map[string]any, defaultEffort string) {
 // ensureDeepSeekEffort 缺 effort 档位时补默认档（snake 优先，camel 兜底）。
 // 已有任一 effort → 不覆盖（显式档位不做任何改写，降级交给 normalizeReasoningEffort）。
 // defaultEffort 空串 → 回退 defaultDeepSeekEffort（硬编码 "high"）。
+//
+// 【历史一致性守卫】历史里 assistant 的 reasoning_content 缺失不一致时**不补档位**。
+//
+// 实测（2026-09-19，global 域 /v2 后端，用真实抓包 body 逐字段二分）：
+//   - 带 reasoning_effort（任意档位）→ 上游 400 code=11155
+//     "the reasoning content from the previous turn must be passed back in thinking mode"
+//   - 只带 thinking.type=enabled、**不带** reasoning_effort → 200 正常
+//     （同一份 body，仅此一个字段之差）
+// 即：**带档位时上游才强制要求上轮的 reasoning 全部回传**；多轮工具型 Agent
+// 的历史里只要有一条 assistant 没带回 reasoning（客户端常见：
+// requiresReasoningContentOnAssistantMessages 未实现），整包就被拒。
+// 历史整体没有 reasoning（老客户端/首轮）时不在此列——那是「一致地没有」，
+// 上游按普通思考模式处理，行为保持原样，避免影响既有可用路径。
 func ensureDeepSeekEffort(obj map[string]any, defaultEffort string) {
 	_, hasSnake := obj["reasoning_effort"]
 	if hasSnake {
@@ -164,8 +177,46 @@ func ensureDeepSeekEffort(obj map[string]any, defaultEffort string) {
 	if hasCamel {
 		return
 	}
+	if reasoningHistoryInconsistent(obj) {
+		return // 不补档位：只开 thinking，规避上游 11155（理由见函数注释）
+	}
 	if defaultEffort == "" {
 		defaultEffort = defaultDeepSeekEffort
 	}
 	obj["reasoning_effort"] = defaultEffort
+}
+
+// reasoningHistoryInconsistent 报告历史里 assistant 消息的 reasoning_content 是否
+// **有的带、有的不带**（不一致）。
+//
+//   - 全部为空（含一条都没有）：返回 false —— 「一致地没有」，不干预（保持原行为）；
+//   - 全部非空：返回 false —— 历史完整，上游的回传要求本就满足；
+//   - 有非空也有空：返回 true —— 客户端回传不完整，补档位必被上游 11155 拒绝。
+//
+// 只读判定，不修改 obj。
+func reasoningHistoryInconsistent(obj map[string]any) bool {
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return false
+	}
+	seenNonEmpty, seenEmpty := false, false
+	for _, mm := range msgs {
+		msg, ok := mm.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "assistant" {
+			continue
+		}
+		s, _ := msg["reasoning_content"].(string)
+		if strings.TrimSpace(s) == "" {
+			seenEmpty = true
+		} else {
+			seenNonEmpty = true
+		}
+		if seenNonEmpty && seenEmpty {
+			return true
+		}
+	}
+	return false
 }

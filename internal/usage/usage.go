@@ -57,6 +57,8 @@ type bucket struct {
 	LatN  int64   `json:"ln"` // 延迟样本数
 	TPS   float64 `json:"v"`  // 吐字速率累计
 	TPSN  int64   `json:"vn"` // 速率样本数
+	CR    float64 `json:"cr"` // 积分消耗累计（上游 usage.credit）
+	CRN   int64   `json:"cn"` // 积分样本数（拿到 credit 的请求数）
 }
 
 // file 落盘结构。
@@ -138,6 +140,9 @@ type Delta struct {
 	HasLatency       bool
 	TokensPerSecond  float64
 	HasTPS           bool
+	// Credit 本次实际消耗的积分（上游 usage.credit）。失败尝试通常没有。
+	Credit    float64
+	HasCredit bool
 }
 
 // Add 记录一次请求尝试。
@@ -189,6 +194,12 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		b.TPS += d.TokensPerSecond
 		b.TPSN++
 	}
+	// 积分：只有上游真的下发了 usage.credit 才计样本（没下发不填 0，
+	// 否则「0 积分」与「未知积分」在数据里无法区分）。
+	if d.HasCredit {
+		b.CR += d.Credit
+		b.CRN++
+	}
 	r.dirty = true
 }
 
@@ -237,6 +248,8 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.LatN += src.LatN
 			dst.TPS += src.TPS
 			dst.TPSN += src.TPSN
+			dst.CR += src.CR
+			dst.CRN += src.CRN
 		}
 		delete(r.buckets, m.from)
 	}
@@ -315,8 +328,38 @@ type Agg struct {
 	PromptTokens  int64   `json:"prompt_tokens"`
 	CompletionTok int64   `json:"completion_tokens"`
 	TotalTokens   int64   `json:"total_tokens"`
+	Credits       float64 `json:"credits"`        // 积分消耗合计（上游 usage.credit 累计）
+	CreditSamples int64   `json:"credit_samples"` // 拿到 credit 的请求数（0 → 上游未下发积分）
 	AvgLatencyMs  float64 `json:"avg_latency_ms"`
 	AvgTPS        float64 `json:"avg_tokens_per_second"`
+	// CreditsPer1k 实测千 token 单价（credits/total*1000），0 = 无数据。
+	// 与「积分倍率」不同：这是**真实扣费**反推的单价，含模型倍率与实际输出长度。
+	CreditsPer1k float64 `json:"credits_per_1k,omitempty"`
+	// CreditsEst 回填的估算积分：历史桶产生时网关还没记录 usage.credit，
+	// 用成本账本（model_costs 的实测 per1k）× 该桶 token 数反推，让历史数据
+	// 也能对上账。与 Credits 分开存放，前端按「估算」标注，绝不冒充实测值。
+	CreditsEst     float64 `json:"credits_est"`
+	CreditsEstToks int64   `json:"credits_est_tokens"` // 参与估算的 token 数（0 = 无单价可估）
+}
+
+// CreditsTotal 对外口径的积分合计：有实测用实测，否则用回填估算。
+func (a Agg) CreditsTotal() float64 {
+	if a.CreditSamples > 0 {
+		return a.Credits
+	}
+	return a.CreditsEst
+}
+
+// CreditsKind 积分来源标注："measured" / "estimated" / "none"。
+func (a Agg) CreditsKind() string {
+	switch {
+	case a.CreditSamples > 0:
+		return "measured"
+	case a.CreditsEstToks > 0:
+		return "estimated"
+	default:
+		return "none"
+	}
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -327,6 +370,9 @@ type aggAcc struct {
 	latSamples int64
 	tpsSum     float64
 	tpsSamples int64
+	// est 历史积分回填器（nil = 不回填）。放在累加器里，避免给每处 add 调用
+	// 都加一个参数、漏传就静默丢估算。
+	est CostEstimator
 }
 
 func (g *aggAcc) add(b *bucket) {
@@ -339,6 +385,18 @@ func (g *aggAcc) add(b *bucket) {
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
 	g.tpsSamples += b.TPSN
+	g.Credits += b.CR
+	g.CreditSamples += b.CRN
+	// 回填：只有「该桶完全没有实测 credit」且「有 token 数」时才估算，
+	// 避免与实测值重复计入（重复计会让总量虚高一倍）。
+	if b.CRN == 0 && b.TT > 0 && g.est != nil {
+		// per1k==0 是有效结论（实测免费），也要计 tokens——否则前端无法区分
+		// 「估算为 0（免费）」与「没单价、算不出来」，两者都显示成 —。
+		if per1k, ok := g.est(b.UID, b.Model); ok {
+			g.CreditsEst += float64(b.TT) / 1000 * per1k
+			g.CreditsEstToks += b.TT
+		}
+	}
 }
 
 func (g *aggAcc) finish() Agg {
@@ -348,6 +406,15 @@ func (g *aggAcc) finish() Agg {
 	}
 	if g.tpsSamples > 0 {
 		a.AvgTPS = g.tpsSum / float64(g.tpsSamples)
+	}
+	// 千 token 单价：按真实扣费与真实 token 数反推（不是目录里的倍率）。
+	// 分子用「实测 + 回填」的合计——两者覆盖的是互不相交的 token 集合
+	// （回填只对无实测 credit 的桶生效），所以合计 / 总 token 才是全局单价。
+	// 只取实测会让单价虚高（分母含未被实测覆盖的历史 token）。
+	if a.TotalTokens > 0 {
+		if total := a.Credits + a.CreditsEst; total > 0 {
+			a.CreditsPer1k = total / float64(a.TotalTokens) * 1000
+		}
 	}
 	return a
 }
@@ -380,9 +447,25 @@ type Snapshot struct {
 	Generated string     `json:"generated"`
 }
 
-// Snapshot 聚合当前全部桶。hours 控制时序返回多少个小时点（其余按日折叠）。
-// nicks 是 uid→昵称映射，仅用于展示。
+// CostEstimator 历史积分回填器：给定 (账号, 模型) 返回实测千 token 单价。
+// 由调用方（面板）从 pool 的成本账本（model_costs）构造；ok=false 表示该组合
+// 无单价可估（对应桶的积分留空，不编造）。
+type CostEstimator func(uid, model string) (per1k float64, ok bool)
+
+// Snapshot 聚合当前全部桶（不回填历史积分）。兼容旧调用方与测试。
 func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
+	return r.SnapshotWithCost(hours, nicks, nil)
+}
+
+// SnapshotWithCost 聚合当前全部桶，并用 est 回填历史积分。
+//
+// 背景：网关从某个版本才开始把上游 usage.credit 记进用量桶，之前的桶只有
+// token 数没有积分——直接展示会让「964 次请求只有 0.1 积分」这种明显失真的
+// 数字。成本账本（pool.model_costs）一直在按 (账号,模型) 记录实测单价，
+// 用它乘以桶里的 token 数即可把历史积分补回来。
+//
+// hours 控制时序返回多少个小时点（其余按日折叠）；nicks 仅用于展示。
+func (r *Recorder) SnapshotWithCost(hours int, nicks map[string]string, est CostEstimator) Snapshot {
 	if r == nil {
 		return Snapshot{Generated: time.Now().Format(time.RFC3339)}
 	}
@@ -397,7 +480,8 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 	}
 	r.mu.Unlock()
 
-	var total aggAcc
+	newAcc := func() *aggAcc { return &aggAcc{est: est} }
+	var total = newAcc()
 	realmAgg := map[string]*aggAcc{}
 	acctAgg := map[string]*aggAcc{}
 	acctRealm := map[string]string{}
@@ -413,12 +497,12 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 		total.add(b)
 
 		if realmAgg[b.Realm] == nil {
-			realmAgg[b.Realm] = &aggAcc{}
+			realmAgg[b.Realm] = newAcc()
 		}
 		realmAgg[b.Realm].add(b)
 
 		if acctAgg[b.UID] == nil {
-			acctAgg[b.UID] = &aggAcc{}
+			acctAgg[b.UID] = newAcc()
 		}
 		acctAgg[b.UID].add(b)
 		// 一个账号只属于一个 realm，这里记下来供前端展示「域」列；
@@ -428,7 +512,7 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 		}
 
 		if modelAgg[b.Model] == nil {
-			modelAgg[b.Model] = &aggAcc{}
+			modelAgg[b.Model] = newAcc()
 		}
 		modelAgg[b.Model].add(b)
 
@@ -441,7 +525,7 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 			}
 			if !ts.Before(hourFrom) {
 				if hourSeries[scope] == nil {
-					hourSeries[scope] = &aggAcc{}
+					hourSeries[scope] = newAcc()
 				}
 				hourSeries[scope].add(b)
 			} else {
@@ -454,7 +538,7 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 			}
 		} else {
 			if daySeries[scope] == nil {
-				daySeries[scope] = &aggAcc{}
+				daySeries[scope] = newAcc()
 			}
 			daySeries[scope].add(b)
 		}

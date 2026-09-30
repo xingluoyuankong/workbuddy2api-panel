@@ -155,6 +155,48 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	p.dirty.Store(true)
 }
 
+// ModelBlockedEverywhere 报告该模型是否已被**全部健康账号**做 11102 负缓存。
+//
+// 用途：区分「没号了」与「这模型上游根本没有」。全部账号都判定 11102 时，
+// 说明问题在模型而非账号——此时报 503 no_healthy_account 会误导用户，
+// 客户端还会不停换号重试（换号对这个模型永远无效）。handler 据此改报
+// 404 model_not_found，让客户端立刻换模型。
+//
+// 判定口径：
+//   - 无健康账号 → false（那是账号问题，不是模型问题）
+//   - 只要有一个健康账号没被 block → false（还能试）
+//   - 全部健康账号都在 block 期内 → true
+func (p *Pool) ModelBlockedEverywhere(model, realm string) bool {
+	if model == "" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	healthy, blocked := 0, 0
+	for _, e := range p.byUID {
+		// realm 必须过滤：CN 模型只由 CN 账号承载。不过滤会把 global 账号算进
+		// 健康数（它们永远没有该 CN 模型的 11102 条目），导致 blocked != healthy、
+		// 判定恒为 false —— 这正是第一版漏掉的分支。
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if e.disabled || !e.healthy(now) {
+			continue
+		}
+		healthy++
+		if mc, ok := e.modelCooldowns[model]; ok && mc.Until.After(now) &&
+			strings.HasPrefix(mc.Reason, ModelBlockReasonPrefix) {
+			blocked++
+		}
+	}
+	return healthy > 0 && blocked == healthy
+}
+
+// ModelBlockReasonPrefix 11102 负缓存条目的 reason 前缀（与 upstream.ModelBlockReason
+// 同源；pool 不反向依赖 upstream，故本地定义一份并保持字面一致）。
+const ModelBlockReasonPrefix = "11102"
+
 // BlockModelClear 清除 (账号, 模型) 的 11102 负缓存条目（该模型实测又通了）。半开探测
 // 或正常请求对该模型成功后调用（handler 成功路径）。只清 11102 条目、不碰 6004 独立
 // 冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉。reason 前缀判定区分两者：
@@ -303,3 +345,40 @@ func nextDay4AM(now time.Time) time.Time {
 // ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。
 // 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
 // reviveCoolingLocked 已迁至 transition.go（状态机迁移唯一权威实现）。
+
+// CooldownWaf 记一次 WAF 403 的**有界**软冷却（P0-WAF-IP-SINGLE 配套）。
+//
+// 与 CooldownSoftRate 的差异：**不推进 softStreak**。理由——WAF 403 是 IP/指纹维
+// 频控信号，与账号无关（换任何号、同一出口 IP 都拦），把它当 429 那样指数堆加到
+// 2h 封顶只会造成「一次突发后全池长时间不可用」的放大伤害（实测 new-api 渠道测速
+// 触发 55 次 403，账号级 softStreak 被推到高位）。
+//
+// 语义：
+//   - resetAt 非零（上游带 Retry-After / 重置墙钟）→ 账号级用该时长，截断
+//     softRateMax（不指数堆加）；
+//   - resetAt 零值 → 固定 base（调用方传 jitterDur(wafCooldownBase)），同样不堆加；
+//   - 已在冷却中再次命中 → 既不续期也不缩短（保持最早 until，自然解除语义，
+//     与 IP 级门控的「激活期不续期」口径一致）。
+func (p *Pool) CooldownWaf(uid string, d time.Duration, resetAt time.Time, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	if now.Before(e.until) && e.coolKind == CoolSoft {
+		// 已在 WAF 软冷却中：不续期、不延长（防越重试越冷）。
+		return
+	}
+	if !resetAt.IsZero() {
+		e.until = p.cappedSoftUntilLocked(now, resetAt)
+	} else {
+		e.until = now.Add(d)
+	}
+	e.coolKind = CoolSoft
+	e.reason = reason
+	e.modelCooldowns = nil // 账号级软冷却：清空模型豁免（切模型不绕过）
+	// softStreak 保持不变（不清零也不递增）——本入口与 429 的指数通道解耦。
+	p.dirty.Store(true)
+}
