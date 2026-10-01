@@ -639,6 +639,9 @@ type Client struct {
 	realmMu      sync.Mutex
 	// realmEgressCache 池出口采样缓存（SampleRealmEgress 写，RealmEgressView 读）。
 	realmEgressCache sync.Map
+	// realmAuthFail realm 级凭据失效截止（407 触发；订阅刷新重建池后清除）。
+	// 整池 token 同批次失效，熔断整个 realm 比逐条试快 50 倍。
+	realmAuthFail sync.Map
 	proxyCursor   atomic.Uint32
 
 	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
@@ -774,6 +777,12 @@ type proxyEntry struct {
 	untrustedUntil atomic.Int64
 	mitmHits       atomic.Int32
 
+	// realm 该出口所属 realm（SetRealmProxy 注入）。
+	realm string
+	// onAuthFail 407 回调：通知 Client 整个 realm 池凭据失效（同一批次 Link
+	// token 一起失效，逐条试没意义）。SetRealmProxy 注入。
+	onAuthFail func()
+
 	// latencyEWMA 成功请求「响应头耗时」的指数移动平均（毫秒；0 = 无样本）。
 	// 选路依据：resin 池节点延迟差 5 倍（实测 TTFB 5s~22s+），只看「是否失败」
 	// 会让慢节点（没失败但 TTFB 20s+）被反复选中——用户感知就是「卡死」。
@@ -858,8 +867,28 @@ func (e *proxyEntry) noteSuccess() {
 // 三轮策略：健康（无失败+不在冷却+无 MITM 嫌疑）→ 冷却期外轮询 → 非 MITM 兜底。
 // 全部出口都在 MITM 熔断期 → 返回 nil 回落直连（把 token 交给劫持者比 403 更糟）。
 // realm 隔离：global 与 cn 各自独立成池，互不取用。
+// markRealmAuthFail 标记整个 realm 池凭据失效（407）：熔断 1h，期间 pickProxy
+// 直接回落直连。订阅刷新（SetRealmProxy）会清除标记。
+func (c *Client) markRealmAuthFail(realm string) {
+	key := realmKey(realm)
+	v := time.Now().Add(time.Hour).UnixMilli()
+	if old, ok := c.realmAuthFail.Load(key); ok {
+		if o, _ := old.(int64); o == v {
+			return // 已标记，不重复打日志
+		}
+	}
+	c.realmAuthFail.Store(key, v)
+	log.Printf("[upstream] %s 池凭据失效（407），整池熔断 1h 回落直连（订阅刷新后自动恢复）", key)
+}
+
 func (c *Client) pickProxy(realm string) *proxyEntry {
 	key := realmKey(realm)
+	// realm 级凭据失效熔断：整池跳过，直接回落直连（比逐条试 407 快得多）。
+	if v, ok := c.realmAuthFail.Load(key); ok {
+		if until, _ := v.(int64); time.Now().UnixMilli() < until {
+			return nil
+		}
+	}
 	c.realmMu.Lock()
 	if c.realmProxies == nil {
 		c.realmProxies = map[string][]*proxyEntry{}
@@ -907,9 +936,11 @@ func (c *Client) pickProxy(realm string) *proxyEntry {
 			return e
 		}
 	}
-	// 兜底：宁可试一个普通失败的（退避期几分钟自愈），也不放弃该 realm；
-	// 但永久剔除的（劫持 >=3 次）任何情况下都不选——把 token 交给已知劫持者
-	// 比一次 503 严重得多。
+	// 兜底：存在非 MITM 嫌疑的出口时，宁可试一个可能坏的（它只是普通失败在
+	// 退避期，几分钟后可能就好了），也不放弃该 realm。
+	// 注意：这里**不检查 deadUntil**——全列表轮询语义要求全在退避期时仍给机会。
+	// 凭据失效（407）场景由 realm 级熔断在函数开头拦截（markRealmAuthFail），
+	// 整池立即回落直连，不走这条兜底。
 	for i := 0; i < n; i++ {
 		if e := entries[(start+i)%n]; good(e, now) && !e.untrusted(now) {
 			return e
@@ -942,9 +973,11 @@ func (t *proxyRT) RoundTrip(req *http.Request) (*http.Response, error) {
 		// 否则代理池永远不会避开已被 WAF 盯上的出口。
 		t.entry.noteFail()
 	case resp.StatusCode == http.StatusProxyAuthRequired:
-		// 407 凭据失效（resin 订阅强刷轮换 Link token 后整条线路 407）：不会
-		// 10s 自愈，逐条撞 407 只会拖慢请求（每次 0.3s×50 条）。直接长冷却 1h，
-		// 让 pickProxy 尽快回落直连；订阅刷新重建池（token 更新）后自动恢复。
+		// 407 凭据失效：同一批次 Link token 一起失效 → 通知 Client 熔断**整个
+		// realm 池**（不是只冷却这一条），否则要逐条试 50 次才轮到直连。
+		if t.entry.onAuthFail != nil {
+			t.entry.onAuthFail()
+		}
 		t.entry.deadUntil.Store(time.Now().Add(time.Hour).UnixNano())
 		t.entry.noteFail()
 	case resp.StatusCode == http.StatusBadGateway:
@@ -1024,8 +1057,12 @@ func (c *Client) SetRealmProxy(realm, rawURL string) error {
 		if err != nil {
 			return err
 		}
+		e.realm = key
+		e.onAuthFail = func() { c.markRealmAuthFail(key) }
 		entries = append(entries, e)
 	}
+	// 新池建立 = 新 token，清掉旧的凭据失效熔断。
+	c.realmAuthFail.Delete(key)
 	c.realmMu.Lock()
 	set(entries)
 	c.realmMu.Unlock()
