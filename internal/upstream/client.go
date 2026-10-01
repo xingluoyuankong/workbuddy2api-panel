@@ -941,6 +941,12 @@ func (t *proxyRT) RoundTrip(req *http.Request) (*http.Response, error) {
 		// 下一次 global 请求换另一个 resin/warp 出口；不要把 403 当成功，
 		// 否则代理池永远不会避开已被 WAF 盯上的出口。
 		t.entry.noteFail()
+	case resp.StatusCode == http.StatusProxyAuthRequired:
+		// 407 凭据失效（resin 订阅强刷轮换 Link token 后整条线路 407）：不会
+		// 10s 自愈，逐条撞 407 只会拖慢请求（每次 0.3s×50 条）。直接长冷却 1h，
+		// 让 pickProxy 尽快回落直连；订阅刷新重建池（token 更新）后自动恢复。
+		t.entry.deadUntil.Store(time.Now().Add(time.Hour).UnixNano())
+		t.entry.noteFail()
 	case resp.StatusCode == http.StatusBadGateway:
 		// 代理网关自己的 502 通常表示该池节点失效；503 可能是上游业务
 		// 失败（如 6004/服务暂时不可用），不能误杀当前出口。
@@ -1092,6 +1098,34 @@ func (c *Client) ProxyCount(realm string) int {
 
 // GlobalProxyCount 兼容包装（global 池条数）。
 func (c *Client) GlobalProxyCount() int { return c.ProxyCount("global") }
+
+// BestProxyFor 返回 realm 池里最稳定的出口链接（排除 excludeRaw），空串=没有
+// 可用条目（保持当前绑定不动，不要清掉）。
+// 稳定度排序：无劫持（mitmHits<3）→ 连续失败少 → 延迟 EWMA 低。
+func (c *Client) BestProxyFor(realm, excludeRaw string) string {
+	c.realmMu.Lock()
+	entries := append([]*proxyEntry(nil), c.realmProxies[realmKey(realm)]...)
+	c.realmMu.Unlock()
+	var best *proxyEntry
+	for _, e := range entries {
+		if e.raw == excludeRaw || e.mitmHits.Load() >= 3 {
+			continue
+		}
+		if best == nil {
+			best = e
+			continue
+		}
+		bf, ef := best.fails.Load(), e.fails.Load()
+		bl, el := best.latencyEWMA.Load(), e.latencyEWMA.Load()
+		if ef < bf || (ef == bf && el > 0 && (bl == 0 || el < bl)) {
+			best = e
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	return best.raw
+}
 
 // realmEgressView 池级出口采样缓存（无绑定账号的面板出口视图数据源）。
 type realmEgressView struct {

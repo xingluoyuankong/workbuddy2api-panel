@@ -142,6 +142,9 @@ type AccountProxyEntry struct {
 	// 每个端口对应一个固定 IP，填了才能立刻发现「出口不是它」）。
 	ExpectedIP string `json:"expected_ip,omitempty"`
 	Enabled bool `json:"enabled"`
+	// Auto 自动绑定标记：true = 由订阅池自动选择/换绑（当前链接失败或劫持时
+	// 自动切到池里下一条稳定链接）；false = 用户手动指定，永不自动改动。
+	Auto bool `json:"auto,omitempty"`
 	// Label 备注（如「美国-洛杉矶-住宅-01」），仅面板展示。
 	Label string `json:"label,omitempty"`
 	// Note 自由备注。
@@ -269,6 +272,9 @@ type AccountProxy struct {
 
 	// direct 直连对照 client：判定「代理有没有真的改变出口」的基准。
 	direct *http.Client
+	// client 出站 Client 引用（订阅池所在；SetClient 注入）。
+	// 自动绑定/换绑用它查池里最稳定的条目（Client.BestProxyFor）。
+	client *Client
 	// directIPCache 直连出口 IP（每次扫都重测成本高，缓存到 check 周期粒度）。
 	directIPCache atomicString
 	// 直连出口的地理与运营方（与 directIPCache 同一次探测取得）。
@@ -401,6 +407,105 @@ func (m *AccountProxy) SetEntry(uid string, e AccountProxyEntry) error {
 }
 
 // Remove 删除一个账号的代理绑定。
+// SetClient 注入出站 Client（订阅池所在），启用自动绑定/故障换绑。
+func (m *AccountProxy) SetClient(c *Client) {
+	if m != nil {
+		m.client = c
+	}
+}
+
+// probeCandidate 候选链接预检：单源实测出口可达（避免把账号绑到整条挂掉的
+// 线路上——resin 订阅刷新中该线路全部节点会暂时失效）。
+func (m *AccountProxy) probeCandidate(raw string) bool {
+	e, err := newProxyEntry(raw)
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	p := probeEgress(ctx, e.http, 1)
+	return p.IP != ""
+}
+
+// AutoBindAccount 自动绑定：无绑定账号粘住池里最稳定链接；auto 绑定的链接
+// 连续校验失败（fails>=2）时换绑到下一条稳定链接。手动绑定（auto=false）
+// 永不改动。换绑保留原 Enabled/Label/Note，清掉旧出口采样。
+//
+// 设计语义（用户定稿）：**不是随机轮询**——账号粘住一条稳定出口，只有它坏了
+// 才切换；切换后重新粘住。与池轮询（pickProxy 分散负载）是两种模式。
+func (m *AccountProxy) AutoBindAccount(uid, realm string) {
+	if m == nil || m.client == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b := m.bindings[uid]
+	if b == nil {
+		// 无绑定：首次自动绑定（粘住最稳定条目）。
+		// 预检：候选先实测一次——整条线路挂掉时（resin 订阅刷新中）宁可保持
+		// 直连（cn 直连国内接口是最佳路径），也不绑一个必挂的出口。
+		best := m.client.BestProxyFor(realm, "")
+		if best != "" && !m.probeCandidate(best) {
+			log.Printf("[autobind] %s 候选出口预检失败（线路不可用），保持直连", realm)
+			return
+		}
+		if best != "" {
+			e := &AccountProxyEntry{Proxy: best, Enabled: true, Auto: true}
+			nb, err := newAccountBinding(uid, e)
+			if err != nil {
+				log.Printf("[autobind] 自动绑定失败 uid=%s: %v", logfmt.UID8(uid), err)
+				return // defer 已解锁
+			}
+			m.doc.Accounts[uid] = e
+			m.bindings[uid] = nb
+			log.Printf("[autobind] %s 自动绑定稳定出口 uid=%s", realm, logfmt.UID8(uid))
+		}
+		return
+	}
+	if !b.spec.Auto || !b.spec.Enabled {
+		return // 手动绑定 / 已停用：不碰
+	}
+	// auto 绑定：连续校验失败 >=2 → 换绑（排除当前链接）
+	if b.entry.fails.Load() < 2 {
+		return
+	}
+	best := m.client.BestProxyFor(realm, b.spec.Proxy)
+	// 换绑候选预检：失败 = 整条线路挂了（resin 订阅刷新中）。
+	// 解绑回落直连（cn 直连国内接口最佳；global 全挂时宁可 503 也不绑死出口），
+	// 订阅恢复后 AutoBind 会自动重新绑定。
+	if best == "" || !m.probeCandidate(best) {
+		uid8 := logfmt.UID8(uid)
+		delete(m.doc.Accounts, uid)
+		delete(m.bindings, uid)
+		_ = m.saveLocked()
+		log.Printf("[autobind] %s 池内无可用的换绑候选（线路不可用），解绑回落直连 uid=%s",
+			realm, uid8)
+		return
+	}
+	host := best
+	if u, err := url.Parse(best); err == nil && u.Host != "" {
+		host = u.Host
+	}
+	oldHost := b.spec.Proxy
+	if u, err := url.Parse(oldHost); err == nil && u.Host != "" {
+		oldHost = u.Host
+	}
+	log.Printf("[autobind] 绑定出口连续失败，自动换绑 uid=%s %s -> %s",
+		logfmt.UID8(uid), oldHost, host)
+	b.spec.Proxy = best
+	b.spec.Auto = true
+	b.lockedIP.Store("")
+	b.probeIP.Store("")
+	b.entry.fails.Store(0)
+	m.doc.Accounts[uid] = &AccountProxyEntry{
+		Proxy: b.spec.Proxy, ExpectedIP: b.spec.ExpectedIP,
+		Enabled: b.spec.Enabled, Label: b.spec.Label, Note: b.spec.Note,
+		Auto: true,
+	}
+	_ = m.saveLocked()
+}
+
+// Remove 从绑定表移除一个账号的代理绑定（落盘同步）。
 func (m *AccountProxy) Remove(uid string) error {
 	if m == nil || m.opts.File == "" {
 		return fmt.Errorf("账号代理未启用")
