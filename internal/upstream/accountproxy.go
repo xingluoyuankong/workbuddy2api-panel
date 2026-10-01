@@ -421,7 +421,7 @@ func (m *AccountProxy) probeCandidate(raw string) bool {
 	if err != nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	p := probeEgress(ctx, e.http, 1)
 	return p.IP != ""
@@ -517,6 +517,18 @@ func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
 		if err != nil {
 			m.mu.Unlock()
 			continue
+		}
+		// 407 = 绑定凭据失效（resin 强刷轮换 token）：立即解绑该账号回落直连。
+		// 绑定 entry 与池条目是独立实例，池的 onAuthFail 覆盖不到这里，必须单独注入。
+		nb.entry.onAuthFail = func() {
+			m.mu.Lock()
+			if b := m.bindings[uid]; b != nil && b.spec.Proxy == nb.entry.raw {
+				delete(m.doc.Accounts, uid)
+				delete(m.bindings, uid)
+				_ = m.saveLocked()
+				log.Printf("[autobind] 绑定出口凭据失效（407），解绑 uid=%s 回落直连", logfmt.UID8(uid))
+			}
+			m.mu.Unlock()
 		}
 		// 保留用户手填的声明 IP / 备注（若有）
 		if ob := m.bindings[uid]; ob != nil {

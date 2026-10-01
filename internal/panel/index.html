@@ -69,6 +69,16 @@ body {
 .ln .lch.c-chat { background: var(--ok-soft); color: var(--ok); }
 .ln .lch.c-sys { background: var(--surface-2); color: var(--ink-3); }
 
+/* 横向柱状图（用量页「按日」「按模型」）：名称 | 轨道 | 数值 | 附注 */
+.uschart-body.bars { padding: 10px 4px; }
+.bar-row { display: grid; grid-template-columns: 88px 1fr 74px 62px; align-items: center;
+  gap: 8px; padding: 3px 6px; font-size: 12px; }
+.bar-name { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-track { background: var(--surface-2); border-radius: 4px; height: 14px; overflow: hidden; }
+.bar-track > i { display: block; height: 100%; border-radius: 4px; transition: width .25s; }
+.bar-val { text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 600; }
+.bar-extra { text-align: right; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
 /* 状态徽章（代理页/账号池状态列）：圆角软底色，一眼区分健康/异常 */
 .st-badge { display: inline-block; font-size: 11px; line-height: 1; padding: 3px 8px; border-radius: 5px; font-weight: 600; }
 .st-ok { background: var(--ok-soft); color: var(--ok); }
@@ -871,6 +881,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="72" selected>近 3 天</option>
             <option value="168">近 7 天</option>
             <option value="720">近 30 天</option>
+            <option value="0">全部历史</option>
           </select>
           <button class="xs" id="btnUsage">刷新</button>
         </header>
@@ -883,6 +894,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <span class="legend"><i class="sw sw-p"></i>prompt<i class="sw sw-c"></i>completion</span>
             </div>
             <div id="usChart" class="uschart-body"></div>
+          </div>
+          <div class="uschart" style="margin-top:14px">
+            <div class="uschart-hd">
+              <span class="lb">按日 Token</span>
+              <span class="grow"></span>
+              <span class="note">窗口内每天一根柱，右侧为请求次数</span>
+            </div>
+            <div id="usDayChart" class="uschart-body bars"></div>
+          </div>
+          <div class="uschart" style="margin-top:14px">
+            <div class="uschart-hd">
+              <span class="lb">按模型 Token</span>
+              <span class="grow"></span>
+              <span class="note">窗口内各模型占比，右侧为请求次数</span>
+            </div>
+            <div id="usModelChart" class="uschart-body bars"></div>
           </div>
         </div>
       </div>

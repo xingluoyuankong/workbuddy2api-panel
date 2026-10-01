@@ -440,7 +440,9 @@ type Snapshot struct {
 	ByRealm   []KeyedAgg `json:"by_realm"`
 	ByAccount []KeyedAgg `json:"by_account"`
 	ByModel   []KeyedAgg `json:"by_model"`
-	Series    []Point    `json:"series"`
+	// ByDay 窗口内按日聚合（柱状图用）：每天一根柱，升序。
+	ByDay []Point `json:"by_day"`
+	Series []Point `json:"series"`
 	Buckets   int        `json:"buckets"`
 	FileBytes int64      `json:"file_bytes"`
 	Since     string     `json:"since,omitempty"`
@@ -469,8 +471,17 @@ func (r *Recorder) SnapshotWithCost(hours int, nicks map[string]string, est Cost
 	if r == nil {
 		return Snapshot{Generated: time.Now().Format(time.RFC3339)}
 	}
-	if hours <= 0 || hours > 24*60 {
+	// hours<=0 = 全量（不按窗口过滤），供「全部历史」视图；
+	// hours>上限 → 夹到上限。默认 72。
+	allTime := hours <= 0
+	if hours > 24*60 {
+		hours = 24 * 60
+	}
+	if hours == 0 && !allTime {
 		hours = 72
+	}
+	if hours <= 0 {
+		hours = 72 // allTime 时仅用于 hourFrom 兜底，实际 inWindow 恒真
 	}
 
 	r.mu.Lock()
@@ -491,9 +502,45 @@ func (r *Recorder) SnapshotWithCost(hours int, nicks map[string]string, est Cost
 
 	nowHour := time.Now().Truncate(time.Hour)
 	hourFrom := nowHour.Add(-time.Duration(hours-1) * time.Hour)
+	// dayFrom 窗口起点（含当日）：24h 窗口 → 昨天；7 天窗口 → 6 天前。
+	// 日桶无时分，用日历日边界判定；小时桶用精确时刻判定。
+	dayFrom := time.Date(nowHour.Year(), nowHour.Month(), nowHour.Day(),
+		0, 0, 0, 0, time.Local).AddDate(0, 0, -(hours/24 - 1))
+	if hours < 24 {
+		// 不足一天的窗口：日桶也只看当天（小时桶负责精度）
+		dayFrom = time.Date(nowHour.Year(), nowHour.Month(), nowHour.Day(),
+			0, 0, 0, 0, time.Local)
+	}
+	if allTime {
+		// 全量：窗口起点退到零值，inWindow 恒真（「全部历史」视图）。
+		hourFrom = time.Time{}
+		dayFrom = time.Time{}
+	}
+
+	// inWindow 判定一个桶是否落在本次查询的 hours 窗口内。
+	// **这是关键**：原来 total/ByRealm/ByAccount/ByModel 无条件累加全部桶
+	//（含 90 天内所有历史），导致 24h / 3 天 / 7 天的总量完全相同。
+	inWindow := func(b *bucket) bool {
+		if allTime {
+			return true
+		}
+		if strings.HasPrefix(b.Scope, "h:") {
+			ts, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(b.Scope, "h:"), time.Local)
+			return err == nil && !ts.Before(hourFrom)
+		}
+		ts, err := time.ParseInLocation(dayLayout, strings.TrimPrefix(b.Scope, "d:"), time.Local)
+		return err == nil && !ts.Before(dayFrom)
+	}
 
 	for i := range bs {
 		b := &bs[i]
+		// 窗口过滤唯一入口：inWindow 含 allTime（hours<=0 恒真）语义。
+		// 此前有局部 var inWindow bool 遮蔽同名函数，day 桶被 hourLayout
+		// 解析失败误过滤（totals 少算 100 天前数据）——已删除。
+		if !inWindow(b) {
+			continue
+		}
+
 		total.add(b)
 
 		if realmAgg[b.Realm] == nil {
@@ -517,8 +564,7 @@ func (r *Recorder) SnapshotWithCost(hours int, nicks map[string]string, est Cost
 		modelAgg[b.Model].add(b)
 
 		scope := strings.TrimPrefix(b.Scope, "h:")
-		isHour := strings.HasPrefix(b.Scope, "h:")
-		if isHour {
+		if strings.HasPrefix(b.Scope, "h:") {
 			ts, err := time.ParseInLocation(hourLayout, scope, time.Local)
 			if err != nil {
 				continue
@@ -537,11 +583,38 @@ func (r *Recorder) SnapshotWithCost(hours int, nicks map[string]string, est Cost
 				daySeries[d].add(b)
 			}
 		} else {
-			if daySeries[scope] == nil {
-				daySeries[scope] = newAcc()
+			// 日桶（Rollup 折叠产物，scope 形如 "d:2026-06-23"）：key 统一剥掉
+			// "d:" 前缀，与小时分支的裸日期 key 对齐。
+			dk := strings.TrimPrefix(scope, "d:")
+			if daySeries[dk] == nil {
+				daySeries[dk] = newAcc()
 			}
-			daySeries[scope].add(b)
+			daySeries[dk].add(b)
 		}
+	}
+
+	// ByDay（柱状图）：hour 桶按日归并 + day 桶，与 Series 解耦——
+	// 24h 窗口下 Series 只有小时点，ByDay 也要有当天的柱子。
+	byDayAgg := map[string]*aggAcc{}
+	for i := range bs {
+		b := &bs[i]
+		if !inWindow(b) {
+			continue
+		}
+		var dk string
+		if strings.HasPrefix(b.Scope, "h:") {
+			ts, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(b.Scope, "h:"), time.Local)
+			if err != nil {
+				continue
+			}
+			dk = ts.Format(dayLayout)
+		} else {
+			dk = strings.TrimPrefix(b.Scope, "d:")
+		}
+		if byDayAgg[dk] == nil {
+			byDayAgg[dk] = newAcc()
+		}
+		byDayAgg[dk].add(b)
 	}
 
 	snap := Snapshot{
@@ -574,6 +647,16 @@ func (r *Recorder) SnapshotWithCost(hours int, nicks map[string]string, est Cost
 	sort.Strings(hourKeys)
 	for _, k := range hourKeys {
 		snap.Series = append(snap.Series, Point{T: k, Scope: "hour", Agg: hourSeries[k].finish()})
+	}
+
+	// ByDay 升序组装（柱状图数据）。
+	byDayKeys := make([]string, 0, len(byDayAgg))
+	for k := range byDayAgg {
+		byDayKeys = append(byDayKeys, k)
+	}
+	sort.Strings(byDayKeys)
+	for _, k := range byDayKeys {
+		snap.ByDay = append(snap.ByDay, Point{T: k, Scope: "day", Agg: byDayAgg[k].finish()})
 	}
 
 	if r.path != "" {
