@@ -142,6 +142,18 @@ func main() {
 		return up.SetRealmProxy(realm, joined)
 	})
 	go sub.Run(context.Background())
+	// 池出口采样：无绑定账号的面板视图数据源（5 分钟一轮，随订阅刷新更新出口）。
+	go func() {
+		time.Sleep(15 * time.Second) // 等 subpool 首刷建池
+		up.SampleRealmEgress("global")
+		up.SampleRealmEgress("cn")
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			up.SampleRealmEgress("global")
+			up.SampleRealmEgress("cn")
+		}
+	}()
 
 	if err := up.SetGlobalProxy(cfg.Upstream.ProxyGlobal); err != nil {
 		log.Fatalf("upstream.proxy_global 配置无效: %v", err)
@@ -188,6 +200,16 @@ func main() {
 			v := ap.EgressView(uid)
 			if v == nil {
 				return nil
+			}
+			// 无绑定账号：出站实际走 realm 订阅池（若池非空），不是直连——
+			// EgressView 的「未绑定=直连」是旧假设，直连 IP 显示会误导。
+			// 用池出口采样视图覆盖（realm 从账号档案取）。
+			if v.Source == upstream.EgressSourceDirect {
+				if a := p.AuthByUID(uid); a != nil {
+					if ev := up.RealmEgressView(a.Realm()); ev != nil {
+						v = ev
+					}
+				}
 			}
 			return &pool.EgressInfo{
 				Source: v.Source, CallIP: v.CallIP,
