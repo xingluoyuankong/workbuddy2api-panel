@@ -1061,8 +1061,34 @@ func (c *Client) SetRealmProxy(realm, rawURL string) error {
 		e.onAuthFail = func() { c.markRealmAuthFail(key) }
 		entries = append(entries, e)
 	}
-	// 新池建立 = 新 token，清掉旧的凭据失效熔断。
-	c.realmAuthFail.Delete(key)
+	// 新池建立 ≠ 新 token 可用：resin 强刷轮换后，订阅里的链接仍是旧 token。
+	// 用数据对比判断：新池与旧池链接集合相同 = token 没变 = 保留 407 熔断
+	// （否则「刷新→清熔断→407→熔断」循环）；不同 = 用户重新导入了新链接，清熔断。
+	// 用数据对比而非网络探活：探活失败会把正常池误熔断（测试与生产都踩过）。
+	if len(entries) > 0 {
+		c.realmMu.Lock()
+		oldSet := map[string]bool{}
+		for _, oe := range c.realmProxies[key] {
+			oldSet[oe.raw] = true
+		}
+		c.realmMu.Unlock()
+		same := len(oldSet) == len(entries)
+		if same {
+			for _, ne := range entries {
+				if !oldSet[ne.raw] {
+					same = false
+					break
+				}
+			}
+		}
+		if same {
+			if _, failing := c.realmAuthFail.Load(key); failing {
+				log.Printf("[upstream] %s 订阅刷新后链接集合未变（token 未更新），保留 407 熔断", key)
+			}
+		} else {
+			c.realmAuthFail.Delete(key)
+		}
+	}
 	c.realmMu.Lock()
 	set(entries)
 	c.realmMu.Unlock()

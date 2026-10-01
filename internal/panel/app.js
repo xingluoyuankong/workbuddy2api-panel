@@ -2039,6 +2039,31 @@ function fmtCredit(n) {
   return n.toLocaleString('zh-CN', { maximumFractionDigits: 0 });
 }
 
+// WINDOW_LABEL 窗口文案（与 index.html 的 usWindow 选项一致）。
+const WINDOW_LABEL = { '24': '近 24 小时', '72': '近 3 天', '168': '近 7 天', '720': '近 30 天', '0': '全部历史' };
+
+// barChart 通用横向柱状图：把 [{name, value, extra}] 画成条形列表。
+// 用于「按日」「按模型」这类离散维度——折线图看趋势，柱状图看构成/对比。
+function barChart(host, rows, opts) {
+  if (!host) return;
+  const o = opts || {};
+  const max = Math.max(1, ...rows.map(r => r.value));
+  if (!rows.length) {
+    host.innerHTML = '<div class="us-empty">窗口内暂无数据</div>';
+    return;
+  }
+  host.innerHTML = rows.map(r => {
+    const pct = Math.max(1.5, (r.value / max) * 100);
+    const col = r.color || o.color || 'var(--accent)';
+    return '<div class="bar-row" title="' + esc(r.title || (r.name + ': ' + fmtTok(r.value))) + '">' +
+      '<span class="bar-name">' + esc(r.name) + '</span>' +
+      '<span class="bar-track"><i style="width:' + pct.toFixed(1) + '%;background:' + col + '"></i></span>' +
+      '<span class="bar-val">' + esc(r.label || fmtTok(r.value)) + '</span>' +
+      (o.showExtra && r.extra ? '<span class="bar-extra">' + esc(r.extra) + '</span>' : '') +
+      '</div>';
+  }).join('');
+}
+
 function renderUsage(d) {
   const t = d.totals || {};
   $('usStats').innerHTML =
@@ -2051,13 +2076,11 @@ function renderUsage(d) {
     usCreditStat(t) +
     usStat(t.credits_per_1k > 0 ? fmtCredit(t.credits_per_1k) : '—', '千 token 积分');
 
-  // 卡片与表格给的是**全部历史**的累计值，只有下面的时序图按所选窗口展示。
-  //
-  // 这是后端的既定口径（Snapshot 的注释：「聚合当前全部桶。hours 控制时序返回
-  // 多少个小时点」），不是缺陷——但界面上不写明，切 24 小时 / 30 天时这几个数字
-  // 纹丝不动，就会被读成「没生效」。所以把口径差异直接写在标题栏。
-  $('usNote').textContent = '卡片为累计值（自启用起，不随窗口变化）· ' +
-    (d.buckets || 0) + ' 个分桶' +
+  // 卡片/表格/时序图**全部**按所选窗口统计（后端 inWindow 过滤）。
+  // 显示窗口起点，让「切窗口数字该变」这件事一眼可验证。
+  const win = WINDOW_LABEL[String(($('usWindow') && $('usWindow').value) || '72')] || '';
+  $('usNote').textContent = win + (d.since ? ' · 最早 ' + esc(d.since) : '') +
+    ' · ' + (d.buckets || 0) + ' 个分桶' +
     (d.file_bytes ? ' · ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
 
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
@@ -2070,6 +2093,28 @@ function renderUsage(d) {
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
     usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="9" class="empty">暂无数据</td></tr>';
+
+  // ── 柱状图 1：按日 token（窗口内每天一根柱）──────────────────
+  const days = (d.by_day || []).filter(p => p.scope === 'day');
+  barChart($('usDayChart'), days.map(p => ({
+    name: (p.t || '').slice(5), // MM-DD
+    value: p.total_tokens || 0,
+    label: fmtTok(p.total_tokens || 0),
+    extra: (p.requests || 0) + ' 次',
+    title: p.t + ' · ' + fmtTok(p.total_tokens || 0) + ' token · ' + (p.requests || 0) + ' 次请求',
+  })), { showExtra: true });
+
+  // ── 柱状图 2：按模型 token（窗口内各模型占比）────────────────
+  const models = (d.by_model || []);
+  barChart($('usModelChart'), models.slice(0, 12).map((m, i) => ({
+    name: m.key || '(未知)',
+    value: m.total_tokens || 0,
+    label: fmtTok(m.total_tokens || 0),
+    extra: fmtTok(m.requests || 0) + ' 次',
+    color: 'hsl(' + ((i * 47) % 360) + ' 62% 55%)',
+    title: m.key + ' · ' + fmtTok(m.total_tokens || 0) + ' token · ' + (m.requests || 0) + ' 次 · ' +
+      (m.credits > 0 ? fmtCredit(m.credits) + ' 积分' : '积分 —'),
+  })), { showExtra: true });
 
   renderUsageChart(d.series || []);
 
@@ -2219,7 +2264,7 @@ function renderUsageChart(series) {
 function fmtTokTip(v) { return fmtTok(v); }
 
 async function loadUsage() {
-  const hours = ($('usWindow') && $('usWindow').value) || 72;
+  const hours = ($('usWindow') && $('usWindow').value) !== undefined ? $('usWindow').value : 72;
   try {
     const d = await api('usage?hours=' + encodeURIComponent(hours));
     renderUsage(d);
