@@ -1164,6 +1164,53 @@ func (c *Client) BestProxyFor(realm, excludeRaw string) string {
 	return best.raw
 }
 
+// CandidateProxies 返回 realm 池的候选链接，按稳定度排序（最优在前），
+// 排除 excludeRaw 与已永久剔除（劫持>=3）的条目。
+// 稳定度：无劫持 → 连续失败少 → 延迟 EWMA 低。
+func (c *Client) CandidateProxies(realm, excludeRaw string) []string {
+	c.realmMu.Lock()
+	entries := append([]*proxyEntry(nil), c.realmProxies[realmKey(realm)]...)
+	c.realmMu.Unlock()
+	// 过滤
+	keep := entries[:0:0]
+	for _, e := range entries {
+		if e.raw == excludeRaw || e.mitmHits.Load() >= 3 {
+			continue
+		}
+		keep = append(keep, e)
+	}
+	// 稳定度排序（简单插入排序：池也就几十条，够用且无额外依赖）
+	for i := 1; i < len(keep); i++ {
+		for j := i; j > 0 && candidateBetter(keep[j], keep[j-1]); j-- {
+			keep[j], keep[j-1] = keep[j-1], keep[j]
+		}
+	}
+	out := make([]string, 0, len(keep))
+	for _, e := range keep {
+		out = append(out, e.raw)
+	}
+	return out
+}
+
+// candidateBetter a 是否比 b 更稳定（用于排序）。
+func candidateBetter(a, b *proxyEntry) bool {
+	af, bf := a.fails.Load(), b.fails.Load()
+	if af != bf {
+		return af < bf
+	}
+	al, bl := a.latencyEWMA.Load(), b.latencyEWMA.Load()
+	switch {
+	case al == 0 && bl == 0:
+		return false
+	case al == 0:
+		return false // 无样本视为未知，排在有样本之后
+	case bl == 0:
+		return true
+	default:
+		return al < bl
+	}
+}
+
 // realmEgressView 池级出口采样缓存（无绑定账号的面板出口视图数据源）。
 type realmEgressView struct {
 	ip, country, cc, asn string
