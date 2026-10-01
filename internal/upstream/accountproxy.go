@@ -275,6 +275,10 @@ type AccountProxy struct {
 	// client 出站 Client 引用（订阅池所在；SetClient 注入）。
 	// 自动绑定/换绑用它查池里最稳定的条目（Client.BestProxyFor）。
 	client *Client
+	// bindSerial 绑定决策串行化：巡检并发跑多个账号的探活（网络 IO），但
+	// 「选哪条链接」的决策必须串行——否则并发账号同时读到空绑定快照，
+	// 全部绑到同一条链接（实测 4 账号同链接同出口 IP，风控高危）。
+	bindSerial sync.Mutex
 	// directIPCache 直连出口 IP（每次扫都重测成本高，缓存到 check 周期粒度）。
 	directIPCache atomicString
 	// 直连出口的地理与运营方（与 directIPCache 同一次探测取得）。
@@ -414,17 +418,27 @@ func (m *AccountProxy) SetClient(c *Client) {
 	}
 }
 
-// probeCandidate 候选链接预检：单源实测出口可达（避免把账号绑到整条挂掉的
-// 线路上——resin 订阅刷新中该线路全部节点会暂时失效）。
-func (m *AccountProxy) probeCandidate(raw string) bool {
+// probeEgressIP 候选链接预检：单源实测出口，返回出口 IP（空 = 不可用）。
+// 避免把账号绑到整条挂掉的线路上（resin 订阅刷新中该线路全部节点暂时失效）；
+// IP 同时用于绑定反亲和（多账号不同出口 IP，风控分散）。
+func (m *AccountProxy) probeEgressIP(raw string) (string, bool) {
 	e, err := newProxyEntry(raw)
 	if err != nil {
-		return false
+		return "", false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	p := probeEgress(ctx, e.http, 1)
-	return p.IP != ""
+	if p.IP == "" {
+		return "", false
+	}
+	return p.IP, true
+}
+
+// probeCandidate 兼容包装：只关心可达性。
+func (m *AccountProxy) probeCandidate(raw string) bool {
+	_, ok := m.probeEgressIP(raw)
+	return ok
 }
 
 // AutoBindAccount 自动绑定：无绑定账号粘住池里最稳定链接；auto 绑定的链接
@@ -496,9 +510,11 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 	log.Printf("[autobind] %s 池内全部候选不可用，解绑回落直连 uid=%s", realm, logfmt.UID8(uid))
 }
 
-// bindFirstUsable 按稳定度逐个探活候选，把第一个可用的绑到 uid。
-// 返回是否成功绑定。全部不可用返回 false（调用方决定保持直连还是解绑）。
-// 网络 IO 全在锁外；仅在确定候选后用短临界区写入。
+// bindFirstUsable 按稳定度探活候选并绑定第一个满足反亲和的。
+// 两阶段：① 锁外并发探活全部候选（拿出口 IP）② bindSerial+m.mu 串行决策——
+// 决策时重读 takenLinks/takenIPs，能看到其他账号刚完成的绑定，保证多账号
+// 分散到不同链接/不同出口 IP（风控：多账号同 IP 高危）。
+// L1 = 链接+IP 都分散；L2 = 仅链接分散（候选出口数不足时）；全失败返回 false。
 func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
 	m.mu.RLock()
 	cur := ""
@@ -507,47 +523,100 @@ func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
 	}
 	m.mu.RUnlock()
 
-	for _, cand := range m.client.CandidateProxies(realm, cur) {
-		if !m.probeCandidate(cand) {
-			continue // 这条不可用，试下一条
+	cands := m.client.CandidateProxies(realm, cur)
+	if len(cands) == 0 {
+		return false
+	}
+
+	// 阶段 ①：锁外探活（限制并发 4，避免瞬时打满）
+	type pr struct {
+		raw string
+		ip  string
+		ok  bool
+	}
+	probed := make([]pr, len(cands))
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for i, cand := range cands {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, cand string) {
+			defer wg.Done()
+			ip, ok := m.probeEgressIP(cand)
+			probed[i] = pr{cand, ip, ok}
+			<-sem
+		}(i, cand)
+	}
+	wg.Wait()
+
+	// 阶段 ②：串行决策（bindSerial 保证同一时刻只有一个账号在分配）
+	m.bindSerial.Lock()
+	defer m.bindSerial.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	takenLinks := map[string]bool{}
+	takenIPs := map[string]bool{}
+	for _, b := range m.bindings {
+		if b.spec.Proxy != "" {
+			takenLinks[b.spec.Proxy] = true
 		}
-		m.mu.Lock()
-		e := &AccountProxyEntry{Proxy: cand, Enabled: true, Auto: true}
-		nb, err := newAccountBinding(uid, e)
-		if err != nil {
-			m.mu.Unlock()
-			continue
+		if ip := b.probeIP.Load(); ip != "" {
+			takenIPs[ip] = true
 		}
-		// 407 = 绑定凭据失效（resin 强刷轮换 token）：立即解绑该账号回落直连。
-		// 绑定 entry 与池条目是独立实例，池的 onAuthFail 覆盖不到这里，必须单独注入。
-		nb.entry.onAuthFail = func() {
-			m.mu.Lock()
-			if b := m.bindings[uid]; b != nil && b.spec.Proxy == nb.entry.raw {
-				delete(m.doc.Accounts, uid)
-				delete(m.bindings, uid)
-				_ = m.saveLocked()
-				log.Printf("[autobind] 绑定出口凭据失效（407），解绑 uid=%s 回落直连", logfmt.UID8(uid))
+	}
+
+	tryBind := func(skipSameIP bool) bool {
+		for _, r := range probed {
+			if !r.ok {
+				continue
 			}
-			m.mu.Unlock()
+			if takenLinks[r.raw] {
+				continue
+			}
+			if skipSameIP && takenIPs[r.ip] {
+				continue
+			}
+			e := &AccountProxyEntry{Proxy: r.raw, Enabled: true, Auto: true}
+			nb, err := newAccountBinding(uid, e)
+			if err != nil {
+				continue
+			}
+			// 407 = 绑定凭据失效（resin 强刷轮换 token）：立即解绑该账号回落直连。
+			nb.entry.onAuthFail = func() {
+				m.mu.Lock()
+				if b := m.bindings[uid]; b != nil && b.spec.Proxy == nb.entry.raw {
+					delete(m.doc.Accounts, uid)
+					delete(m.bindings, uid)
+					_ = m.saveLocked()
+					log.Printf("[autobind] 绑定出口凭据失效（407），解绑 uid=%s 回落直连", logfmt.UID8(uid))
+				}
+				m.mu.Unlock()
+			}
+			// 保留用户手填的声明 IP / 备注（若有）
+			if ob := m.bindings[uid]; ob != nil {
+				nb.spec.ExpectedIP = ob.spec.ExpectedIP
+				nb.spec.Label = ob.spec.Label
+				nb.spec.Note = ob.spec.Note
+				e.ExpectedIP = ob.spec.ExpectedIP
+				e.Label = ob.spec.Label
+				e.Note = ob.spec.Note
+			}
+			m.doc.Accounts[uid] = e
+			m.bindings[uid] = nb
+			_ = m.saveLocked()
+			takenLinks[r.raw] = true // 本轮后续账号跳过（同 tick 并发已串行化，防御性）
+			takenIPs[r.ip] = true
+			log.Printf("[autobind] %s uid=%s 绑定候选（出口 %s）", realm, logfmt.UID8(uid), r.ip)
+			return true
 		}
-		// 保留用户手填的声明 IP / 备注（若有）
-		if ob := m.bindings[uid]; ob != nil {
-			nb.spec.ExpectedIP = ob.spec.ExpectedIP
-			nb.spec.Label = ob.spec.Label
-			nb.spec.Note = ob.spec.Note
-			e.ExpectedIP = ob.spec.ExpectedIP
-			e.Label = ob.spec.Label
-			e.Note = ob.spec.Note
-		}
-		m.doc.Accounts[uid] = e
-		m.bindings[uid] = nb
-		_ = m.saveLocked()
-		m.mu.Unlock()
+		return false
+	}
+
+	if tryBind(true) {
 		return true
 	}
-	return false
+	return tryBind(false)
 }
-
 // Remove 从绑定表移除一个账号的代理绑定（落盘同步）。
 func (m *AccountProxy) Remove(uid string) error {
 	if m == nil || m.opts.File == "" {
