@@ -437,69 +437,95 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 	if m == nil || m.client == nil {
 		return
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// 严禁持锁做网络 IO：probeCandidate 最长 12s，持锁会让 Statuses / EgressView /
+	// proxyGate（每个请求都调）全部阻塞 → 整个服务卡死（实测健康检查超时 17 次）。
+	// 流程：锁外读快照 → 锁外预检 → 短临界区提交。
+	m.mu.RLock()
 	b := m.bindings[uid]
+	var curRaw string
+	var isAuto, isEnabled bool
+	if b != nil {
+		curRaw = b.spec.Proxy
+		isAuto = b.spec.Auto
+		isEnabled = b.spec.Enabled
+	}
+	m.mu.RUnlock()
+
+	if b != nil && (!isAuto || !isEnabled) {
+		return // 手动绑定 / 已停用：不碰
+	}
+
+	// 无绑定：首次自动绑定（锁外取候选 + 预检；失败保持直连，
+	// cn 直连国内接口是最佳路径，global 直连实测可达）
 	if b == nil {
-		// 无绑定：首次自动绑定（粘住最稳定条目）。
-		// 预检：候选先实测一次——整条线路挂掉时（resin 订阅刷新中）宁可保持
-		// 直连（cn 直连国内接口是最佳路径），也不绑一个必挂的出口。
 		best := m.client.BestProxyFor(realm, "")
-		if best != "" && !m.probeCandidate(best) {
+		if best == "" {
+			return
+		}
+		if !m.probeCandidate(best) {
 			log.Printf("[autobind] %s 候选出口预检失败（线路不可用），保持直连", realm)
 			return
 		}
-		if best != "" {
-			e := &AccountProxyEntry{Proxy: best, Enabled: true, Auto: true}
-			nb, err := newAccountBinding(uid, e)
-			if err != nil {
-				log.Printf("[autobind] 自动绑定失败 uid=%s: %v", logfmt.UID8(uid), err)
-				return // defer 已解锁
-			}
-			m.doc.Accounts[uid] = e
-			m.bindings[uid] = nb
-			log.Printf("[autobind] %s 自动绑定稳定出口 uid=%s", realm, logfmt.UID8(uid))
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.bindings[uid] != nil {
+			return // 并发：已被绑定
 		}
+		e := &AccountProxyEntry{Proxy: best, Enabled: true, Auto: true}
+		nb, err := newAccountBinding(uid, e)
+		if err != nil {
+			log.Printf("[autobind] 自动绑定失败 uid=%s: %v", logfmt.UID8(uid), err)
+			return
+		}
+		m.doc.Accounts[uid] = e
+		m.bindings[uid] = nb
+		log.Printf("[autobind] %s 自动绑定稳定出口 uid=%s", realm, logfmt.UID8(uid))
 		return
 	}
-	if !b.spec.Auto || !b.spec.Enabled {
-		return // 手动绑定 / 已停用：不碰
-	}
-	// auto 绑定：连续校验失败 >=2 → 换绑（排除当前链接）
+
+	// auto 绑定：连续失败 >=2 才触发换绑（锁外）
 	if b.entry.fails.Load() < 2 {
 		return
 	}
-	best := m.client.BestProxyFor(realm, b.spec.Proxy)
-	// 换绑候选预检：失败 = 整条线路挂了（resin 订阅刷新中）。
-	// 解绑回落直连（cn 直连国内接口最佳；global 全挂时宁可 503 也不绑死出口），
-	// 订阅恢复后 AutoBind 会自动重新绑定。
+	best := m.client.BestProxyFor(realm, curRaw)
 	if best == "" || !m.probeCandidate(best) {
-		uid8 := logfmt.UID8(uid)
+		// 池内无可用的换绑候选（线路不可用）→ 解绑回落直连
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if nb := m.bindings[uid]; nb == nil || nb.spec.Proxy != curRaw {
+			return // 并发：已变化
+		}
 		delete(m.doc.Accounts, uid)
 		delete(m.bindings, uid)
 		_ = m.saveLocked()
 		log.Printf("[autobind] %s 池内无可用的换绑候选（线路不可用），解绑回落直连 uid=%s",
-			realm, uid8)
+			realm, logfmt.UID8(uid))
 		return
 	}
 	host := best
 	if u, err := url.Parse(best); err == nil && u.Host != "" {
 		host = u.Host
 	}
-	oldHost := b.spec.Proxy
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	nb := m.bindings[uid]
+	if nb == nil || nb.spec.Proxy != curRaw {
+		return // 并发：已变化
+	}
+	oldHost := curRaw
 	if u, err := url.Parse(oldHost); err == nil && u.Host != "" {
 		oldHost = u.Host
 	}
 	log.Printf("[autobind] 绑定出口连续失败，自动换绑 uid=%s %s -> %s",
 		logfmt.UID8(uid), oldHost, host)
-	b.spec.Proxy = best
-	b.spec.Auto = true
-	b.lockedIP.Store("")
-	b.probeIP.Store("")
-	b.entry.fails.Store(0)
+	nb.spec.Proxy = best
+	nb.spec.Auto = true
+	nb.lockedIP.Store("")
+	nb.probeIP.Store("")
+	nb.entry.fails.Store(0)
 	m.doc.Accounts[uid] = &AccountProxyEntry{
-		Proxy: b.spec.Proxy, ExpectedIP: b.spec.ExpectedIP,
-		Enabled: b.spec.Enabled, Label: b.spec.Label, Note: b.spec.Note,
+		Proxy: nb.spec.Proxy, ExpectedIP: nb.spec.ExpectedIP,
+		Enabled: nb.spec.Enabled, Label: nb.spec.Label, Note: nb.spec.Note,
 		Auto: true,
 	}
 	_ = m.saveLocked()
