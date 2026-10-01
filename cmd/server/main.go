@@ -2,6 +2,7 @@
 package main
 
 import (
+	"sync"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -198,12 +199,19 @@ func main() {
 			t := time.NewTicker(time.Minute)
 			defer t.Stop()
 			for range t.C {
+				// 并发巡检：每个账号的探活最长 12s，串行会拖过一个 tick。
+				var wg sync.WaitGroup
 				for _, a := range auths {
 					if a == nil {
 						continue
 					}
-					ap.AutoBindAccount(a.UID, a.Realm())
+					wg.Add(1)
+					go func(uid, realm string) {
+						defer wg.Done()
+						ap.AutoBindAccount(uid, realm)
+					}(a.UID, a.Realm())
 				}
+				wg.Wait()
 			}
 		}()
 		up.AccountProxy = ap

@@ -437,9 +437,8 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 	if m == nil || m.client == nil {
 		return
 	}
-	// 严禁持锁做网络 IO：probeCandidate 最长 12s，持锁会让 Statuses / EgressView /
-	// proxyGate（每个请求都调）全部阻塞 → 整个服务卡死（实测健康检查超时 17 次）。
-	// 流程：锁外读快照 → 锁外预检 → 短临界区提交。
+	// 严禁持锁做网络 IO（曾因此卡死整个服务）：锁外读快照 → 锁外探活/预检 →
+	// 短临界区提交。所有探活都在锁外完成。
 	m.mu.RLock()
 	b := m.bindings[uid]
 	var curRaw string
@@ -455,80 +454,86 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 		return // 手动绑定 / 已停用：不碰
 	}
 
-	// 无绑定：首次自动绑定（锁外取候选 + 预检；失败保持直连，
-	// cn 直连国内接口是最佳路径，global 直连实测可达）
+	// ── 无绑定：首次自动绑定 ─────────────────────────────────────
+	// 逐个探活候选（按稳定度排序），用第一个真正可用的；全部不可用 → 保持直连。
 	if b == nil {
-		best := m.client.BestProxyFor(realm, "")
-		if best == "" {
-			return
+		if m.bindFirstUsable(uid, realm) {
+			log.Printf("[autobind] %s 自动绑定稳定出口 uid=%s", realm, logfmt.UID8(uid))
 		}
-		if !m.probeCandidate(best) {
-			log.Printf("[autobind] %s 候选出口预检失败（线路不可用），保持直连", realm)
-			return
-		}
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if m.bindings[uid] != nil {
-			return // 并发：已被绑定
-		}
-		e := &AccountProxyEntry{Proxy: best, Enabled: true, Auto: true}
-		nb, err := newAccountBinding(uid, e)
-		if err != nil {
-			log.Printf("[autobind] 自动绑定失败 uid=%s: %v", logfmt.UID8(uid), err)
-			return
-		}
-		m.doc.Accounts[uid] = e
-		m.bindings[uid] = nb
-		log.Printf("[autobind] %s 自动绑定稳定出口 uid=%s", realm, logfmt.UID8(uid))
 		return
 	}
 
-	// auto 绑定：连续失败 >=2 才触发换绑（锁外）
-	if b.entry.fails.Load() < 2 {
+	// ── 有 auto 绑定：先主动探活当前链接（1 分钟粒度发现失效）────
+	// 必须无条件探活：不能用「fails>0 就跳探活」短路——那样链路恢复了计数还在涨，
+	// 会误判成持续失效而错误换绑。
+	if m.probeCandidate(curRaw) {
+		b.entry.fails.Store(0) // 探活成功清零（抗抖动：瞬时不可用不累积）
 		return
 	}
-	best := m.client.BestProxyFor(realm, curRaw)
-	if best == "" || !m.probeCandidate(best) {
-		// 池内无可用的换绑候选（线路不可用）→ 解绑回落直连
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if nb := m.bindings[uid]; nb == nil || nb.spec.Proxy != curRaw {
-			return // 并发：已变化
-		}
-		delete(m.doc.Accounts, uid)
-		delete(m.bindings, uid)
-		_ = m.saveLocked()
-		log.Printf("[autobind] %s 池内无可用的换绑候选（线路不可用），解绑回落直连 uid=%s",
-			realm, logfmt.UID8(uid))
+	b.entry.noteFail()
+
+	// 连续失败未达阈值：继续观察（避免网络抖动导致频繁换绑）
+	const failThreshold = 3
+	if b.entry.fails.Load() < failThreshold {
 		return
 	}
-	host := best
-	if u, err := url.Parse(best); err == nil && u.Host != "" {
-		host = u.Host
+
+	// ── 阈值达到：换绑（逐个探活候选）────────────────────────────
+	// 池里没有可用候选（全探活失败）→ 解绑回落直连（订阅恢复后自动重绑）。
+	if m.bindFirstUsable(uid, realm) {
+		log.Printf("[autobind] 绑定出口连续失败 %d 次，已换绑 uid=%s",
+			failThreshold, logfmt.UID8(uid))
+		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	nb := m.bindings[uid]
-	if nb == nil || nb.spec.Proxy != curRaw {
+	if nb := m.bindings[uid]; nb == nil || nb.spec.Proxy != curRaw {
 		return // 并发：已变化
 	}
-	oldHost := curRaw
-	if u, err := url.Parse(oldHost); err == nil && u.Host != "" {
-		oldHost = u.Host
-	}
-	log.Printf("[autobind] 绑定出口连续失败，自动换绑 uid=%s %s -> %s",
-		logfmt.UID8(uid), oldHost, host)
-	nb.spec.Proxy = best
-	nb.spec.Auto = true
-	nb.lockedIP.Store("")
-	nb.probeIP.Store("")
-	nb.entry.fails.Store(0)
-	m.doc.Accounts[uid] = &AccountProxyEntry{
-		Proxy: nb.spec.Proxy, ExpectedIP: nb.spec.ExpectedIP,
-		Enabled: nb.spec.Enabled, Label: nb.spec.Label, Note: nb.spec.Note,
-		Auto: true,
-	}
+	delete(m.doc.Accounts, uid)
+	delete(m.bindings, uid)
 	_ = m.saveLocked()
+	log.Printf("[autobind] %s 池内全部候选不可用，解绑回落直连 uid=%s", realm, logfmt.UID8(uid))
+}
+
+// bindFirstUsable 按稳定度逐个探活候选，把第一个可用的绑到 uid。
+// 返回是否成功绑定。全部不可用返回 false（调用方决定保持直连还是解绑）。
+// 网络 IO 全在锁外；仅在确定候选后用短临界区写入。
+func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
+	m.mu.RLock()
+	cur := ""
+	if b := m.bindings[uid]; b != nil {
+		cur = b.spec.Proxy
+	}
+	m.mu.RUnlock()
+
+	for _, cand := range m.client.CandidateProxies(realm, cur) {
+		if !m.probeCandidate(cand) {
+			continue // 这条不可用，试下一条
+		}
+		m.mu.Lock()
+		e := &AccountProxyEntry{Proxy: cand, Enabled: true, Auto: true}
+		nb, err := newAccountBinding(uid, e)
+		if err != nil {
+			m.mu.Unlock()
+			continue
+		}
+		// 保留用户手填的声明 IP / 备注（若有）
+		if ob := m.bindings[uid]; ob != nil {
+			nb.spec.ExpectedIP = ob.spec.ExpectedIP
+			nb.spec.Label = ob.spec.Label
+			nb.spec.Note = ob.spec.Note
+			e.ExpectedIP = ob.spec.ExpectedIP
+			e.Label = ob.spec.Label
+			e.Note = ob.spec.Note
+		}
+		m.doc.Accounts[uid] = e
+		m.bindings[uid] = nb
+		_ = m.saveLocked()
+		m.mu.Unlock()
+		return true
+	}
+	return false
 }
 
 // Remove 从绑定表移除一个账号的代理绑定（落盘同步）。
