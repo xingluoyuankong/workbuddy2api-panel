@@ -637,6 +637,8 @@ type Client struct {
 	// 单一出口被上游 WAF 盯上时不会整片不可用。
 	realmProxies map[string][]*proxyEntry
 	realmMu      sync.Mutex
+	// realmEgressCache 池出口采样缓存（SampleRealmEgress 写，RealmEgressView 读）。
+	realmEgressCache sync.Map
 	proxyCursor   atomic.Uint32
 
 	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
@@ -1090,6 +1092,57 @@ func (c *Client) ProxyCount(realm string) int {
 
 // GlobalProxyCount 兼容包装（global 池条数）。
 func (c *Client) GlobalProxyCount() int { return c.ProxyCount("global") }
+
+// realmEgressView 池级出口采样缓存（无绑定账号的面板出口视图数据源）。
+type realmEgressView struct {
+	ip, country, cc, asn string
+	at                   int64
+}
+
+// SampleRealmEgress 对 realm 池**当前选中**的出口做一次实测采样。
+//
+// 背景：无绑定账号的出站走 realm 订阅池（chatHTTPFor→pickProxy），但
+// EgressView 对无绑定账号返回的是「本机直连出口」（旧假设）——面板显示的
+// 服务器 IP 与实际出站不符。此采样为面板提供池出口的真实 IP（5 分钟一轮）。
+func (c *Client) SampleRealmEgress(realm string) {
+	e := c.pickProxy(realm)
+	if e == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	p := probeEgress(ctx, e.http, 1) // 单源即可（面板展示，不做 quorum 仲裁）
+	if p.IP == "" {
+		return
+	}
+	c.realmEgressCache.Store(realmKey(realm), realmEgressView{
+		ip: p.IP, country: p.Country, cc: p.CountryCode, asn: p.ASN,
+		at: time.Now().UnixMilli(),
+	})
+}
+
+// RealmEgressView 无绑定账号（出站走 realm 池）的面板出口视图。
+// 池为空（该 realm 直连）或尚无样本返回 nil——调用方回落直连视图。
+func (c *Client) RealmEgressView(realm string) *EgressViewInfo {
+	if c.ProxyCount(realm) == 0 {
+		return nil
+	}
+	v, ok := c.realmEgressCache.Load(realmKey(realm))
+	if !ok {
+		return nil
+	}
+	ev := v.(realmEgressView)
+	return &EgressViewInfo{
+		Source:      EgressSourceProxy,
+		IP:          ev.ip,
+		Country:     ev.country,
+		CountryCode: ev.cc,
+		ASN:         ev.asn,
+		CheckedAt:   ev.at,
+		State:       "ok",
+		Label:       fmt.Sprintf("订阅池出口（%d 条轮换）", c.ProxyCount(realm)),
+	}
+}
 
 // ProxySummary 返回指定 realm 出口池的健康摘要（面板/日志展示用，不含凭据）。
 // 返回形如 ["warp:1080 ok", "172.17.0.1:2269 fails=3 skip 40s"] 的列表。
