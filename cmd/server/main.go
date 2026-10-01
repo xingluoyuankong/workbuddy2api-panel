@@ -191,6 +191,21 @@ func main() {
 			log.Printf("WARN: 账号代理绑定表加载失败（出站不受影响）: %v", err)
 		}
 		ap.SyncAccounts(auths) // 账号已删除的绑定一并清理，防僵尸条目堆积
+		ap.SetClient(up)
+		// 自动绑定循环：每分钟巡检——无绑定账号粘住池里最稳定链接；auto 绑定
+		// 连续校验失败自动换绑下一条（非随机轮询，故障才切）。realm 从 auths 取。
+		go func() {
+			t := time.NewTicker(time.Minute)
+			defer t.Stop()
+			for range t.C {
+				for _, a := range auths {
+					if a == nil {
+						continue
+					}
+					ap.AutoBindAccount(a.UID, a.Realm())
+				}
+			}
+		}()
 		up.AccountProxy = ap
 		// 代理闸门：quarantine 策略下出口不可信的账号不参与选号（其余策略恒放行）。
 		p.SetProxyGate(ap.Usable)
