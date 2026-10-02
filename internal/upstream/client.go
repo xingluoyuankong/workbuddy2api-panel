@@ -3,15 +3,15 @@
 package upstream
 
 import (
-	"net"
 	"bytes"
 	"context"
-	"encoding/json"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -29,23 +29,23 @@ import (
 type ErrKind int
 
 const (
-	ErrNone           ErrKind = iota // 成功
-	ErrHardCredit                    // 余额不足（402 或 body 关键词）→ 长冷却
-	ErrSoftRate                      // 429 软限流 → 短冷却
-	ErrSessionDead                   // 401 + 12153 offline session 失效 → 禁用
-	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
-	ErrServer                        // 5xx 上游故障
-	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
-	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
-	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
-	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
-	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
-	ErrClient                        // 其他 4xx / 业务错误
-	ErrKind520                       // 520 错误（Cloudflare 解析失败）→ 立即重试，0ms 退避
-	ErrTransport                     // 通用传输错误 → 正常退避（500ms·2^i 封顶 8s）
-	ErrTransportTimeout              // 传输层超时 → 重退避（1s·2^i 封顶 16s）
-	ErrTransportEOF                  // 传输层 EOF → 重退避（1s·2^i 封顶 16s）
+	ErrNone             ErrKind = iota // 成功
+	ErrHardCredit                      // 余额不足（402 或 body 关键词）→ 长冷却
+	ErrSoftRate                        // 429 软限流 → 短冷却
+	ErrSessionDead                     // 401 + 12153 offline session 失效 → 禁用
+	ErrNotFound                        // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
+	ErrServer                          // 5xx 上游故障
+	ErrContentBlocked                  // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
+	ErrBadParams                       // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
+	ErrAccountFault                    // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
+	ErrModelBlocked                    // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
+	ErrWafBlock                        // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
+	ErrPromptTooLong                   // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+	ErrClient                          // 其他 4xx / 业务错误
+	ErrKind520                         // 520 错误（Cloudflare 解析失败）→ 立即重试，0ms 退避
+	ErrTransport                       // 通用传输错误 → 正常退避（500ms·2^i 封顶 8s）
+	ErrTransportTimeout                // 传输层超时 → 重退避（1s·2^i 封顶 16s）
+	ErrTransportEOF                    // 传输层 EOF → 重退避（1s·2^i 封顶 16s）
 )
 
 func (k ErrKind) String() string {
@@ -948,6 +948,7 @@ func (c *Client) pickProxy(realm string) *proxyEntry {
 	}
 	return nil
 }
+
 // proxyRT 包装出站 Transport，统计每个出口的成败（供 pickGlobalProxy 降权）。
 type proxyRT struct {
 	base  http.RoundTripper
@@ -1108,6 +1109,7 @@ func (c *Client) SetRealmProxy(realm, rawURL string) error {
 func (c *Client) SetGlobalProxy(rawURL string) error {
 	return c.SetRealmProxy("global", rawURL)
 }
+
 // newProxyEntry 解析一个代理 URL 并构造带成败统计的 client 对。
 func newProxyEntry(raw string) (*proxyEntry, error) {
 	u, err := url.Parse(raw)
@@ -1313,6 +1315,57 @@ func (c *Client) ProxySummary(realm string) []string {
 		}
 	}
 	return out
+}
+
+// ProxyPoolStat 出口池健康分布（面板展示用；只回计数，不含任何凭据）。
+//
+// 为什么需要它：面板此前只透出「池内 N 条」，运维看不出池子到底还剩几条能用——
+// 15 条里 12 条在冷却和 15 条全健康，是两种完全不同的处境，但显示都是「15 条」。
+//
+// 分层口径（互斥，Total = Healthy + Cooling + Retrying）：
+//   - Total    池内总条数
+//   - Healthy  无连续失败（fails==0）——正常参与选路
+//   - Cooling  有失败且仍在降权窗口内（deadUntil 未到）——本轮不会被选中
+//   - Retrying 有失败但降权窗口已过——下次选路会重试
+//   - Hijacked TLS 劫持命中过（mitmHits>0，含已被永久剔除的）
+//   - Removed  永久剔除（mitmHits>=3）——不再进入候选
+//   - Available 可进入候选的条数（Total - Removed）
+type ProxyPoolStat struct {
+	Total     int `json:"total"`
+	Healthy   int `json:"healthy"`
+	Cooling   int `json:"cooling"`
+	Retrying  int `json:"retrying"`
+	Hijacked  int `json:"hijacked"`
+	Removed   int `json:"removed"`
+	Available int `json:"available"`
+}
+
+// ProxyPoolStats 统计指定 realm 出口池的健康分布（无池时全 0）。
+func (c *Client) ProxyPoolStats(realm string) ProxyPoolStat {
+	c.realmMu.Lock()
+	entries := append([]*proxyEntry(nil), c.realmProxies[realmKey(realm)]...)
+	c.realmMu.Unlock()
+	st := ProxyPoolStat{Total: len(entries)}
+	now := time.Now().UnixNano()
+	for _, e := range entries {
+		if h := e.mitmHits.Load(); h > 0 {
+			st.Hijacked++
+			if h >= 3 {
+				st.Removed++
+			}
+		}
+		f := e.fails.Load()
+		switch {
+		case f == 0:
+			st.Healthy++
+		case e.deadUntil.Load() > now:
+			st.Cooling++
+		default:
+			st.Retrying++
+		}
+	}
+	st.Available = st.Total - st.Removed
+	return st
 }
 
 // defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
