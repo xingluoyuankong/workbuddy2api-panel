@@ -107,3 +107,61 @@ func TestEgressProvider(t *testing.T) {
 		}
 	}
 }
+
+// TestEgressProviderNoRecursiveLock 出口 provider 回调 pool（AuthByUID）时，
+// List/Status 不得死锁。
+//
+// 2026-10-02 P0（全站不可用事故）：statusOf 曾在持 p.mu.RLock 的路径上调
+// egressFor，而生产 provider（cmd/server/main.go 的 SetEgressProvider 闭包）
+// 内部又调 p.AuthByUID → **递归 RLock**。只要此刻有写者排队——RecordTokenUsage
+// 是每个 chat 请求收尾的必经之路，startFlusher 每 flushInterval 也会抢写锁——
+// Go RWMutex 的写优先语义就让第二个 RLock 永久阻塞：写者等读者释放，读者等
+// 写者让位，读锁再也无人释放。现场 98 个读者 + 1 个写者全部僵死，healthz 与
+// chat 全线超时 31 分钟。
+//
+// 本测试在 provider 内部主动制造"写者已排队"的时序，旧实现必死锁（5s 超时）。
+func TestEgressProviderNoRecursiveLock(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "uid-r"})
+
+	p.SetEgressProvider(func(uid string) *EgressInfo {
+		// 复刻生产 provider 的回调形态：先让一个写者进等待队列，再回调 pool。
+		// 若调用方此刻持有读锁（旧实现），下面的 AuthByUID 就会卡死。
+		queued := make(chan struct{})
+		go func() {
+			close(queued)
+			p.mu.Lock()
+			p.mu.Unlock()
+		}()
+		<-queued
+		time.Sleep(20 * time.Millisecond) // 给写者时间真正阻塞在 Lock 上
+		if a := p.AuthByUID(uid); a == nil {
+			t.Error("provider 内 AuthByUID 返回 nil")
+		}
+		return &EgressInfo{IP: "1.2.3.4", State: "ok"}
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, st := range p.List() {
+			if st.UID == "uid-r" {
+				if st.Egress == nil {
+					t.Error("List 未填充 Egress")
+				}
+			}
+		}
+		st, ok := p.Status("uid-r")
+		if !ok {
+			t.Error("Status 取不到账号")
+		} else if st.Egress == nil {
+			t.Error("Status 未填充 Egress")
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("List/Status 死锁：egress provider 回调 pool 时发生了递归 RLock")
+	}
+}

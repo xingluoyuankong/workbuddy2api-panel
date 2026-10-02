@@ -279,15 +279,19 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	p.dirty.Store(true)
 }
 
-// Status 查询单账号状态。
+// Status 查询单账号状态。出口信息在**释放 p.mu 之后**才填充：egress provider
+// 会回调 pool/AccountProxy，持锁调用会递归 RLock 死锁（见 egressFor 注释）。
 func (p *Pool) Status(uid string) (Status, bool) {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
 	e, ok := p.byUID[uid]
 	if !ok {
+		p.mu.RUnlock()
 		return Status{}, false
 	}
-	return p.statusOf(uid, e), true
+	st := p.statusOf(uid, e)
+	p.mu.RUnlock()
+	st.Egress = p.egressFor(uid)
+	return st, true
 }
 
 // AuthByUID 返回账号的完整凭证（给调度器/运维接口用）。
@@ -460,9 +464,9 @@ func (p *Pool) ServableForRealm(realm string) bool {
 }
 
 // List 返回所有账号状态（按 UID 排序，稳定输出）。
+// 出口信息在**释放 p.mu 之后**逐行填充，理由同 Status。
 func (p *Pool) List() []Status {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
 	uids := make([]string, 0, len(p.byUID))
 	for uid := range p.byUID {
 		uids = append(uids, uid)
@@ -471,6 +475,10 @@ func (p *Pool) List() []Status {
 	out := make([]Status, 0, len(uids))
 	for _, uid := range uids {
 		out = append(out, p.statusOf(uid, p.byUID[uid]))
+	}
+	p.mu.RUnlock()
+	for i := range out {
+		out[i].Egress = p.egressFor(out[i].UID)
 	}
 	return out
 }
@@ -516,9 +524,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		}
 		st.CoolKind = e.coolKind.String()
 	}
-	// 出口信息（账号代理实测快照）：面板账号池列表直接展示，「直连」与
-	// 「走代理但出口不对」在列表上就能分辨，不必切到代理页。
-	st.Egress = p.egressFor(uid)
+	// 出口信息（账号代理实测快照）由调用方在**锁外**填充（见 Status/List）：
+	// 这里处于持锁路径，egress provider 会回调 pool 造成递归 RLock 死锁。
 	return st
 }
 
