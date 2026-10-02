@@ -292,17 +292,51 @@ func (p *Panel) proxyBulk(w http.ResponseWriter, r *http.Request) {
 // subPoolManager 取订阅池；未启用返回 nil（路由层统一 501）。
 func (p *Panel) subPoolManager() *upstream.SubPool { return p.subPool }
 
-// subPoolList 订阅池状态（global/cn 两行）。
+// subPoolRealmView 订阅池一行（面板视图）：配置 + 解析结果 + 出口池健康分布。
+//
+// 三个数字刻意分开透出，回答三个不同问题：
+//   - SubsCount  配了几条链接（用户维护的输入）
+//   - Entries    上次刷新解析出多少条出口（拉取结果）
+//   - Pool       这些出口当前几条能打（实时健康，和 entries 会不一致：
+//     拉取成功 15 条、其中 12 条正在冷却，是"池子快空了"的强信号）
+type subPoolRealmView struct {
+	Realm       string                 `json:"realm"`
+	Subs        []string               `json:"subs"`
+	SubsCount   int                    `json:"subs_count"`
+	Entries     int                    `json:"entries"`
+	RefreshedAt int64                  `json:"refreshed_at"`
+	LastErr     string                 `json:"last_error,omitempty"`
+	Pool        upstream.ProxyPoolStat `json:"pool"`
+}
+
+// subPoolList 订阅池状态（global/cn 两行）+ 各自出口池健康分布。
 func (p *Panel) subPoolList(w http.ResponseWriter, r *http.Request) {
 	m := p.subPoolManager()
 	if m == nil {
 		writeErr(w, http.StatusNotImplemented, "订阅池未启用")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"realms": m.Status()})
+	sts := m.Status()
+	views := make([]subPoolRealmView, 0, len(sts))
+	for _, s := range sts {
+		v := subPoolRealmView{
+			Realm:       s.Realm,
+			Subs:        s.Subs,
+			SubsCount:   len(s.Subs),
+			Entries:     s.Entries,
+			RefreshedAt: s.RefreshedAt,
+			LastErr:     s.LastErr,
+		}
+		if p.cfg.Upstream != nil {
+			v.Pool = p.cfg.Upstream.ProxyPoolStats(s.Realm)
+		}
+		views = append(views, v)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"realms": views})
 }
 
-// subPoolSave 保存指定 realm 的订阅 URL 列表并立即刷新。
+// subPoolSave 变更指定 realm 的订阅 URL 列表并立即刷新。
+// mode=replace（默认，整体覆盖）/ append（尾部追加，去重不动既有条目）。
 func (p *Panel) subPoolSave(w http.ResponseWriter, r *http.Request) {
 	m := p.subPoolManager()
 	if m == nil {
@@ -312,6 +346,7 @@ func (p *Panel) subPoolSave(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Realm string   `json:"realm"`
 		Subs  []string `json:"subs"`
+		Mode  string   `json:"mode"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
@@ -322,8 +357,41 @@ func (p *Panel) subPoolSave(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "realm 只能是 global 或 cn（两池不互通）")
 		return
 	}
-	if err := m.SetSubs(realm, body.Subs); err != nil {
+	mode := strings.ToLower(strings.TrimSpace(body.Mode))
+	if mode != "" && mode != upstream.SubModeReplace && mode != upstream.SubModeAppend {
+		writeErr(w, http.StatusBadRequest, "mode 只能是 replace（覆盖）或 append（追加）")
+		return
+	}
+	if err := m.ApplySubs(realm, body.Subs, mode); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// subPoolClear 清空指定 realm 的订阅列表与出口池（该 realm 回落直连）。
+// 与"保存空列表"等价，单独给端点是为了让前端能明确区分"清除"这个破坏性动作
+// （前端会二次确认），而不是让用户靠"把文本框删空再点保存"来猜。
+func (p *Panel) subPoolClear(w http.ResponseWriter, r *http.Request) {
+	m := p.subPoolManager()
+	if m == nil {
+		writeErr(w, http.StatusNotImplemented, "订阅池未启用")
+		return
+	}
+	var body struct {
+		Realm string `json:"realm"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
+		return
+	}
+	realm := strings.ToLower(strings.TrimSpace(body.Realm))
+	if realm != "global" && realm != "cn" {
+		writeErr(w, http.StatusBadRequest, "realm 只能是 global 或 cn")
+		return
+	}
+	if err := m.Clear(realm); err != nil {
+		writeErr(w, http.StatusBadGateway, "清除失败: "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})

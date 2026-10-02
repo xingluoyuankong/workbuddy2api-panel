@@ -2,11 +2,11 @@ package upstream
 
 import (
 	"context"
-	"io"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -40,7 +40,7 @@ type SubPool struct {
 
 // subPoolDoc 落盘结构。
 type subPoolDoc struct {
-	Version int              `json:"version"`
+	Version int                 `json:"version"`
 	Realms  map[string][]string `json:"realms"` // realm → 订阅 URL 列表
 }
 
@@ -125,6 +125,65 @@ func (m *SubPool) SetSubs(realm string, urls []string) error {
 		return nil
 	}
 	return m.Refresh(realm)
+}
+
+// 订阅列表变更模式（面板三种操作，语义必须显式区分——旧面板只有"保存"，
+// 用户想加一条链接会被当成"整表替换"，一粘贴就把原有池冲掉）。
+const (
+	// SubModeReplace 用给定列表**整体覆盖**（默认，向后兼容旧面板）。
+	SubModeReplace = "replace"
+	// SubModeAppend 在现有列表**之后追加**（去重、保序，不动既有条目）。
+	SubModeAppend = "append"
+)
+
+// ApplySubs 按 mode 变更指定 realm 的订阅列表并落盘 + 刷新。
+// mode 为空视为 replace（旧客户端不带 mode 字段）。
+func (m *SubPool) ApplySubs(realm string, urls []string, mode string) error {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case SubModeAppend:
+		return m.AppendSubs(realm, urls)
+	default:
+		return m.SetSubs(realm, urls)
+	}
+}
+
+// AppendSubs 追加订阅链接：既有条目原样保留（保序），新条目去重后接在尾部。
+// 一条都没新增（全是重复/空行）时直接返回 nil——不落盘、不刷新，避免
+// "点添加却把整池重新拉一遍"的无效动作。
+func (m *SubPool) AppendSubs(realm string, urls []string) error {
+	seen := map[string]bool{}
+	merged := make([]string, 0, len(urls))
+	for _, u := range m.Subs(realm) {
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		merged = append(merged, u)
+	}
+	added := 0
+	for _, u := range urls {
+		u = strings.TrimSpace(u)
+		if u == "" || seen[u] {
+			continue
+		}
+		if _, err := url.Parse(u); err != nil {
+			return fmt.Errorf("订阅链接无效 %q: %w", u, err)
+		}
+		seen[u] = true
+		merged = append(merged, u)
+		added++
+	}
+	if added == 0 {
+		return nil
+	}
+	return m.SetSubs(realm, merged)
+}
+
+// Clear 清空指定 realm 的订阅列表**与该 realm 的出口池**。
+// 走 SetSubs(realm, nil)：空列表在 SetSubs 里会 delete(m.subs, realm) 并经
+// onChange(realm, "") 把池一并清掉——"列表没了池还在"会留下无法解释的残留出口。
+func (m *SubPool) Clear(realm string) error {
+	return m.SetSubs(realm, nil)
 }
 
 // Status 面板展示。
@@ -241,6 +300,7 @@ func (m *SubPool) Refresh(realm string) error {
 // 支持两种格式（自动识别）：
 //  1. base64（v2ray 订阅标准形态）
 //  2. 纯文本行（每行一条代理 URL）
+//
 // 只接受网关能用 scheme：http/https/socks5/socks5h；vmess/vless 等跳过并计数。
 func (m *SubPool) fetchOne(ctx context.Context, subURL string) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, subURL, nil)

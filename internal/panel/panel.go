@@ -226,6 +226,7 @@ func (p *Panel) routes() {
 	// 订阅链接池（realm 隔离：global/cn 各自独立的订阅 URL 列表）
 	p.mux.HandleFunc("GET /panel/api/subpool", p.withAuth(p.subPoolList))
 	p.mux.HandleFunc("POST /panel/api/subpool/save", p.withAuth(p.subPoolSave))
+	p.mux.HandleFunc("POST /panel/api/subpool/clear", p.withAuth(p.subPoolClear))
 	p.mux.HandleFunc("POST /panel/api/subpool/refresh", p.withAuth(p.subPoolRefresh))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }

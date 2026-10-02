@@ -163,7 +163,7 @@ function go(v) {
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
-  if (v === 'proxies') loadProxies(true);
+  if (v === 'proxies') { loadProxies(true); loadSubpool(); }
   if (v === 'packages') loadPackages();
   if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
 }
@@ -1308,7 +1308,11 @@ async function refreshVisible() {
     if (view === 'accounts') await loadOverview(true);
     else if (view === 'logs') await loadLogs();
     else if (view === 'taskscenter') await pollQueueOnce();
-    else if (view === 'proxies') { if (++pxPollTick % 2 === 0) await loadProxies(); }
+    else if (view === 'proxies') {
+      // 订阅池条数/健康随出口失败实时变，与表格同节奏刷新（每 2 轮 = 10s）；
+      // 但用户正在编辑文本框时 loadSubpool 内部会跳过覆盖，不会冲掉粘贴内容。
+      if (++pxPollTick % 2 === 0) { await loadProxies(); await loadSubpool(); }
+    }
   } finally { refreshInflight = false; }
 }
 function start() {
@@ -2607,61 +2611,129 @@ on('pxBulkSave', 'click', async () => {
 
 
 // ── 订阅链接池（realm 隔离）────────────────────────────────────
+// 最近一次拉到的池状态（清除确认框要报"当前多少条"）。
+let spLast = null;
+
+// 池健康条：把后端 ProxyPoolStat 翻成人话。
+// 只显示 Total 是不够的——「15 条里 12 条在冷却」和「15 条全健康」显示成同一个
+// 数字，运维看不出池子其实快空了。所以"可打/冷却/待重试/劫持/剔除"必须分开列。
+function spPoolHtml(p) {
+  if (!p || !p.total) return '池内暂无出口 —— 该 realm 走直连';
+  const bits = [];
+  bits.push('池内 <b>' + p.total + '</b> 条');
+  bits.push('可打 <b class="' + (p.available ? 'ok' : 'bad') + '">' + p.available + '</b>');
+  if (p.cooling) bits.push('<b class="warn">' + p.cooling + '</b> 冷却中');
+  if (p.retrying) bits.push('<b class="warn">' + p.retrying + '</b> 待重试');
+  if (p.hijacked) bits.push('<b class="bad">' + p.hijacked + '</b> 劫持命中');
+  if (p.removed) bits.push('<b class="bad">' + p.removed + '</b> 已永久剔除');
+  return bits.join('<span class="sep">·</span>');
+}
+
 async function loadSubpool() {
   try {
     const d = await api('subpool');
     if (!shouldRender('subpool', d)) return;
+    spLast = d;
     const realms = d.realms || [];
+    const sumBits = [];
+    let anyBad = false;
     for (const r of realms) {
-      const ta = r.realm === 'global' ? $('spGlobalSubs') : $('spCnSubs');
-      const info = r.realm === 'global' ? $('spGlobalInfo') : $('spCnInfo');
-      if (!ta) continue;
-      if (document.activeElement !== ta) ta.value = (r.subs || []).join('\n');
+      const isGlobal = r.realm === 'global';
+      const ta = isGlobal ? $('spGlobalSubs') : $('spCnSubs');
+      const info = isGlobal ? $('spGlobalInfo') : $('spCnInfo');
+      const pool = isGlobal ? $('spGlobalPool') : $('spCnPool');
+      // 用户正在编辑时不要覆盖输入（避免拉取把没保存的粘贴内容冲掉）
+      if (ta && document.activeElement !== ta) ta.value = (r.subs || []).join('\n');
       if (info) {
-        const bits = [];
-        if (r.entries) bits.push('池内 ' + r.entries + ' 条');
+        const bits = ['已配置 ' + (r.subs_count || 0) + ' 条链接'];
+        if (r.entries) bits.push('解析出 ' + r.entries + ' 条出口');
         if (r.refreshed_at) bits.push('刷新于 ' + ago(new Date(r.refreshed_at).toISOString()));
-        if (r.last_error) bits.push('<span style="color:#f85149">错误: ' + esc(r.last_error.slice(0, 60)) + '…</span>');
-        info.innerHTML = bits.length ? '· ' + bits.join(' · ') : '· 未配置';
+        if (r.last_error) {
+          bits.push('<span style="color:var(--bad)">错误: ' + esc(String(r.last_error).slice(0, 60)) + '…</span>');
+          anyBad = true;
+        }
+        info.innerHTML = '· ' + bits.join(' · ');
       }
-      // summary 行（折叠时也能看到核心状态）
-      const sum = $('spSummaryInfo');
-      if (sum) {
-        const n = (r.entries || 0);
-        sum.textContent = 'global ' + n + ' 条出口' + (r.last_error ? ' · 有错误' : '') + ' · 点击展开管理';
-      }
+      if (pool) pool.innerHTML = spPoolHtml(r.pool);
+      if (r.pool && (r.pool.removed || r.pool.hijacked)) anyBad = true;
+      sumBits.push(r.realm + ' ' + (r.subs_count || 0) + ' 链接 / ' + ((r.pool && r.pool.available) || 0) + ' 可用');
+    }
+    const sum = $('spSummaryInfo');
+    if (sum) {
+      sum.innerHTML = sumBits.length
+        ? '· ' + sumBits.join(' · ') + (anyBad ? ' · <span style="color:var(--bad)">有异常</span>' : '') + ' · 点击展开管理'
+        : '点击展开管理';
     }
   } catch (e) { /* 静默：订阅池接口未启用时忽略 */ }
 }
 
-async function subpoolAction(realm, action) {
+// subpoolAction 四种操作，语义必须互不混淆：
+//   add     只追加（后端按链接去重，已有条目一条不动）
+//   replace 整体覆盖（文本框里没有的条目会被删掉）
+//   refresh 不动列表，只重新拉取解析
+//   clear   清空列表与该 realm 出口池（二次确认）
+async function subpoolAction(realm, mode) {
+  const isGlobal = realm === 'global';
+  const ta = isGlobal ? $('spGlobalSubs') : $('spCnSubs');
+  const btnId = {
+    add: isGlobal ? 'btnSpAddGlobal' : 'btnSpAddCn',
+    replace: isGlobal ? 'btnSpSaveGlobal' : 'btnSpSaveCn',
+    refresh: isGlobal ? 'btnSpRefreshGlobal' : 'btnSpRefreshCn',
+    clear: isGlobal ? 'btnSpClearGlobal' : 'btnSpClearCn',
+  }[mode];
+  const btn = $(btnId);
+
+  let path = 'subpool/save';
   const body = { realm };
-  if (action === 'save') {
-    const ta = realm === 'global' ? $('spGlobalSubs') : $('spCnSubs');
-    body.subs = (ta.value || '').split('\n').map(x => x.trim()).filter(Boolean);
+  let busy = '处理中…';
+
+  if (mode === 'add' || mode === 'replace') {
+    const subs = (ta.value || '').split('\n').map(x => x.trim()).filter(Boolean);
+    if (!subs.length) {
+      alert(mode === 'add'
+        ? '文本框为空：请先粘贴要添加的代理链接或订阅 URL。'
+        : '文本框为空。若确实要清空该池，请用「清除」按钮（有二次确认）。');
+      return;
+    }
+    body.mode = mode === 'add' ? 'append' : 'replace';
+    body.subs = subs;
+    busy = mode === 'add' ? '添加中…' : '替换中…';
+  } else if (mode === 'clear') {
+    const cur = (spLast && (spLast.realms || []).find(x => x.realm === realm)) || {};
+    const n = cur.subs_count || 0;
+    const m = (cur.pool && cur.pool.total) || 0;
+    if (!confirm('确定清空 ' + realm + ' 池？\n\n将删除：' + n + ' 条订阅链接' + (m ? ' + 已解析的 ' + m + ' 条出口' : '') +
+      '\n后果：' + realm + ' 账号回落直连。\n此操作不可撤销。')) return;
+    path = 'subpool/clear';
+    busy = '清除中…';
+  } else {
+    busy = '刷新中…';
   }
-  const btn = action === 'save'
-    ? (realm === 'global' ? $('btnSpSaveGlobal') : $('btnSpSaveCn'))
-    : (realm === 'global' ? $('btnSpRefreshGlobal') : $('btnSpRefreshCn'));
+
   const old = btn.textContent;
-  btn.disabled = true; btn.textContent = action === 'save' ? '保存中…' : '刷新中…';
+  btn.disabled = true; btn.textContent = busy;
   try {
-    await api('subpool/' + action, { method: 'POST', body: JSON.stringify(body) });
+    await api(path, { method: 'POST', body: JSON.stringify(body) });
     btn.textContent = '完成';
     await loadSubpool();
+    if (mode === 'add' && body.subs) toast('已追加 ' + body.subs.length + ' 条（重复条目自动去重）');
   } catch (e) {
     btn.textContent = '失败';
-    alert('订阅池' + (action === 'save' ? '保存' : '刷新') + '失败：' + e.message);
+    alert('订阅池' + ({ add: '添加', replace: '替换', refresh: '刷新', clear: '清除' }[mode]) + '失败：' + e.message);
   }
   btn.disabled = false;
   setTimeout(() => { btn.textContent = old; }, 1200);
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  ['global', 'cn'].forEach(realm => {
-    const sB = realm === 'global' ? $('btnSpSaveGlobal') : $('btnSpSaveCn');
-    const rB = realm === 'global' ? $('btnSpRefreshGlobal') : $('btnSpRefreshCn');
-    if (sB) sB.onclick = () => subpoolAction(realm, 'save');
-    if (rB) rB.onclick = () => subpoolAction(realm, 'refresh');
-  });
+  const bind = {
+    btnSpAddGlobal: ['global', 'add'], btnSpSaveGlobal: ['global', 'replace'],
+    btnSpRefreshGlobal: ['global', 'refresh'], btnSpClearGlobal: ['global', 'clear'],
+    btnSpAddCn: ['cn', 'add'], btnSpSaveCn: ['cn', 'replace'],
+    btnSpRefreshCn: ['cn', 'refresh'], btnSpClearCn: ['cn', 'clear'],
+  };
+  for (const id in bind) {
+    const b = $(id);
+    if (b) b.onclick = () => subpoolAction(bind[id][0], bind[id][1]);
+  }
 });

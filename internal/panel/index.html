@@ -179,6 +179,14 @@ button.danger { color: var(--bad); }
 button.danger:hover:not(:disabled) { border-color: var(--bad); }
 button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; }
 button.icon { padding: 7px 9px; }
+/* 出口池健康条：池子"还剩几条能打"必须一眼可见——只看条数会把
+   "15 条全在冷却"误读成"池子很健康"。 */
+.sp-pool { font-size: 12.5px; line-height: 1.75; margin-bottom: 6px; color: var(--ink-2); }
+.sp-pool b { color: var(--ink); font-weight: 600; font-family: var(--mono); }
+.sp-pool .ok { color: var(--ok); }
+.sp-pool .warn { color: var(--warn); }
+.sp-pool .bad { color: var(--bad); }
+.sp-pool .sep { color: var(--ink-3); margin: 0 6px; }
 input, select {
   font: inherit; color: var(--ink); background: var(--surface-2);
   border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; width: 100%;
@@ -831,25 +839,31 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <details id="spDetails" style="margin-bottom:12px">
             <summary style="cursor:pointer;user-select:none;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)">
               <b>订阅链接池</b>
-              <span class="note" id="spSummaryInfo" style="margin-left:8px">global 与 cn 各自独立（两池不互通），点击展开管理</span>
+              <span class="note" id="spSummaryInfo" style="margin-left:8px">点击展开管理</span>
             </summary>
             <div style="padding:12px 10px 4px">
-              <div class="note" style="margin-bottom:10px;line-height:1.6">global 与 cn 各自独立的订阅 URL 列表（两池不互通）。每 6 小时自动拉取，解析出的代理链接进入对应 realm 的出口池；出口出问题（失败/TLS 劫持）自动降权切换，优先使用稳定且无劫持记录的链接。<b>可直接粘贴代理链接</b>（带凭据的 http/socks5，立即入池），也可粘贴订阅 URL 自动拉取；vmess/vless 暂不支持。</div>
+              <div class="note" style="margin-bottom:10px;line-height:1.6">global 与 cn 各自独立的出口池（两池不互通）。每 6 小时自动拉取，解析出的代理链接进入对应 realm 的出口池；出口失败自动降权重试，TLS 劫持（证书校验失败）长熔断并在命中 3 次后永久剔除。<b>可直接粘贴代理链接</b>（带凭据的 http/socks5，立即入池），也可粘贴订阅 URL 自动拉取；vmess/vless 暂不支持。<br>三种写入方式：<b>添加</b> = 只把文本框里的新链接接到池尾，已有条目原样保留；<b>替换</b> = 用文本框内容整体覆盖（文本框里没有的条目会被删掉）；<b>清除</b> = 清空该池，该 realm 回落直连。</div>
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
             <div>
               <div style="margin-bottom:6px"><b>global 池</b> <span class="note" id="spGlobalInfo"></span></div>
-              <textarea id="spGlobalSubs" rows="4" style="width:100%" placeholder="每行一条：代理链接（http://key@host:port 或 socks5://...，直接入池）或订阅 URL（http 地址，自动拉取）"></textarea>
-              <div style="margin-top:6px;display:flex;gap:8px">
-                <button class="xs primary" id="btnSpSaveGlobal">保存并刷新</button>
-                <button class="xs" id="btnSpRefreshGlobal">仅刷新</button>
+              <div class="sp-pool" id="spGlobalPool">—</div>
+              <textarea id="spGlobalSubs" rows="5" style="width:100%" placeholder="每行一条：代理链接（http://key@host:port 或 socks5://...，直接入池）或订阅 URL（http 地址，自动拉取）"></textarea>
+              <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
+                <button class="xs primary" id="btnSpAddGlobal" title="把文本框里的新链接追加到池尾，已有条目原样保留（去重）">添加</button>
+                <button class="xs" id="btnSpSaveGlobal" title="用文本框内容整体覆盖该池：文本框里没有的条目会被删掉">替换</button>
+                <button class="xs" id="btnSpRefreshGlobal" title="不改列表，重新拉取并解析一次">仅刷新</button>
+                <button class="xs danger" id="btnSpClearGlobal" title="清空该池，global 账号回落直连（需二次确认）">清除</button>
               </div>
             </div>
             <div>
               <div style="margin-bottom:6px"><b>cn 池</b> <span class="note" id="spCnInfo"></span></div>
-              <textarea id="spCnSubs" rows="4" style="width:100%" placeholder="每行一条：代理链接或订阅 URL（留空 = cn 账号走直连）"></textarea>
-              <div style="margin-top:6px;display:flex;gap:8px">
-                <button class="xs primary" id="btnSpSaveCn">保存并刷新</button>
-                <button class="xs" id="btnSpRefreshCn">仅刷新</button>
+              <div class="sp-pool" id="spCnPool">—</div>
+              <textarea id="spCnSubs" rows="5" style="width:100%" placeholder="每行一条：代理链接或订阅 URL（留空 = cn 账号走直连）"></textarea>
+              <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
+                <button class="xs primary" id="btnSpAddCn" title="把文本框里的新链接追加到池尾，已有条目原样保留（去重）">添加</button>
+                <button class="xs" id="btnSpSaveCn" title="用文本框内容整体覆盖该池">替换</button>
+                <button class="xs" id="btnSpRefreshCn" title="不改列表，重新拉取并解析一次">仅刷新</button>
+                <button class="xs danger" id="btnSpClearCn" title="清空该池，cn 账号回落直连（需二次确认）">清除</button>
               </div>
             </div>
           </div>
