@@ -187,12 +187,22 @@ func (p *Pool) SetEgressProvider(fn func(uid string) *EgressInfo) {
 }
 
 // egressFor 取账号出口信息（未注入提供者时返回 nil）。
-// 调用方需已持 p.mu（只读闭包，不会回打 pool，无死锁）。
+//
+// ⚠️ **必须在未持有 p.mu 时调用**（2026-10-02 P0 全站不可用事故根因）：
+// 注入的 provider 由 main 装配，内部会回调 pool（AuthByUID）并再取
+// AccountProxy 的锁。若在持 p.mu 的路径上调用（如旧的 statusOf），
+// 就是「递归 RLock + 锁序倒置」——只要此刻有写者（RecordTokenUsage /
+// startFlusher）在排队，Go RWMutex 的写优先会让第二个 RLock 永久阻塞，
+// 读锁再也无人释放，全池读操作（healthz / List / 选号）一起冻死。
+// 现在 List/Status 均先把 provider 取到本地、释放锁后再填充出口。
 func (p *Pool) egressFor(uid string) *EgressInfo {
-	if p.egressOf == nil {
+	p.mu.RLock()
+	fn := p.egressOf
+	p.mu.RUnlock()
+	if fn == nil {
 		return nil
 	}
-	return p.egressOf(uid)
+	return fn(uid)
 }
 
 // proxyGateOK 判定账号是否通过代理闸门（未注入闸门时恒 true）。
