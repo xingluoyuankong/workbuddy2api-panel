@@ -199,17 +199,21 @@ func main() {
 			t := time.NewTicker(time.Minute)
 			defer t.Stop()
 			for range t.C {
-				// 并发巡检：每个账号的探活最长 12s，串行会拖过一个 tick。
+				// 动态账号列表：auths 是启动快照，运行时新增的账号不在里面
+				//（实测新号永远没被自动绑定）。每 tick 从池取当前全量。
+				type ar struct{ uid, realm string }
+				list := make([]ar, 0, 8)
+				for _, st := range p.List() {
+					list = append(list, ar{st.UID, st.Realm})
+				}
+				// 并发巡检：每个账号的探活最长 8s，串行会拖过一个 tick。
 				var wg sync.WaitGroup
-				for _, a := range auths {
-					if a == nil {
-						continue
-					}
+				for _, a := range list {
 					wg.Add(1)
 					go func(uid, realm string) {
 						defer wg.Done()
 						ap.AutoBindAccount(uid, realm)
-					}(a.UID, a.Realm())
+					}(a.uid, a.realm)
 				}
 				wg.Wait()
 			}

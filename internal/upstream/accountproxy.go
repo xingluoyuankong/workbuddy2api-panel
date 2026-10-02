@@ -479,15 +479,38 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 
 	// ── 有 auto 绑定：先主动探活当前链接（1 分钟粒度发现失效）────
 	// 必须无条件探活：不能用「fails>0 就跳探活」短路——那样链路恢复了计数还在涨，
-	// 会误判成持续失效而错误换绑。
-	if m.probeCandidate(curRaw) {
+	// 会误判成持续失效而错误换绑。探活同时拿出口 IP，供同 IP 冲突检测。
+	ip, alive := m.probeEgressIP(curRaw)
+	if alive {
 		b.entry.fails.Store(0) // 探活成功清零（抗抖动：瞬时不可用不累积）
+		b.probeIP.Store(ip)    // 刷新采样（面板显示 + 反亲和数据源）
+
+		// 同 IP 冲突检测（风控）：resin 出口轮换可能把两个账号转到同一出口。
+		// 冲突 → 立即换绑（bindFirstUsable 的反亲和会排除冲突 IP）；
+		// 无可用候选则保持现状（下轮再试）。
+		m.mu.RLock()
+		conflict := false
+		for ou, ob := range m.bindings {
+			if ou == uid {
+				continue
+			}
+			if oip := ob.probeIP.Load(); oip != "" && oip == ip {
+				conflict = true
+				log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突，换绑 uid=%s",
+					realm, ip, logfmt.UID8(ou), logfmt.UID8(uid))
+				break
+			}
+		}
+		m.mu.RUnlock()
+		if conflict && m.bindFirstUsable(uid, realm) {
+			log.Printf("[autobind] 同 IP 冲突换绑完成 uid=%s", logfmt.UID8(uid))
+		}
 		return
 	}
 	b.entry.noteFail()
 
 	// 连续失败未达阈值：继续观察（避免网络抖动导致频繁换绑）
-	const failThreshold = 3
+	const failThreshold = 2
 	if b.entry.fails.Load() < failThreshold {
 		return
 	}
@@ -603,6 +626,9 @@ func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
 			}
 			m.doc.Accounts[uid] = e
 			m.bindings[uid] = nb
+			// 立即记录探活出口 IP：后续账号的 takenIPs 反亲和马上可见
+			//（此前要等 30 分钟校验才填 probeIP，期间同 IP 漏检）。
+			nb.probeIP.Store(r.ip)
 			_ = m.saveLocked()
 			takenLinks[r.raw] = true // 本轮后续账号跳过（同 tick 并发已串行化，防御性）
 			takenIPs[r.ip] = true
