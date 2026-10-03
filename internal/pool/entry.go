@@ -79,6 +79,10 @@ type Status struct {
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
+	// ModelDay (账号, 模型) 当日用量与实测额度（6004 快照）。只含"有信息量"的
+	// 模型——当日有用过 / 有实测额度 / 正被限流，三者任一；空 map = 该账号今天
+	// 还没有可展示的用量。面板据此在账号列表标注「免费模型 已用/额度」。
+	ModelDay map[string]ModelDayStatus `json:"model_day,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
 	Realm           string     `json:"realm,omitempty"`
@@ -198,6 +202,49 @@ type modelCostEntry struct {
 	LastSeen  time.Time
 	Samples   int
 }
+
+// modelDayUsage 单个 (账号, 模型) 的**当日**用量（本地日界，跨日整体清零）。
+// 按模型独立记（不是账号级汇总）：额度是模型维度限的（6004 按 model 触发）。
+type modelDayUsage struct {
+	Day    string  // 本地日期 "2006-01-02"，与当前日不同即清零重计
+	Reqs   int64   // 请求数（到达上游的尝试，含失败——失败也占上游侧的限流计数）
+	Tokens int64   // 累计 token（prompt+completion，仅 usage 明确存在时累加）
+	Credit float64 // 累计扣费
+}
+
+// modelQuotaObs 实测单日额度：6004 触发瞬间对当日用量的快照。
+//
+// 为什么只能"实测"：上游没有任何"查询模型调用额度"的接口，6004 文案
+// （「将在 … 重置」）也只带重置墙钟、**不带限额数字**。所以额度只能被动观测
+// ——日常流量记数，撞线瞬间定格。不做主动探测：那要把每个免费模型的额度
+// 烧光一遍才能量出来，代价比知道这个数字大得多。
+type modelQuotaObs struct {
+	Day        string    // 观测发生的那天（额度按日重置，跨天即过期语义）
+	Reqs       int64     // 6004 触发时的当日请求数 ≈ 请求额度
+	Tokens     int64     // 6004 触发时的当日 token 数 ≈ token 额度
+	Samples    int       // 累计观测次数（跨天累计，越多越可信）
+	ObservedAt time.Time // 最近一次观测时刻
+}
+
+// ModelDayStatus 面板透出的 (账号, 模型) 当日用量与实测额度。
+type ModelDayStatus struct {
+	Day    string  `json:"day"`
+	Reqs   int64   `json:"reqs"`
+	Tokens int64   `json:"tokens"`
+	Credit float64 `json:"credit,omitempty"`
+	// QuotaReqs/QuotaTokens 6004 触发瞬间快照 ≈ 实测单日额度。0 = 从未触发过
+	// 6004（额度未知，面板只能显示"已用 N"，不显示分母）。
+	QuotaReqs    int64     `json:"quota_reqs,omitempty"`
+	QuotaTokens  int64     `json:"quota_tokens,omitempty"`
+	QuotaSamples int       `json:"quota_samples,omitempty"`
+	QuotaAt      time.Time `json:"quota_at,omitempty"`
+	// Limited 该模型当前是否正处于 6004 限流期（含 Until/ResetAt 倒计时）。
+	Limited bool      `json:"limited,omitempty"`
+	Until   time.Time `json:"until,omitempty"`
+	ResetAt time.Time `json:"reset_at,omitempty"`
+	// Reason 限流原因原文（6004 限流 / 11102 无此模型），面板据此区分展示。
+	Reason string `json:"reason,omitempty"`
+}
 type entry struct {
 	a            *auth.Auth
 	credits      int64
@@ -263,8 +310,112 @@ type entry struct {
 	// 持久化（stateAccount.ModelCosts，P1-anti-monopoly）：重启后成本知识保留；
 	// 落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活。
 	modelCost map[string]modelCostEntry
+	// modelDay (账号, 模型) 当日用量：6004 触发瞬间的快照就是实测额度（见
+	// modelQuotaObs）。跨日清零是**读取时判定**（Day != today 即重计），不是定时器
+	// ——免得为翻日加一个 ticker。
+	modelDay map[string]*modelDayUsage
+	// modelQuota (账号, 模型) 实测单日额度（6004 快照）。持久化
+	// （stateAccount.ModelQuotas）：额度是稀缺知识——观测到一次要等真撞一天线，
+	// 重启丢掉就得重等一天。
+	modelQuota map[string]modelQuotaObs
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
+}
+
+// dayLayout 本地日界的日期格式（modelDayUsage.Day / modelQuotaObs.Day）。
+const dayLayout = "2006-01-02"
+
+// noteModelDayLocked 记一次 (账号, 模型) 的当日用量（调用方必须已持 p.mu）。
+// 跨日判定在此做：该模型上次记录的 Day 不是今天 → 清零重计。
+func (e *entry) noteModelDayLocked(model string, delta TokenUsageDelta, now time.Time) {
+	if model == "" {
+		return
+	}
+	today := now.Format(dayLayout)
+	u := e.modelDay[model]
+	if u == nil || u.Day != today {
+		u = &modelDayUsage{Day: today}
+		if e.modelDay == nil {
+			e.modelDay = map[string]*modelDayUsage{}
+		}
+		e.modelDay[model] = u
+	}
+	u.Reqs++
+	if delta.HasTotalTokens && delta.TotalTokens > 0 {
+		u.Tokens += delta.TotalTokens
+	} else {
+		// usage 缺失时按有无 completion 粗算，保证"用了但没 usage"也计入量
+		u.Tokens += delta.PromptTokens + delta.CompletionTokens
+	}
+	if delta.HasCredit {
+		u.Credit += delta.Credit
+	}
+}
+
+// snapshotModelQuotaLocked 6004 触发瞬间把该模型当日用量定格为实测额度
+// （调用方必须已持 p.mu）。同一天内重复触发只更新时间戳（额度没变）；
+// 跨天观测 Samples 累计。
+func (e *entry) snapshotModelQuotaLocked(model string, now time.Time) {
+	if model == "" {
+		return
+	}
+	today := now.Format(dayLayout)
+	u := e.modelDay[model]
+	q := e.modelQuota[model]
+	sameDay := q.Day == today
+	reqs, toks := int64(0), int64(0)
+	if u != nil && u.Day == today {
+		reqs, toks = u.Reqs, u.Tokens
+	}
+	switch {
+	case q.Samples == 0:
+		q = modelQuotaObs{Day: today, Samples: 1}
+	case !sameDay:
+		q.Day = today
+		q.Samples++ // 跨天再观测：样本 +1
+	}
+	q.Reqs, q.Tokens, q.ObservedAt = reqs, toks, now
+	if e.modelQuota == nil {
+		e.modelQuota = map[string]modelQuotaObs{}
+	}
+	e.modelQuota[model] = q
+}
+
+// modelDayStatusLocked 汇总 (账号, 模型) 当日用量 + 实测额度 + 限流态
+// （调用方必须已持 p.mu）。只含"有信息量"的模型：当日有用过 / 有实测额度 /
+// 正被限流（含未过期的 11102 负缓存），三者任一；否则返回 nil。
+func (e *entry) modelDayStatusLocked(now time.Time) map[string]ModelDayStatus {
+	if len(e.modelDay) == 0 && len(e.modelQuota) == 0 && len(e.modelCooldowns) == 0 {
+		return nil
+	}
+	today := now.Format(dayLayout)
+	out := map[string]ModelDayStatus{}
+	for m, u := range e.modelDay {
+		if u == nil || u.Day != today || (u.Reqs == 0 && u.Tokens == 0) {
+			continue
+		}
+		out[m] = ModelDayStatus{Day: u.Day, Reqs: u.Reqs, Tokens: u.Tokens, Credit: u.Credit}
+	}
+	for m, q := range e.modelQuota {
+		if q.Reqs == 0 && q.Tokens == 0 {
+			continue
+		}
+		v := out[m]
+		v.QuotaReqs, v.QuotaTokens, v.QuotaSamples, v.QuotaAt = q.Reqs, q.Tokens, q.Samples, q.ObservedAt
+		out[m] = v
+	}
+	for m, mc := range e.modelCooldowns {
+		if !now.Before(mc.Until) {
+			continue // 已过期不算限流
+		}
+		v := out[m]
+		v.Limited, v.Until, v.ResetAt, v.Reason = true, mc.Until, mc.ResetAt, mc.Reason
+		out[m] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // modelCostOf 返回该账号在指定 model 上的有效成本观测；无观测或观测过期返回 ok=false。
@@ -442,6 +593,12 @@ type stateAccount struct {
 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
 	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
 	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
+	// ModelDayUsage (账号, 模型) 当日用量（model → 记录）。持久化：6004 快照的
+	// 分母依赖当日累计，重启丢分子会让额度观测偏小。恢复按 Day 惰性过滤（非今日丢弃）。
+	ModelDayUsage map[string]stateModelDayUsage `json:"model_day_usage,omitempty"`
+	// ModelQuotas (账号, 模型) 实测单日额度（6004 快照）。持久化：观测到一次要等
+	// 真撞一天线，重启丢掉就得重等一天。不按 Day 过期（稀缺知识，跨天保留展示）。
+	ModelQuotas map[string]stateModelQuota `json:"model_quotas,omitempty"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态
@@ -459,6 +616,26 @@ type stateModelCost struct {
 	CostPer1k float64   `json:"cost_per_1k"`
 	LastSeen  time.Time `json:"last_seen"`
 	Samples   int       `json:"samples,omitempty"`
+}
+
+// stateModelDayUsage (账号, 模型) 当日用量的持久化记录。落盘/恢复都按 Day
+// 惰性过滤：不是今天的条目直接丢弃（日额度本来就按日清零）。
+type stateModelDayUsage struct {
+	Day    string  `json:"day"`
+	Reqs   int64   `json:"reqs"`
+	Tokens int64   `json:"tokens"`
+	Credit float64 `json:"credit,omitempty"`
+}
+
+// stateModelQuota (账号, 模型) 实测单日额度的持久化记录。**不按 Day 过期**：
+// 额度是"6004 那一刻的用量快照"，是稀缺知识（观测到一次要等真撞一天线），
+// 跨天后仍保留展示（面板标注观测日期），被下一次 6004 覆盖。
+type stateModelQuota struct {
+	Day        string    `json:"day"`
+	Reqs       int64     `json:"reqs"`
+	Tokens     int64     `json:"tokens"`
+	Samples    int       `json:"samples,omitempty"`
+	ObservedAt time.Time `json:"observed_at"`
 }
 
 // stateFile 持久化格式。

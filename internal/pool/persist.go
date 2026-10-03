@@ -175,6 +175,27 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
+		// 当日按模型用量：只恢复今天的（昨天的条目直接丢弃——日额度本就按日清零）。
+		today := now.Format(dayLayout)
+		for m, u := range s.ModelDayUsage {
+			if u.Day != today || (u.Reqs == 0 && u.Tokens == 0) {
+				continue
+			}
+			if e.modelDay == nil {
+				e.modelDay = map[string]*modelDayUsage{}
+			}
+			e.modelDay[m] = &modelDayUsage{Day: u.Day, Reqs: u.Reqs, Tokens: u.Tokens, Credit: u.Credit}
+		}
+		// 实测额度（6004 快照）：稀缺知识，跨天也恢复（面板标注观测日期）。
+		for m, q := range s.ModelQuotas {
+			if q.Reqs == 0 && q.Tokens == 0 {
+				continue
+			}
+			if e.modelQuota == nil {
+				e.modelQuota = map[string]modelQuotaObs{}
+			}
+			e.modelQuota[m] = modelQuotaObs{Day: q.Day, Reqs: q.Reqs, Tokens: q.Tokens, Samples: q.Samples, ObservedAt: q.ObservedAt}
+		}
 		p.byUID[uid] = e
 	}
 }
@@ -290,6 +311,27 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				}
 				s.ModelCosts[m] = stateModelCost{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
+		}
+		// 当日按模型用量：只写今天的（昨天的日额度本来就已清零，不写）。
+		today := now.Format(dayLayout)
+		for m, u := range e.modelDay {
+			if u == nil || u.Day != today || (u.Reqs == 0 && u.Tokens == 0) {
+				continue
+			}
+			if s.ModelDayUsage == nil {
+				s.ModelDayUsage = map[string]stateModelDayUsage{}
+			}
+			s.ModelDayUsage[m] = stateModelDayUsage{Day: u.Day, Reqs: u.Reqs, Tokens: u.Tokens, Credit: u.Credit}
+		}
+		// 实测额度（6004 快照）：稀缺知识全量落盘，不按 Day 过期（跨天保留展示）。
+		for m, q := range e.modelQuota {
+			if q.Reqs == 0 && q.Tokens == 0 {
+				continue
+			}
+			if s.ModelQuotas == nil {
+				s.ModelQuotas = map[string]stateModelQuota{}
+			}
+			s.ModelQuotas[m] = stateModelQuota{Day: q.Day, Reqs: q.Reqs, Tokens: q.Tokens, Samples: q.Samples, ObservedAt: q.ObservedAt}
 		}
 		sf.Accounts[uid] = s
 	}

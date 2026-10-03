@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -284,6 +285,57 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// 每账号近期报错计数：扫描日志环的 err 级别行，按行内 uid=xxxxxxxx 前缀归账
+	// （日志统一打 8 位前缀，logfmt.UID8）。这是"日志报错 → 账号列表"的直通车：
+	// 运维不用再去日志页翻，账号行上直接看到哪个号在持续报错。环 2000 行扫描
+	// 一次微秒级，5s 轮询可承受。
+	errByUID := map[string]int{}
+	if p.logs != nil {
+		errs, _ := p.logs.Filter(SnapshotOpts{Level: LvlErr})
+		for _, e := range errs {
+			if m := uidInLogRe.FindStringSubmatch(e.Text); m != nil {
+				errByUID[m[1]]++
+			}
+		}
+	}
+	// 免费模型集合（realm:model → true）：实测单次消耗 <= 0 且有样本的模型。
+	// 数据源 = modelmeta（模型验证/probe 写入）。**不能**用账号自身的成本账本判
+	// 免费：NoteModelCost 只记 credit>0 的观测，真免费模型根本不会入账——用账本
+	// 判免费会把免费模型全部漏掉。
+	freeSet := map[string]bool{}
+	if p.cfg.ModelMeta != nil {
+		for _, v := range p.cfg.ModelMeta.All() {
+			if v.Samples > 0 && v.Credit <= 0 {
+				freeSet[v.Realm+":"+v.ID] = true
+			}
+		}
+	}
+	accounts := p.cfg.Pool.List()
+	rows := make([]accountRow, len(accounts))
+	for i, st := range accounts {
+		n := 0
+		if len(st.UID) >= 8 {
+			n = errByUID[strings.ToLower(st.UID[:8])]
+		}
+		// 修剪 model_day：只保留「免费 / 限流中 / 有实测额度」的模型。
+		// 注意键形态：model_day 的键是**全调用名**（cn:glm-5.3-flash，与
+		// RecordTokenUsage 的 delta.Model 同源），免费集是裸名 —— 必须剥前缀再查，
+		// 否则拼出 cn:cn:xxx 永远查不中（上线首版就栽在这）。
+		if len(st.ModelDay) > 0 {
+			trimmed := make(map[string]pool.ModelDayStatus, len(st.ModelDay))
+			for m, v := range st.ModelDay {
+				bare := m
+				if i := strings.Index(m, ":"); i >= 0 {
+					bare = m[i+1:]
+				}
+				if freeSet[st.Realm+":"+bare] || v.Limited || v.QuotaReqs > 0 {
+					trimmed[m] = v
+				}
+			}
+			st.ModelDay = trimmed
+		}
+		rows[i] = accountRow{Status: st, ErrRecent: n}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
@@ -296,10 +348,21 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
 		// 账号代理：bound = 已绑定且启用的账号数，bad = 出口异常的账号数。
-		"proxy_bound":     pxBound,
-		"proxy_bad":       pxBad,
-		"accounts":        p.cfg.Pool.List(),
+		"proxy_bound": pxBound,
+		"proxy_bad":   pxBad,
+		"accounts":    rows,
 	})
+}
+
+// uidInLogRe 从日志行提取 uid= 前缀（8 位十六进制，logfmt.UID8 的输出形态）。
+var uidInLogRe = regexp.MustCompile(`(?i)uid=([0-9a-f]{8})`)
+
+// accountRow 账号列表行 = 池状态 + 面板侧附加观测（近期报错计数）。
+// 内嵌 pool.Status：JSON 序列化时字段扁平提升，前端拿到的结构与旧版完全兼容，
+// 只是多了 err_recent —— 旧前端零回归。
+type accountRow struct {
+	pool.Status
+	ErrRecent int `json:"err_recent"`
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
@@ -400,7 +463,28 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 	// key 必须带 realm：CN 与 global 是两套定价，同名模型（如 deepseek-v4.1-flash）
 	// 在两个域的价格可能完全不同，混在一起聚合会得出两边一样的假数据。
 	ledger := map[string]ledgerRow{}
+	// 每模型「今日额度状态」跨账号聚合（模型页标注）：账号列表只标单号，
+	// 模型页标全局——一眼看出"哪个免费模型今天在几个号上已经耗尽"。
+	// exhausted = 6004 限流中，或当日用量已达实测额度（6004 快照）。
+	qstat := map[string]struct{ accounts, exhausted int }{}
 	for _, st := range p.cfg.Pool.List() {
+		lim := map[string]bool{}
+		for _, r := range st.RateLimitedModels {
+			lim[r.Model] = true
+		}
+		for m, v := range st.ModelDay {
+			bare := m
+			if i := strings.Index(m, ":"); i >= 0 {
+				bare = m[i+1:] // model_day 键是全调用名（cn:xxx），账本/台账键是裸名
+			}
+			k := st.Realm + ":" + bare
+			s := qstat[k]
+			s.accounts++
+			if lim[bare] || (v.QuotaReqs > 0 && v.Reqs >= v.QuotaReqs) {
+				s.exhausted++
+			}
+			qstat[k] = s
+		}
 		for _, mc := range st.ModelCosts {
 			if mc.Model == "" || mc.Samples < 2 {
 				continue
@@ -456,6 +540,21 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 		// 目录写 x0.00 但账本还留着限免前的旧单价）。
 		if raw, _ := m["credits"].(string); creditsIsZero(raw) {
 			m["free_declared"] = true
+		}
+		// 今日额度状态（跨账号聚合）：仅免费模型标注——「N 个号在用 / M 个已耗尽」。
+		// 非免费模型没有"额度"语义（按量计费），标了反而误导。
+		// 免费判定三源（任一为真）：①目录声明 credits=x0 ②成本账本实测 per1k<=0
+		// ③modelmeta 实测 samples>0 且 credit<=0 ——③必须有：真免费模型因
+		// NoteModelCost 只记 credit>0 而永远进不了②的账本（hy4-preview-f 就这样）。
+		measuredFree := v.Samples > 0 && v.Credit <= 0
+		ledgerFree := func() bool {
+			if r, ok := ledger[k]; ok {
+				return r.Per1k <= 0
+			}
+			return false
+		}()
+		if qs, ok := qstat[k]; ok && (m["free_declared"] == true || measuredFree || ledgerFree) {
+			m["quota_today"] = map[string]any{"accounts": qs.accounts, "exhausted": qs.exhausted}
 		}
 		// 成本账本：实测单价与免费判定。面板据此标「免费」徽标，
 		// 让用户一眼看出该用哪个变体（如 hy4-preview-f 免费、hy4-preview 收费）。
@@ -881,6 +980,7 @@ func (p *Panel) sessionList(w http.ResponseWriter, r *http.Request) {
 //   - {"all": true}            清空全部绑定
 //   - {"uid": "<uid>"}         只解开绑定到该账号的会话（更精准）
 //   - {"key": "<会话key>"}      解开单个会话
+//
 // 三者都为空时按 all 处理（面板主按钮语义：全部重置）。
 //
 // 为什么要手动入口：粘性会把对话长期钉在一个账号上。账号进入冷却/被 6004
