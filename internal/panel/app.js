@@ -243,6 +243,11 @@ function egressCell(eg) {
 function shortModel(m) {
   return m && m.length > 16 ? m.slice(0, 15) + '…' : (m || '—');
 }
+/* quotaCell 额度/报错列：realm **全量**免费模型一枚 chip。
+ *   √ 绿 = 今日还有额度（含"今日未用"——没用过不代表没有，只是无观测）
+ *   × 红 = 今日已耗尽（6004 限流中，或当日用量已达实测额度）
+ * 数字全进 tooltip；报错 badge 可点击 → 跳日志页并按该 uid 过滤 err 行，
+ * 让"报错 4"能被一眼查证，而不是一个需要解释的数字。 */
 function quotaCell(s) {
   const day = s.model_day || {};
   const names = Object.keys(day);
@@ -251,20 +256,28 @@ function quotaCell(s) {
   }
   const bits = [];
   if (names.length) {
-    // 每个免费模型一枚 chip：√=今日还有额度（绿），×=今日已耗尽/限流中（红）。
-    // 数字只进 tooltip，不占版面——账号列表要的是"哪个号还能不能用"，不是报表。
     const chips = names.map(m => {
       const v = day[m];
       const bare = m.indexOf(':') >= 0 ? m.slice(m.indexOf(':') + 1) : m;
       const nm = esc(shortModel(bare));
-      const exhausted = v.limited || (v.quota_reqs > 0 && v.reqs >= v.quota_reqs);
-      let tip = nm + '：今日已用 ' + v.reqs + ' 次 / ' + (v.tokens || 0) + ' tok';
-      tip += v.quota_reqs > 0
-        ? '｜实测额度 ≈ ' + v.quota_reqs + ' 次 / ' + v.quota_tokens + ' tok（观测 ' + v.quota_samples + ' 次）'
-        : '｜额度未知（该模型今日尚未触发过 6004，无法观测）';
-      if (v.limited) {
-        tip += '｜【限流中】' + (v.reason || '') +
+      // 「已耗尽」必须同时满足：已达实测额度 且 上游重置墙钟未到——
+      // 重置时间一过额度窗口已更新，× 继续挂着就是与上游实际恢复状态脱节。
+      const resetAt = v.quota_reset_at ? new Date(v.quota_reset_at).getTime() : 0;
+      const quotaActive = v.quota_reqs > 0 && (!resetAt || Date.now() < resetAt);
+      const exhausted = v.limited || (quotaActive && v.reqs >= v.quota_reqs);
+      let tip;
+      if (exhausted) {
+        tip = nm + '：今日已耗尽';
+        if (v.reqs || v.tokens) tip += '（已用 ' + v.reqs + ' 次 / ' + (v.tokens || 0) + ' tok';
+        if (v.quota_reqs > 0) tip += '，实测额度 ≈ ' + v.quota_reqs + ' 次（观测 ' + v.quota_samples + ' 次）';
+        if (v.reqs || v.tokens) tip += ')';
+        if (v.limited) tip += '｜' + (v.reason || '6004 限流') +
           (v.until ? ' · 重置于 ' + new Date(v.until).toLocaleTimeString('zh-CN', { hour12: false }) : '');
+      } else if (v.reqs > 0) {
+        tip = nm + '：今日已用 ' + v.reqs + ' 次 / ' + (v.tokens || 0) + ' tok' +
+          (v.quota_reqs > 0 ? '｜实测额度 ≈ ' + v.quota_reqs + ' 次（观测 ' + v.quota_samples + ' 次）' : '｜额度未知（尚未触发过 6004）');
+      } else {
+        tip = nm + '：今日未用（无用量观测，额度未知）';
       }
       return {
         exhausted,
@@ -275,7 +288,8 @@ function quotaCell(s) {
     bits.push('<div class="q-chips">' + chips.map(c => c.html).join('') + '</div>');
   }
   if (s.err_recent > 0) {
-    bits.push('<span class="tag bad" title="日志环内该账号的报错行数（err 级别）">报错 ' + s.err_recent + '</span>');
+    bits.push('<span class="tag bad q-errlog" data-errlog="' + esc(s.uid.slice(0, 8)) +
+      '" title="日志环内该账号的报错行数（err 级别）。点击跳转日志页查看明细">报错 ' + s.err_recent + '</span>');
   }
   return '<td class="qcell">' + bits.join(' ') + '</td>';
 }
@@ -283,7 +297,7 @@ function quotaCell(s) {
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="11"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -326,12 +340,11 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + realmTag(s.realm) + '</div><div class="id">' + esc(short) + '</div></td>' +
-      '<td>' + tag + note + '</td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + realmTag(s.realm) + '</div><div class="id">' + esc(short) + '</div><div class="id" style="font-family:var(--sans)">最近成功 ' + ago(s.last_success) + '</div></td>' +
+      '<td>' + tag + (s.in_flight > 0 ? ' <span class="tag mute" title="该账号当前正在处理的请求数">在途 ' + s.in_flight + '</span>' : '') + note + '</td>' +
       egressCell(s.egress) +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
-      '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
         '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
         '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
@@ -339,7 +352,6 @@ function renderAccounts(list) {
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
       quotaCell(s) +
-      '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
@@ -350,6 +362,22 @@ function renderAccounts(list) {
       '</td></tr>';
   }).join('');
 }
+
+/* 「报错 N」badge 点击 → 跳日志页并按该 uid 过滤 err 行。
+ * 让账号列表上的报错数字可查证：看得到数量，更能立刻看到是哪些错。 */
+on('accBody', 'click', ev => {
+  const b = ev.target.closest('[data-errlog]');
+  if (!b) return;
+  logLvl = 'err';
+  logCh = 'all';
+  logQuery = 'uid=' + b.dataset.errlog;
+  document.querySelectorAll('#logLvlChips .chip').forEach(c => c.classList.toggle('on', c.dataset.lvl === 'err'));
+  document.querySelectorAll('#logChips .chip').forEach(c => c.classList.toggle('on', c.dataset.ch === 'all'));
+  const s = $('logSearch');
+  if (s) s.value = logQuery;
+  go('logs');
+  loadLogs();
+});
 
 /* ── 身份提示词：载入 / 编辑 / 保存（热生效） ──────────────────────
  *
@@ -679,16 +707,16 @@ function mmTierOptions(cur) {
  * 未实测只是没数据。面板必须把两者分开，否则用户会误用收费变体。 */
 /* mmIsFree 免费判定，三个来源按权威度排序：
  *   ① 上游目录声明 credits=x0.00  —— 官方定价，最权威
- *   ② 成本账本实测 per1k<=0       —— 实测验证（如 hy4-preview-f 396 次全 0）
- *   ③ 验证接口回显 credit==0
- * 只看账本会漏掉「刚限免、还没跑过请求」的模型：global:deepseek-v4.1-flash
- * 目录明确写 x0.00，但账本还留着限免前的旧单价，结果被误标成收费。 */
+ *   ② 成本账本实测 per1k<=0       —— 实测验证
+ *   ③ 后端权威免费集（quota_today 只对免费模型下发：目录声明 ∪ 真实流量实扣0×≥3次）
+ * **不猜** measured.credit==0：探针请求没拿到 usage.credit 时字段缺失→零值，
+ * 会把 gpt-5.6-sol / gpt-5.6-terra / primary-model 这类收费模型误标成免费
+ * （2026-10-04 用户实测打回）。 */
 function mmIsFree(m) {
   if (m.free_declared) return true;
   if (m.ledger) return !!m.ledger.free;
-  const me = m.measured;
-  if (!me) return false;
-  return (me.samples || 0) > 0 && !(me.credit > 0);
+  if (m.quota_today) return true;
+  return false;
 }
 
 function mmCopy(text, label, short) {

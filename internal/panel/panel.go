@@ -114,6 +114,63 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// freeCache 免费模型集缓存（key = "realm:bare"）。计算依赖目录（ListModels，
+	// 1h 缓存）与用量全量聚合，两者都不便宜；而免费/收费的变化频率是"天"级
+	// （限免开始/结束），缓存 5 分钟足够新鲜。overview 5s 轮询只读缓存。
+	freeMu    sync.Mutex
+	freeCache map[string]bool
+	freeAt    time.Time
+}
+
+// freeModels 计算免费模型集（带 5 分钟缓存）。
+//
+// 免费判定只认两个**硬证据**源——2026-10-04 事故教训：曾把 modelmeta 的
+// credit<=0 当免费，结果把 gpt-5.6-sol / gpt-5.6-terra / primary-model /
+// hunyuan-2.0-instruct 这类「探针没拿到 usage.credit（缺字段→零值）」的
+// 收费模型全标成了免费，用户当场打回。
+//
+// ① 目录声明：上游官方定价 credits=x0.00（最权威；cn 目录有，global 目录
+//
+//	不下发 credits 字段）。
+//
+// ② 真实流量实扣 0：usage 按 (realm, model) 聚合里 credit_samples>=3 且
+//
+//	credits 合计<=0。**samples>=3 是关键**——单次/探针形态的 0 可能只是
+//	「上游没下发 credit」的假 0，连续多次真请求都实扣 0 才是免费。
+//	（hy4-preview-f 693 样本全 0、deepseek-v4.1-flash 2842 样本全 0：
+//	这才是铁证。）
+func (p *Panel) freeModels() map[string]bool {
+	p.freeMu.Lock()
+	defer p.freeMu.Unlock()
+	if p.freeCache != nil && time.Since(p.freeAt) < 5*time.Minute {
+		return p.freeCache
+	}
+	set := map[string]bool{}
+	if p.cfg.ListModels != nil {
+		for _, e := range p.cfg.ListModels() {
+			full, _ := e["id"].(string)
+			raw, _ := e["credits"].(string)
+			if full != "" && creditsIsZero(raw) {
+				set[full] = true // full = "cn:xxx" 全调用名，与 usage 键同形
+			}
+		}
+	}
+	if p.cfg.Usage != nil {
+		// 近 7 天窗口：免费/收费是**会变**的（限免开始/结束、调价），"现在免费"
+		// 只该看近期实扣。全期聚合会被历史旧价格时代的零星扣费污染——实测
+		// global:deepseek-v4.1-flash 全期含 0.13（一个月前的旧价扣费），
+		// 按"全期实扣 0"判会把当前真免费的它误杀。
+		snap := p.cfg.Usage.SnapshotWithCost(24*7, nil, nil)
+		for _, k := range snap.ByModel {
+			if k.CreditSamples >= 3 && k.Credits <= 0 {
+				set[k.Key] = true
+			}
+		}
+	}
+	p.freeCache = set
+	p.freeAt = time.Now()
+	return set
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -298,17 +355,21 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// 免费模型集合（realm:model → true）：实测单次消耗 <= 0 且有样本的模型。
-	// 数据源 = modelmeta（模型验证/probe 写入）。**不能**用账号自身的成本账本判
-	// 免费：NoteModelCost 只记 credit>0 的观测，真免费模型根本不会入账——用账本
-	// 判免费会把免费模型全部漏掉。
-	freeSet := map[string]bool{}
-	if p.cfg.ModelMeta != nil {
-		for _, v := range p.cfg.ModelMeta.All() {
-			if v.Samples > 0 && v.Credit <= 0 {
-				freeSet[v.Realm+":"+v.ID] = true
-			}
+	// 免费模型集：目录声明 x0.00 ∪ 真实流量实扣 0（credit_samples>=3）。
+	// 见 freeModels() 注释——**不用** modelmeta 的 credit（探针缺 usage 时
+	// 零值会被误判免费，gpt-5.6-sol/terra/primary-model/hunyuan 就是这么混进来的）。
+	freeSet := p.freeModels()
+	freeByRealm := map[string][]string{}
+	for k := range freeSet {
+		i := strings.Index(k, ":")
+		if i <= 0 || i == len(k)-1 {
+			continue
 		}
+		realm, bare := k[:i], k[i+1:]
+		freeByRealm[realm] = append(freeByRealm[realm], bare)
+	}
+	for r := range freeByRealm {
+		sort.Strings(freeByRealm[r])
 	}
 	accounts := p.cfg.Pool.List()
 	rows := make([]accountRow, len(accounts))
@@ -317,22 +378,36 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		if len(st.UID) >= 8 {
 			n = errByUID[strings.ToLower(st.UID[:8])]
 		}
-		// 修剪 model_day：只保留「免费 / 限流中 / 有实测额度」的模型。
-		// 注意键形态：model_day 的键是**全调用名**（cn:glm-5.3-flash，与
-		// RecordTokenUsage 的 delta.Model 同源），免费集是裸名 —— 必须剥前缀再查，
-		// 否则拼出 cn:cn:xxx 永远查不中（上线首版就栽在这）。
-		if len(st.ModelDay) > 0 {
-			trimmed := make(map[string]pool.ModelDayStatus, len(st.ModelDay))
-			for m, v := range st.ModelDay {
-				bare := m
-				if i := strings.Index(m, ":"); i >= 0 {
-					bare = m[i+1:]
-				}
-				if freeSet[st.Realm+":"+bare] || v.Limited || v.QuotaReqs > 0 {
-					trimmed[m] = v
-				}
+		// 重写 model_day 为该号 **全量** 免费模型 + 限流中的模型：
+		//   - 没今日用量的免费模型也要出现（√ 有余）——只列用过的会让人以为
+		//     "global 只有 deepseek 一个免费模型"；
+		//   - 键保持全调用名（cn:xxx，与 Status 原口径一致，前端剥前缀显示）；
+		//   - 6004 限流（RateLimitedModels 键为裸名）盖到对应模型上为 ×；
+		//   - 限流中的非免费模型（如 11102 无此模型）也进列（× 语义）。
+		limited := make(map[string]pool.RateLimitedModel, len(st.RateLimitedModels))
+		for _, r := range st.RateLimitedModels {
+			limited[r.Model] = r
+		}
+		fm := map[string]pool.ModelDayStatus{}
+		for _, bare := range freeByRealm[st.Realm] {
+			full := st.Realm + ":" + bare
+			v := st.ModelDay[full] // 今日没用过 = 零值（√，tooltip 标"今日未用"）
+			if r, ok := limited[bare]; ok {
+				v.Limited, v.Until, v.ResetAt, v.Reason = true, r.Until, r.ResetAt, r.Reason
 			}
-			st.ModelDay = trimmed
+			fm[full] = v
+		}
+		for _, r := range st.RateLimitedModels {
+			full := st.Realm + ":" + r.Model
+			if _, ok := fm[full]; ok {
+				continue
+			}
+			v := st.ModelDay[full]
+			v.Limited, v.Until, v.ResetAt, v.Reason = true, r.Until, r.ResetAt, r.Reason
+			fm[full] = v
+		}
+		if len(fm) > 0 {
+			st.ModelDay = fm
 		}
 		rows[i] = accountRow{Status: st, ErrRecent: n}
 	}
@@ -467,6 +542,7 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 	// 模型页标全局——一眼看出"哪个免费模型今天在几个号上已经耗尽"。
 	// exhausted = 6004 限流中，或当日用量已达实测额度（6004 快照）。
 	qstat := map[string]struct{ accounts, exhausted int }{}
+	now := time.Now()
 	for _, st := range p.cfg.Pool.List() {
 		lim := map[string]bool{}
 		for _, r := range st.RateLimitedModels {
@@ -480,7 +556,10 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 			k := st.Realm + ":" + bare
 			s := qstat[k]
 			s.accounts++
-			if lim[bare] || (v.QuotaReqs > 0 && v.Reqs >= v.QuotaReqs) {
+			// 已耗尽 = 6004 限流中，或已达实测额度且上游重置墙钟未到
+			//（重置后额度窗口已更新，不能再算耗尽）。
+			quotaActive := v.QuotaReqs > 0 && (v.QuotaResetAt.IsZero() || now.Before(v.QuotaResetAt))
+			if lim[bare] || (quotaActive && v.Reqs >= v.QuotaReqs) {
 				s.exhausted++
 			}
 			qstat[k] = s
@@ -543,17 +622,10 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 		}
 		// 今日额度状态（跨账号聚合）：仅免费模型标注——「N 个号在用 / M 个已耗尽」。
 		// 非免费模型没有"额度"语义（按量计费），标了反而误导。
-		// 免费判定三源（任一为真）：①目录声明 credits=x0 ②成本账本实测 per1k<=0
-		// ③modelmeta 实测 samples>0 且 credit<=0 ——③必须有：真免费模型因
-		// NoteModelCost 只记 credit>0 而永远进不了②的账本（hy4-preview-f 就这样）。
-		measuredFree := v.Samples > 0 && v.Credit <= 0
-		ledgerFree := func() bool {
-			if r, ok := ledger[k]; ok {
-				return r.Per1k <= 0
-			}
-			return false
-		}()
-		if qs, ok := qstat[k]; ok && (m["free_declared"] == true || measuredFree || ledgerFree) {
+		// 免费判定与账号列表同源（freeModels：目录声明 ∪ 真实流量实扣 0）。
+		// **不用** modelmeta 的 credit<=0 当免费——探针缺 usage.credit 时零值
+		// 会把收费模型误标（gpt-5.6-sol/terra/primary-model/hunyuan 实测踩中）。
+		if qs, ok := qstat[k]; ok && p.freeModels()[k] {
 			m["quota_today"] = map[string]any{"accounts": qs.accounts, "exhausted": qs.exhausted}
 		}
 		// 成本账本：实测单价与免费判定。面板据此标「免费」徽标，
