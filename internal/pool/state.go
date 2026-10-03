@@ -250,6 +250,9 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	if delta.Model != "" {
 		usage.LastModel = delta.Model
 	}
+	// 当日按模型记量（6004 触发瞬间快照即实测额度）。每次**上游尝试**都算一次
+	// ——失败尝试同样消耗上游侧的限流计数，漏记会让实测额度偏大。
+	e.noteModelDayLocked(delta.Model, delta, time.Now())
 	known := false
 	if delta.HasPromptTokens && delta.PromptTokens >= 0 {
 		usage.PromptTokens += delta.PromptTokens
@@ -526,6 +529,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	}
 	// 出口信息（账号代理实测快照）由调用方在**锁外**填充（见 Status/List）：
 	// 这里处于持锁路径，egress provider 会回调 pool 造成递归 RLock 死锁。
+	// 每模型当日用量与实测额度（6004 快照）：账号列表标注「已用/额度」用。
+	st.ModelDay = e.modelDayStatusLocked(now)
 	return st
 }
 

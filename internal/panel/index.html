@@ -161,7 +161,9 @@ body {
 .topbar .sep { color: var(--ink-3); }
 .topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
 .topbar .grow { flex: 1; }
-.view { padding: 22px 24px 60px; max-width: 1180px; width: 100%; }
+/* 内容框宽度 90%：表格列多（账号池 11 列），1180px 上限会把列挤到换行。 */
+.view { padding: 22px 24px 60px; max-width: none; width: 90%; }
+@media (max-width: 900px) { .view { width: 100%; } }
 .view[hidden] { display: none; }
 
 /* ── 控件 ─────────────────────────────────────────────────────────── */
@@ -337,6 +339,14 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .cred { min-width: 84px; }
 .cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
 .cred .n .of { color: var(--ink-3); font-size: 11px; }
+/* 额度/报错列：免费模型当日用量 vs 实测额度（6004 快照）+ 限流倒计时 + 近期报错。
+   实测额度来自"撞线瞬间快照"，没观测到之前只显示已用（分母未知不编造）。 */
+.qcell { font-size: 12px; line-height: 1.75; white-space: nowrap; }
+.qcell .q-chips { display: flex; flex-wrap: wrap; gap: 3px; max-width: 240px; }
+.qcell .q-none { color: var(--ink-3); }
+.q-chip { display: inline-block; font-size: 11px; line-height: 1; padding: 3px 7px; border-radius: 5px; font-weight: 550; cursor: default; }
+.q-ok { background: var(--ok-soft); color: var(--ok); }
+.q-bad { background: var(--bad-soft); color: var(--bad); }
 .bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 5px; overflow: hidden; max-width: 88px; }
 .bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
 .tag {
@@ -699,7 +709,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
             <th>账号</th><th>状态</th><th>出口 IP</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
+            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>额度 / 报错</th><th>最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>

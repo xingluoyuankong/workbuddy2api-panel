@@ -232,10 +232,58 @@ function egressCell(eg) {
     '</td>';
 }
 
+/* ── 账号列表：额度 / 报错列 ─────────────────────────────────────
+ *
+ * 额度的来源必须说清楚：上游**没有**"查询模型调用额度"的接口，6004 限流文案
+ * 也只带重置墙钟、不带限额数字。所以额度只能被动观测——网关平时记每模型当日
+ * 用量，6004 撞线瞬间快照下来就是实测额度。没撞过线的模型只显示已用次数，
+ * 分母未知就不显示分母（编一个数字比不显示危害大）。
+ * 免费判定复用成本台账（实测单价<=0）；报错计数由后端从日志环 err 行按 uid 归账。
+ */
+function shortModel(m) {
+  return m && m.length > 16 ? m.slice(0, 15) + '…' : (m || '—');
+}
+function quotaCell(s) {
+  const day = s.model_day || {};
+  const names = Object.keys(day);
+  if (!names.length && !(s.err_recent > 0)) {
+    return '<td class="qcell"><span class="q-none">—</span></td>';
+  }
+  const bits = [];
+  if (names.length) {
+    // 每个免费模型一枚 chip：√=今日还有额度（绿），×=今日已耗尽/限流中（红）。
+    // 数字只进 tooltip，不占版面——账号列表要的是"哪个号还能不能用"，不是报表。
+    const chips = names.map(m => {
+      const v = day[m];
+      const bare = m.indexOf(':') >= 0 ? m.slice(m.indexOf(':') + 1) : m;
+      const nm = esc(shortModel(bare));
+      const exhausted = v.limited || (v.quota_reqs > 0 && v.reqs >= v.quota_reqs);
+      let tip = nm + '：今日已用 ' + v.reqs + ' 次 / ' + (v.tokens || 0) + ' tok';
+      tip += v.quota_reqs > 0
+        ? '｜实测额度 ≈ ' + v.quota_reqs + ' 次 / ' + v.quota_tokens + ' tok（观测 ' + v.quota_samples + ' 次）'
+        : '｜额度未知（该模型今日尚未触发过 6004，无法观测）';
+      if (v.limited) {
+        tip += '｜【限流中】' + (v.reason || '') +
+          (v.until ? ' · 重置于 ' + new Date(v.until).toLocaleTimeString('zh-CN', { hour12: false }) : '');
+      }
+      return {
+        exhausted,
+        html: '<span class="q-chip ' + (exhausted ? 'q-bad' : 'q-ok') + '" title="' + esc(tip) + '">' +
+          (exhausted ? '×' : '√') + ' ' + nm + '</span>'
+      };
+    }).sort((a, b) => (b.exhausted ? 1 : 0) - (a.exhausted ? 1 : 0));
+    bits.push('<div class="q-chips">' + chips.map(c => c.html).join('') + '</div>');
+  }
+  if (s.err_recent > 0) {
+    bits.push('<span class="tag bad" title="日志环内该账号的报错行数（err 级别）">报错 ' + s.err_recent + '</span>');
+  }
+  return '<td class="qcell">' + bits.join(' ') + '</td>';
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="11"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -290,6 +338,7 @@ function renderAccounts(list) {
         '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
+      quotaCell(s) +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
@@ -737,6 +786,18 @@ function mmCard(m) {
       (m.last_error ? '⚠ ' + esc((m.last_error.code || '') + ' ' + (m.last_error.message || '').slice(0, 160)) : esc(note)) + '</div>'
     : '';
 
+/* mmQuotaToday 模型卡「今日额度」行：跨账号聚合（后端只对免费模型下发）。
+   额度语义只对免费模型成立——按量计费的模型谈"额度"是误导。 */
+function mmQuotaToday(m) {
+  const q = m.quota_today;
+  if (!q || !q.accounts) return '';
+  const exhausted = q.exhausted || 0;
+  return '<div class="mm-kv"><span class="lb">今日额度</span><span' +
+    (exhausted ? ' style="color:var(--bad)"' : '') + '>' +
+    q.accounts + ' 个号在用' + (exhausted ? ' · ' + exhausted + ' 已耗尽' : ' · 全部有余') +
+    '</span></div>';
+}
+
   return '<div class="mm-card' + (free ? ' free' : '') + (m.removed ? ' gone' : '') + '" data-key="' + esc(key) + '">' +
     '<div class="mm-card-hd">' +
       '<input type="checkbox" class="mm-pick-one" value="' + esc(key) + '" />' +
@@ -754,6 +815,7 @@ function mmCard(m) {
       '<div class="mm-kv"><span class="lb">真实映射名</span>' + mmCopy(m.upstream_model, '真实映射名') + '</div>' +
       '<div class="mm-kv"><span class="lb">调用名</span>' + mmCopy(key, '调用名') + '</div>' +
       '<div class="mm-kv"><span class="lb">消耗</span><span' + ledgerTip + '>' + credit + '</span></div>' +
+      mmQuotaToday(m) +
       '<div class="mm-kv"><span class="lb">倍率</span><span>' +
         (m.credits ? esc(m.credits) : '<span style="color:var(--ink-3)">—</span>') + '</span></div>' +
       '<div class="mm-kv"><span class="lb">上下文</span><span>' +
