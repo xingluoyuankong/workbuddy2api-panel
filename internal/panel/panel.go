@@ -163,13 +163,47 @@ func (p *Panel) freeModels() map[string]bool {
 		// 按"全期实扣 0"判会把当前真免费的它误杀。
 		snap := p.cfg.Usage.SnapshotWithCost(24*7, nil, nil)
 		for _, k := range snap.ByModel {
-			if k.CreditSamples >= 3 && k.Credits <= 0 {
+			// TotalTokens>=10 万 = "真实使用"门槛。每日模型探测（~6k token）同样
+			// 被上游以 0 扣费回报（cn:auto/balanced-model/hy4-preview 7 次探测全 0），
+			// 但同批探测里 global:hy4-preview 被扣 0.37、glm-5.3 被扣 0.49——说明
+			// 探测确实计费，0 只是这些**路由别名/变体**的计费形态，不代表免费。
+			// 没有这个门槛，free 列表会被 auto/balanced-model/hy3-b/hy3-c 一类
+			// 别名塞满（用户实测打回："大部分不是免费的，还有一部分重复的"）。
+			// 10 万 token ≈ 几十次真实对话，探测级（~6k）永远够不着。
+			if k.CreditSamples >= 3 && k.Credits <= 0 && k.TotalTokens >= 100_000 {
 				set[k.Key] = true
 			}
 		}
 	}
+	// 免费集变化告警：上游会动态调价（实测 2026-10-04 凌晨 cn:deepseek-v4.1-flash
+	// 被撤下 x0、hy3-b/hy3-c 新晋 x0，前后只差两小时）。这是运维必须知道的信号
+	// ——免费通道变了，选号偏好与"额度"标注全跟着变。仅在实际变化时打一条。
+	if p.freeCache != nil {
+		var added, removed []string
+		for k := range set {
+			if !p.freeCache[k] {
+				added = append(added, k)
+			}
+		}
+		for k := range p.freeCache {
+			if !set[k] {
+				removed = append(removed, k)
+			}
+		}
+		if len(added)+len(removed) > 0 {
+			sort.Strings(added)
+			sort.Strings(removed)
+			log.Printf("[panel] 免费模型集变化: +[%s] -[%s]", strings.Join(added, " "), strings.Join(removed, " "))
+		}
+	}
 	p.freeCache = set
 	p.freeAt = time.Now()
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	log.Printf("[panel][DEBUG] freeModels: %d 个 -> %v (catalog=%v usage=%v)", len(set), keys, p.cfg.ListModels != nil, p.cfg.Usage != nil)
 	return set
 }
 
