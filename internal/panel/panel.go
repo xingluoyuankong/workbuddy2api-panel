@@ -160,7 +160,7 @@ func New(cfg Config) *Panel {
 		subPool: cfg.SubPool,
 		mux:     http.NewServeMux(),
 		started: time.Now(),
-		logs:    NewRing(500),
+		logs:    NewRing(2000),
 		logins:  map[string]loginSession{},
 	}
 	p.routes()
@@ -303,8 +303,24 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
+// logsHandler 日志读取。支持服务端过滤（ch 频道 / lvl 级别 / q 子串 / limit 条数），
+// 并随响应返回全环统计 stats（报错徽标的数据源）。
+//
+// 为什么过滤放服务端：环容量提到 2000 后全量 JSON 每个轮询周期都发一遍太重；
+// 而且报错统计必须"始终统计全环"，在前端对已过滤子集做计数会得出
+// 「筛出 3 条 → 面板显示 3 个错误」的自欺数字。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
+	q := r.URL.Query()
+	opts := SnapshotOpts{
+		Channel: q.Get("ch"),
+		Level:   q.Get("lvl"),
+		Query:   q.Get("q"),
+	}
+	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 {
+		opts.Limit = n
+	}
+	entries, stats := p.logs.Filter(opts)
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "stats": stats})
 }
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：

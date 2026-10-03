@@ -1226,8 +1226,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <button class="xs chip" data-ch="chat">对话</button>
             <button class="xs chip" data-ch="sys">系统</button>
           </span>
-          <span class="note" id="logNote">最近 500 行</span>
+          <span class="chips" id="logLvlChips">
+            <button class="xs chip on" data-lvl="">全部级别</button>
+            <button class="xs chip" data-lvl="err" id="chipLogErr" title="只看错误行（ERR:/SECURITY:/5xx/失败…）">错误</button>
+            <button class="xs chip" data-lvl="warn" id="chipLogWarn" title="只看警告行（冷却/熔断/降权/4xx…）">警告</button>
+          </span>
+          <input id="logSearch" placeholder="搜索日志…" autocomplete="off" spellcheck="false"
+                 style="width:150px;padding:3.5px 9px;font-size:12.5px;border:1px solid var(--line);border-radius:6px;background:var(--surface-2);color:var(--ink)">
+          <span class="note" id="logNote">—</span>
           <button class="xs" id="btnLogPin">自动滚动：开</button>
+          <button class="xs" id="btnLogPause" title="停止自动拉取（排查时防止日志滚动）">暂停</button>
+          <button class="xs" id="btnLogCopy" title="复制当前显示的日志">复制</button>
+          <button class="xs" id="btnLogDl" title="导出当前筛选条件下的日志为 .log 文件">下载</button>
         </header>
         <pre id="logBox"></pre>
       </div>

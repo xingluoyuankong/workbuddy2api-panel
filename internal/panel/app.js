@@ -1044,7 +1044,7 @@ on('mmOnlyVerified', 'change', async ev => {
 });
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
-let logCh = 'all';
+let logCh = 'all', logLvl = '', logQuery = '', logPaused = false, logSearchTimer = null;
 on('logChips', 'click', ev => {
   const b = ev.target.closest('button[data-ch]');
   if (!b) return;
@@ -1052,33 +1052,109 @@ on('logChips', 'click', ev => {
   document.querySelectorAll('#logChips .chip').forEach(c => c.classList.toggle('on', c === b));
   loadLogs();
 });
+on('logLvlChips', 'click', ev => {
+  const b = ev.target.closest('button[data-lvl]');
+  if (!b) return;
+  logLvl = b.dataset.lvl;
+  document.querySelectorAll('#logLvlChips .chip').forEach(c => c.classList.toggle('on', c === b));
+  loadLogs();
+});
+el('logSearch').addEventListener('input', () => {
+  // 防抖：搜索是打字密集操作，每键一次请求会把 5s 轮询挤爆
+  clearTimeout(logSearchTimer);
+  logSearchTimer = setTimeout(() => { logQuery = el('logSearch').value.trim(); loadLogs(); }, 300);
+});
+
+// loadLogs 过滤（ch 频道 / lvl 级别 / q 子串）已全部下沉到服务端——环容量 2000
+// 后全量 JSON 每个轮询周期都发一遍太重。stats 始终统计**全环**（服务端保证），
+// 所以「错误 N」徽标反映的是环内真实报错存量，与当前筛选无关。
 async function loadLogs() {
+  if (logPaused) return;
   const box = $('logBox');
+  if (!box) return;
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
   try {
-    const d = await api('logs');
-    const all = d.entries || [];
-    if (!shouldRender('logs_' + logCh, all)) return; // 无新日志：跳过重绘
-    const entries = all.filter(e => logCh === 'all' || e.ch === logCh).slice(-300); // 可视上限
+    const p = new URLSearchParams();
+    if (logCh !== 'all') p.set('ch', logCh);
+    if (logLvl) p.set('lvl', logLvl);
+    if (logQuery) p.set('q', logQuery);
+    p.set('limit', '500');
+    const d = await api('logs' + (p.toString() ? '?' + p.toString() : ''));
+    if (!shouldRender('logs', d)) return;
+    const entries = d.entries || [];
+    // 级别由服务端入环时定级（含 chat 表格行的状态码列：5xx=err / 4xx=warn），
+    // 前端不再用 `error|失败|错误` 正则现判——那会漏掉 503 行、误伤含这些词的正常行。
+    const lvlCls = { err: ' e', warn: ' w' };
     box.innerHTML = entries.length
       ? entries.map(e => {
-        const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
         const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
         const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
-        return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
+        return '<span class="ln' + (lvlCls[e.lvl] || '') + '">' + ch + esc(t + ' ' + e.text) + '</span>';
       }).join('')
-      : '<span style="color:var(--ink-3)">暂无日志</span>';
+      : '<span style="color:var(--ink-3)">暂无日志' + (logQuery ? '（无匹配 "' + esc(logQuery) + '"）' : '') + '</span>';
     if (logPin && atEnd) box.scrollTop = box.scrollHeight;
-    const counts = {};
-    for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
-    $('logNote').textContent = logCh === 'all'
-      ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
-      : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
+    renderLogStats(d.stats || {}, entries.length);
   } catch (e) { /* 概览已提示 */ }
 }
+
+// renderLogStats 头部状态行 + 错误/警告 chip 上的存量徽标。
+function renderLogStats(st, shown) {
+  const byCh = st.by_channel || {}, byLvl = st.by_level || {};
+  const parts = ['环 ' + (st.total || 0) + '/' + (st.cap || 0)];
+  if (logCh === 'all') {
+    parts.push('任务 ' + (byCh.task || 0), '对话 ' + (byCh.chat || 0), '系统 ' + (byCh.sys || 0));
+  } else {
+    parts.push('显示 ' + shown + ' 行');
+  }
+  const le = st.last_error;
+  if (le) {
+    const s = Math.max(0, Math.round((Date.now() - new Date(le.ts).getTime()) / 1000));
+    parts.push('最近错误 ' + (s < 60 ? s + 's 前' : Math.round(s / 60) + 'm 前'));
+  }
+  $('logNote').textContent = parts.join(' · ');
+  const ec = byLvl.err || 0, wc = byLvl.warn || 0;
+  $('chipLogErr').textContent = '错误' + (ec ? ' ' + ec : '');
+  $('chipLogWarn').textContent = '警告' + (wc ? ' ' + wc : '');
+  $('chipLogErr').style.color = ec ? 'var(--bad)' : '';
+  $('chipLogWarn').style.color = wc ? 'var(--warn)' : '';
+}
+
 el('btnLogPin').onclick = () => {
   logPin = !logPin;
   $('btnLogPin').textContent = '自动滚动：' + (logPin ? '开' : '关');
+};
+el('btnLogPause').onclick = () => {
+  logPaused = !logPaused;
+  $('btnLogPause').textContent = logPaused ? '继续' : '暂停';
+  if (!logPaused) loadLogs();
+};
+el('btnLogCopy').onclick = async () => {
+  const lines = Array.from(document.querySelectorAll('#logBox .ln')).map(x => x.textContent);
+  try {
+    await navigator.clipboard.writeText(lines.join('\n'));
+    $('btnLogCopy').textContent = '已复制';
+    setTimeout(() => { $('btnLogCopy').textContent = '复制'; }, 1200);
+  } catch (e) { alert('复制失败：' + e.message); }
+};
+el('btnLogDl').onclick = async () => {
+  // 导出按当前筛选条件重新拉一次（不带 limit = 全环），而不是只导屏幕上那 500 行
+  try {
+    const p = new URLSearchParams();
+    if (logCh !== 'all') p.set('ch', logCh);
+    if (logLvl) p.set('lvl', logLvl);
+    if (logQuery) p.set('q', logQuery);
+    const d = await api('logs' + (p.toString() ? '?' + p.toString() : ''));
+    const lines = (d.entries || []).map(e => {
+      const t = e.ts ? new Date(e.ts).toLocaleString('zh-CN', { hour12: false }) : '';
+      return '[' + e.lvl + '][' + e.ch + '] ' + t + ' ' + e.text;
+    });
+    const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'wb2api-logs-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.log';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  } catch (e) { alert('导出失败：' + e.message); }
 };
 
 /* ── 配置 ─────────────────────────────────────────────────────────── */
