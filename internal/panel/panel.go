@@ -147,12 +147,37 @@ func (p *Panel) freeModels() map[string]bool {
 		return p.freeCache
 	}
 	set := map[string]bool{}
-	if p.cfg.ListModels != nil {
-		for _, e := range p.cfg.ListModels() {
-			full, _ := e["id"].(string)
-			raw, _ := e["credits"].(string)
-			if full != "" && creditsIsZero(raw) {
-				set[full] = true // full = "cn:xxx" 全调用名，与 usage 键同形
+	// ① 当天 0 点价快照（modelmeta 落库）：**全天稳定**，不随目录双源竞速抖动。
+	//    当天还没有快照（部署后首次/服务刚启动）时，现场拉一次目录补采并冻结，
+	//    之后整天都用这一份；次日 0 点每日刷新重新捕获。
+	day := time.Now().Format("2006-01-02")
+	if p.cfg.ModelMeta != nil {
+		fresh := false
+		for _, v := range p.cfg.ModelMeta.All() {
+			if v.CatalogDay == day && v.CatalogCredits != "" {
+				fresh = true
+				break
+			}
+		}
+		if !fresh && p.cfg.ListModels != nil {
+			cat := map[string]string{}
+			for _, e := range p.cfg.ListModels() {
+				full, _ := e["id"].(string)
+				raw, _ := e["credits"].(string)
+				if full != "" && raw != "" {
+					cat[full] = raw
+				}
+			}
+			if len(cat) > 0 {
+				p.cfg.ModelMeta.CaptureCatalog(day, cat)
+				fresh = true
+			}
+		}
+		if fresh {
+			for _, v := range p.cfg.ModelMeta.All() {
+				if v.CatalogDay == day && v.CatalogCredits != "" && creditsIsZero(v.CatalogCredits) {
+					set[v.Realm+":"+v.ID] = true
+				}
 			}
 		}
 	}

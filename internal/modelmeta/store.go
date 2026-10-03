@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -40,6 +41,13 @@ type Record struct {
 	LatencyMS int64   `json:"latency_ms,omitempty"` // 实测耗时
 	Samples   int     `json:"samples,omitempty"`    // 实测成功次数
 	UpdatedAt string  `json:"updated_at,omitempty"`
+
+	// CatalogCredits/CatalogDay 当日目录价快照：0 点每日刷新（或当天首次目录
+	// 拉取）时从上游目录捕获的 credits 倍率原文。**当天内不变**——上游目录
+	// 双源竞速、两次拉取结果可能不一致，面板免费判定必须以当天 0 点冻结价
+	// 为准，否则免费清单会在一天内反复翻转。
+	CatalogCredits string `json:"catalog_credits,omitempty"`
+	CatalogDay     string `json:"catalog_day,omitempty"`
 }
 
 // View 合并 Fact 与 Record 后的对外视图（面板与 /v1/models 消费）。
@@ -50,7 +58,7 @@ type View struct {
 	FullID        string   `json:"full_id"` // "cn:deep-model" 形式（下游调用名）
 	Display       string   `json:"display"`
 	UpstreamModel string   `json:"upstream_model,omitempty"` // 真实映射名
-	CallName      string   `json:"call_name"`                 // 实际调用名（= FullID）
+	CallName      string   `json:"call_name"`                // 实际调用名（= FullID）
 	IsAlias       bool     `json:"is_alias"`
 	Status        Status   `json:"status"`
 	Verified      bool     `json:"verified"`
@@ -61,13 +69,38 @@ type View struct {
 	Removed       bool     `json:"removed,omitempty"`
 	RemovedReason string   `json:"removed_reason,omitempty"`
 	// ContextWindow 手动指定的上下文窗口档位（0 = 跟随上游目录值）。
-	ContextWindow int64   `json:"context_window,omitempty"`
-	ErrCode       string   `json:"err_code,omitempty"`
-	ErrMsg        string   `json:"err_msg,omitempty"`
-	Credit        float64  `json:"credit,omitempty"`
-	LatencyMS     int64    `json:"latency_ms,omitempty"`
-	Samples       int      `json:"samples,omitempty"`
-	UpdatedAt     string   `json:"updated_at,omitempty"`
+	ContextWindow  int64   `json:"context_window,omitempty"`
+	ErrCode        string  `json:"err_code,omitempty"`
+	ErrMsg         string  `json:"err_msg,omitempty"`
+	Credit         float64 `json:"credit,omitempty"`
+	LatencyMS      int64   `json:"latency_ms,omitempty"`
+	Samples        int     `json:"samples,omitempty"`
+	UpdatedAt      string  `json:"updated_at,omitempty"`
+	CatalogCredits string  `json:"catalog_credits,omitempty"`
+	CatalogDay     string  `json:"catalog_day,omitempty"`
+}
+
+// CaptureCatalog 把目录价快照（credits 倍率原文）按 (realm, 模型) 批量落库。
+// entries 的键为全调用名（"cn:deepseek-v4.1-flash"）。0 点每日刷新与面板
+// 当天首次目录拉取都会调用；同键重复捕获直接覆盖（价格以最近一次拉取为准）。
+// 一次加锁、至多一次落盘。返回写入条数。
+func (s *Store) CaptureCatalog(day string, entries map[string]string) int {
+	s.mu.Lock()
+	for full, credits := range entries {
+		i := strings.Index(full, ":")
+		if i <= 0 || i == len(full)-1 || credits == "" {
+			continue
+		}
+		r := s.ensureLocked(full[:i], full[i+1:])
+		r.CatalogCredits = credits
+		r.CatalogDay = day
+	}
+	n := len(entries)
+	s.mu.Unlock()
+	if n > 0 {
+		s.save()
+	}
+	return n
 }
 
 // Store 模型元数据仓库（JSON 持久化 + 读写锁）。
@@ -206,6 +239,8 @@ func (s *Store) annotateLocked(realm, id, upstreamName string) View {
 		v.LatencyMS = rec.LatencyMS
 		v.Samples = rec.Samples
 		v.UpdatedAt = rec.UpdatedAt
+		v.CatalogCredits = rec.CatalogCredits
+		v.CatalogDay = rec.CatalogDay
 	} else if hasFact && v.UpstreamModel == "" {
 		v.UpstreamModel = fact.Upstream
 	}

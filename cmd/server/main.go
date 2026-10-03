@@ -2,7 +2,6 @@
 package main
 
 import (
-	"sync"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -18,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -176,14 +176,14 @@ func main() {
 			apFile = stateSibling(cfg.StateFile, "proxy.json")
 		}
 		ap := upstream.NewAccountProxy(upstream.AccountProxyOptions{
-			File:          apFile,
-			StateFile:     stateSibling(cfg.StateFile, "proxy_state.json"),
-			CheckInterval: cfg.AccountProxyCheckInterval,
-			ProbeTimeout:  cfg.AccountProxyProbeTimeout,
-			Quorum:        cfg.AccountProxy.Quorum,
-			OnMismatch:    cfg.AccountProxy.OnMismatch,
-			LockFirstIP:   cfg.AccountProxy.LockFirstIP,
-			MaxPerIP:      cfg.AccountProxy.MaxPerIP,
+			File:           apFile,
+			StateFile:      stateSibling(cfg.StateFile, "proxy_state.json"),
+			CheckInterval:  cfg.AccountProxyCheckInterval,
+			ProbeTimeout:   cfg.AccountProxyProbeTimeout,
+			Quorum:         cfg.AccountProxy.Quorum,
+			OnMismatch:     cfg.AccountProxy.OnMismatch,
+			LockFirstIP:    cfg.AccountProxy.LockFirstIP,
+			MaxPerIP:       cfg.AccountProxy.MaxPerIP,
 			MaxPerIPAction: cfg.AccountProxy.MaxPerIPAction,
 			MinInterval:    cfg.AccountProxyMinInterval,
 		})
@@ -423,7 +423,7 @@ func main() {
 		// 粘性会话路由器：面板「重置/清理粘性会话」用（未启用时 nil，接口返回 501）。
 		Session: sessRouter,
 		Version: appVersion,
-		Live:        live,
+		Live:    live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -650,7 +650,21 @@ func runDailyModelRefresh(ctx context.Context, h *server.Handler, store *modelme
 
 		// 1) 目录缓存失效并立即重拉：拿最新 credits 倍率与上下架状态。
 		h.InvalidateModelCache()
-		h.ModelList()
+		catalog := h.ModelList()
+		// 0 点价快照落库：把当天目录倍率按 (realm, 模型) 写进 modelmeta 冻结，
+		// 全天稳定使用。上游目录双源竞速、两次拉取结果可能不一致，不冻结的话
+		// 面板免费清单会在一天内反复翻转（实测 2026-10-04 凌晨两次拉取结果不同）。
+		cat := make(map[string]string, len(catalog))
+		for _, e := range catalog {
+			full, _ := e["id"].(string)
+			credits, _ := e["credits"].(string)
+			if full != "" && credits != "" {
+				cat[full] = credits
+			}
+		}
+		if n := store.CaptureCatalog(time.Now().Format("2006-01-02"), cat); n > 0 {
+			log.Printf("[models] 0 点价快照已落库: %d 个模型", n)
+		}
 
 		// 2) 实测消耗刷新：只跑在册且未删除的模型。
 		refs := make([]modelmeta.ModelRef, 0, 128)
