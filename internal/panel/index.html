@@ -161,9 +161,10 @@ body {
 .topbar .sep { color: var(--ink-3); }
 .topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
 .topbar .grow { flex: 1; }
-/* 内容框宽度 90%：表格列多（账号池 11 列），1180px 上限会把列挤到换行。 */
-.view { padding: 22px 24px 60px; max-width: none; width: 90%; }
-@media (max-width: 900px) { .view { width: 100%; } }
+/* 内容框宽度：去掉 1180px 上限，撑满主区（100%）。此前用户要"拉长到 90%"，
+   但窄窗口下 90% 反而比 100% 更窄（主区本身只剩几百 px）——"要宽"的本质是
+   去掉上限，而不是按比例缩。窄屏不需要特殊处理，100% 本来就是满宽。 */
+.view { padding: 22px 24px 60px; max-width: none; width: 100%; }
 .view[hidden] { display: none; }
 
 /* ── 控件 ─────────────────────────────────────────────────────────── */
@@ -240,8 +241,9 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* ── 账号表（签名元素：健康色条 + 积分量条）───────────────────────── */
 .tbl-wrap { overflow-x: auto; }
 .acc { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 640px; }
-/* 账号表 10 列（v1.10 起含出口 IP 列）：给足宽度避免表头互相挤压。 */
-.acc:not(.md):not(.us):not(.mm) { min-width: 880px; }
+/* 账号表 9 列（在途并入状态、最近成功并入账号单元格）：min-width 压到 720，
+   窄窗口下不再出现横向滚动；列内内容允许换行兜底。 */
+.acc:not(.md):not(.us):not(.mm) { min-width: 720px; }
 .acc th {
   text-align: left; font-weight: 500; font-size: 11.5px; color: var(--ink-3);
   padding: 9px 11px; border-bottom: 1px solid var(--line); white-space: nowrap;
@@ -709,7 +711,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
             <th>账号</th><th>状态</th><th>出口 IP</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>额度 / 报错</th><th>最近成功</th><th class="c-acts"></th>
+            <th>成功 / 失败</th><th>用量</th><th>额度 / 报错</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>

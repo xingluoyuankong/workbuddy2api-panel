@@ -224,6 +224,10 @@ type modelQuotaObs struct {
 	Tokens     int64     // 6004 触发时的当日 token 数 ≈ token 额度
 	Samples    int       // 累计观测次数（跨天累计，越多越可信）
 	ObservedAt time.Time // 最近一次观测时刻
+	// ResetAt 上游声明的额度重置墙钟（6004 文案解析值）。**耗尽状态的解除依据**：
+	// 重置时间一过，额度窗口已更新，"已耗尽"不再成立——否则冷却到期后账号列表
+	// 会一直挂着 ×，直到本地次日才消失（与上游实际恢复时刻脱节）。
+	ResetAt time.Time
 }
 
 // ModelDayStatus 面板透出的 (账号, 模型) 当日用量与实测额度。
@@ -238,6 +242,9 @@ type ModelDayStatus struct {
 	QuotaTokens  int64     `json:"quota_tokens,omitempty"`
 	QuotaSamples int       `json:"quota_samples,omitempty"`
 	QuotaAt      time.Time `json:"quota_at,omitempty"`
+	// QuotaResetAt 上游声明的额度重置墙钟。前端判"已耗尽"须同时满足
+	// reqs>=quota 且 now < QuotaResetAt（重置后额度窗口已更新）。
+	QuotaResetAt time.Time `json:"quota_reset_at,omitempty"`
 	// Limited 该模型当前是否正处于 6004 限流期（含 Until/ResetAt 倒计时）。
 	Limited bool      `json:"limited,omitempty"`
 	Until   time.Time `json:"until,omitempty"`
@@ -355,7 +362,7 @@ func (e *entry) noteModelDayLocked(model string, delta TokenUsageDelta, now time
 // snapshotModelQuotaLocked 6004 触发瞬间把该模型当日用量定格为实测额度
 // （调用方必须已持 p.mu）。同一天内重复触发只更新时间戳（额度没变）；
 // 跨天观测 Samples 累计。
-func (e *entry) snapshotModelQuotaLocked(model string, now time.Time) {
+func (e *entry) snapshotModelQuotaLocked(model string, now, resetAt time.Time) {
 	if model == "" {
 		return
 	}
@@ -374,7 +381,7 @@ func (e *entry) snapshotModelQuotaLocked(model string, now time.Time) {
 		q.Day = today
 		q.Samples++ // 跨天再观测：样本 +1
 	}
-	q.Reqs, q.Tokens, q.ObservedAt = reqs, toks, now
+	q.Reqs, q.Tokens, q.ObservedAt, q.ResetAt = reqs, toks, now, resetAt
 	if e.modelQuota == nil {
 		e.modelQuota = map[string]modelQuotaObs{}
 	}
@@ -401,7 +408,8 @@ func (e *entry) modelDayStatusLocked(now time.Time) map[string]ModelDayStatus {
 			continue
 		}
 		v := out[m]
-		v.QuotaReqs, v.QuotaTokens, v.QuotaSamples, v.QuotaAt = q.Reqs, q.Tokens, q.Samples, q.ObservedAt
+		v.QuotaReqs, v.QuotaTokens, v.QuotaSamples = q.Reqs, q.Tokens, q.Samples
+		v.QuotaAt, v.QuotaResetAt = q.ObservedAt, q.ResetAt
 		out[m] = v
 	}
 	for m, mc := range e.modelCooldowns {
@@ -636,6 +644,7 @@ type stateModelQuota struct {
 	Tokens     int64     `json:"tokens"`
 	Samples    int       `json:"samples,omitempty"`
 	ObservedAt time.Time `json:"observed_at"`
+	ResetAt    time.Time `json:"reset_at,omitempty"`
 }
 
 // stateFile 持久化格式。

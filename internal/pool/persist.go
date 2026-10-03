@@ -194,7 +194,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			if e.modelQuota == nil {
 				e.modelQuota = map[string]modelQuotaObs{}
 			}
-			e.modelQuota[m] = modelQuotaObs{Day: q.Day, Reqs: q.Reqs, Tokens: q.Tokens, Samples: q.Samples, ObservedAt: q.ObservedAt}
+			e.modelQuota[m] = modelQuotaObs{Day: q.Day, Reqs: q.Reqs, Tokens: q.Tokens, Samples: q.Samples, ObservedAt: q.ObservedAt, ResetAt: q.ResetAt}
 		}
 		p.byUID[uid] = e
 	}
@@ -331,7 +331,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			if s.ModelQuotas == nil {
 				s.ModelQuotas = map[string]stateModelQuota{}
 			}
-			s.ModelQuotas[m] = stateModelQuota{Day: q.Day, Reqs: q.Reqs, Tokens: q.Tokens, Samples: q.Samples, ObservedAt: q.ObservedAt}
+			s.ModelQuotas[m] = stateModelQuota{Day: q.Day, Reqs: q.Reqs, Tokens: q.Tokens, Samples: q.Samples, ObservedAt: q.ObservedAt, ResetAt: q.ResetAt}
 		}
 		sf.Accounts[uid] = s
 	}

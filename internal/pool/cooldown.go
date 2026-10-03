@@ -80,7 +80,7 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 		now := time.Now()
 		// 6004 触发瞬间把该模型当日用量定格为实测额度（上游不带限额数字，
 		// 只能这样观测；见 modelQuotaObs）。放在最前：无论走哪个分支都算一次观测。
-		e.snapshotModelQuotaLocked(model, now)
+		e.snapshotModelQuotaLocked(model, now, resetAt)
 		if !resetAt.IsZero() {
 			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
 			if e.modelCooldowns == nil {
