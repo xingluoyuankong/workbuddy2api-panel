@@ -288,8 +288,15 @@ function quotaCell(s) {
     bits.push('<div class="q-chips">' + chips.map(c => c.html).join('') + '</div>');
   }
   if (s.err_recent > 0) {
+    // badge 自带上下文：最近一次报错的时间与原文，让数字不用点开日志就能定性
+    //（transport error=出口/代理问题、429=上游限流、SECURITY=劫持熔断……）。
+    let lastTip = '';
+    if (s.err_last_at) {
+      lastTip = '\n最近一次：' + new Date(s.err_last_at).toLocaleString('zh-CN', { hour12: false }) +
+        '\n' + String(s.err_last_text || '').slice(0, 180);
+    }
     bits.push('<span class="tag bad q-errlog" data-errlog="' + esc(s.uid.slice(0, 8)) +
-      '" title="日志环内该账号的报错行数（err 级别）。点击跳转日志页查看明细">报错 ' + s.err_recent + '</span>');
+      '" title="该账号在日志环内的报错行数（err 级别）。点击跳转日志页按此账号过滤查看全部明细' + esc(lastTip) + '">报错 ' + s.err_recent + '</span>');
   }
   return '<td class="qcell">' + bits.join(' ') + '</td>';
 }

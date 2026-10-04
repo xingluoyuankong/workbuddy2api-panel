@@ -406,11 +406,15 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 运维不用再去日志页翻，账号行上直接看到哪个号在持续报错。环 2000 行扫描
 	// 一次微秒级，5s 轮询可承受。
 	errByUID := map[string]int{}
+	errLast := map[string]LogEntry{}
 	if p.logs != nil {
 		errs, _ := p.logs.Filter(SnapshotOpts{Level: LvlErr})
 		for _, e := range errs {
 			if m := uidInLogRe.FindStringSubmatch(e.Text); m != nil {
 				errByUID[m[1]]++
+				if prev, ok := errLast[m[1]]; !ok || e.TS.After(prev.TS) {
+					errLast[m[1]] = e
+				}
 			}
 		}
 	}
@@ -468,7 +472,14 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		if len(fm) > 0 {
 			st.ModelDay = fm
 		}
-		rows[i] = accountRow{Status: st, ErrRecent: n}
+		row := accountRow{Status: st, ErrRecent: n}
+		if n > 0 {
+			if le, ok := errLast[strings.ToLower(st.UID[:8])]; ok {
+				row.ErrLastAt = le.TS.Format(time.RFC3339)
+				row.ErrLastText = le.Text
+			}
+		}
+		rows[i] = row
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
@@ -496,7 +507,9 @@ var uidInLogRe = regexp.MustCompile(`(?i)uid=([0-9a-f]{8})`)
 // 只是多了 err_recent —— 旧前端零回归。
 type accountRow struct {
 	pool.Status
-	ErrRecent int `json:"err_recent"`
+	ErrRecent   int    `json:"err_recent"`
+	ErrLastAt   string `json:"err_last_at,omitempty"`   // 环内最近一次报错时刻
+	ErrLastText string `json:"err_last_text,omitempty"` // 最近一次报错原文（badge tooltip）
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。

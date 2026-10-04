@@ -132,3 +132,26 @@ func TestModelQuotaPersistence(t *testing.T) {
 		t.Fatalf("昨日用量应被丢弃（日额度按日清零），got %d", v.Reqs)
 	}
 }
+
+// TestModelKeyNormalization 模型键归一化：下游可能用 "cn:xxx"（全调用名）或
+// 裸 "xxx" 两种形态请求同一模型——两种形态必须合并为同一份当日用量；而
+// 6004 冷却回调传的是裸名，快照必须能查到全名形态记下的用量。
+// 实测踩中：6004 触发 6 次、快照全空（按裸名查全名键的当日用量 → 查不到 → 0）。
+func TestModelKeyNormalization(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "uid-n"})
+	p.RecordTokenUsage("uid-n", TokenUsageDelta{Model: "cn:hy4-preview-f", HasTotalTokens: true, TotalTokens: 100})
+	p.RecordTokenUsage("uid-n", TokenUsageDelta{Model: "hy4-preview-f", HasTotalTokens: true, TotalTokens: 50})
+
+	st, _ := p.Status("uid-n")
+	if v := st.ModelDay["hy4-preview-f"]; v.Reqs != 2 || v.Tokens != 150 {
+		t.Fatalf("两种键形态应合并为一份当日用量（2 次/150 tok），got %+v all=%v", v, st.ModelDay)
+	}
+
+	// 6004 回调（裸名）→ 快照应捕获合并后的用量
+	p.CooldownSoftForModel("uid-n", time.Hour, time.Now().Add(time.Hour), "hy4-preview-f", "6004 model rate limit")
+	st, _ = p.Status("uid-n")
+	if v := st.ModelDay["hy4-preview-f"]; v.QuotaReqs != 2 || v.QuotaTokens != 150 {
+		t.Fatalf("6004 快照应捕获合并后的用量（2 次/150 tok），got %+v", v)
+	}
+}

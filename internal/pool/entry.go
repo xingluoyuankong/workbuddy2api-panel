@@ -2,6 +2,7 @@
 package pool
 
 import (
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -332,9 +333,23 @@ type entry struct {
 // dayLayout 本地日界的日期格式（modelDayUsage.Day / modelQuotaObs.Day）。
 const dayLayout = "2006-01-02"
 
+// bareModel 剥掉全调用名的 realm 前缀（"cn:hy4-preview-f" -> "hy4-preview-f"）。
+// 池内所有按模型记账（当日用量/额度快照/成本账本）统一用裸名——下游客户端可能
+// 用 "cn:xxx" 或裸 "xxx" 两种形态请求同一模型，不归一的话同一模型的当日用量会被
+// 拆成两份；而 6004 冷却回调传的是裸名（handler 的 bareModel），快照按裸名查
+// 当日用量会查不到 -> 额度永远记成 0（实测 2026-10-04 踩中：6004 触发 6 次、
+// 快照全空）。
+func bareModel(m string) string {
+	if i := strings.Index(m, ":"); i >= 0 {
+		return m[i+1:]
+	}
+	return m
+}
+
 // noteModelDayLocked 记一次 (账号, 模型) 的当日用量（调用方必须已持 p.mu）。
 // 跨日判定在此做：该模型上次记录的 Day 不是今天 → 清零重计。
 func (e *entry) noteModelDayLocked(model string, delta TokenUsageDelta, now time.Time) {
+	model = bareModel(model)
 	if model == "" {
 		return
 	}
@@ -363,6 +378,7 @@ func (e *entry) noteModelDayLocked(model string, delta TokenUsageDelta, now time
 // （调用方必须已持 p.mu）。同一天内重复触发只更新时间戳（额度没变）；
 // 跨天观测 Samples 累计。
 func (e *entry) snapshotModelQuotaLocked(model string, now, resetAt time.Time) {
+	model = bareModel(model)
 	if model == "" {
 		return
 	}
