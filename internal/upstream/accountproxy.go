@@ -43,14 +43,14 @@ import (
 type proxyState int
 
 const (
-	proxyStateUnchecked proxyState = iota // 还没校验过（启动后首次请求先放行）
-	proxyStateOK                          // 出口 == 声明 IP，代理确实生效
-	proxyStateUnreachable                 // 代理连不上 / 回显全挂
-	proxyStateNotEffective                // 出口 IP == 直连出口 IP：代理没生效
-	proxyStateRotating                    // 多源不一致：出口在轮换
-	proxyStateMismatch                    // 出口 != 声明 IP
-	proxyStateLeak                        // 检测到来源头泄漏（XFF 链）
-	proxyStateDisabled                    // 手动关闭 / 未配置
+	proxyStateUnchecked    proxyState = iota // 还没校验过（启动后首次请求先放行）
+	proxyStateOK                             // 出口 == 声明 IP，代理确实生效
+	proxyStateUnreachable                    // 代理连不上 / 回显全挂
+	proxyStateNotEffective                   // 出口 IP == 直连出口 IP：代理没生效
+	proxyStateRotating                       // 多源不一致：出口在轮换
+	proxyStateMismatch                       // 出口 != 声明 IP
+	proxyStateLeak                           // 检测到来源头泄漏（XFF 链）
+	proxyStateDisabled                       // 手动关闭 / 未配置
 )
 
 // String 状态的机读名（面板与日志消费，勿改字面量）。
@@ -141,7 +141,7 @@ type AccountProxyEntry struct {
 	// ExpectedIP 声明的出口 IP。空 = 首次实测后自动锁定（推荐填：住宅代理通常
 	// 每个端口对应一个固定 IP，填了才能立刻发现「出口不是它」）。
 	ExpectedIP string `json:"expected_ip,omitempty"`
-	Enabled bool `json:"enabled"`
+	Enabled    bool   `json:"enabled"`
 	// Auto 自动绑定标记：true = 由订阅池自动选择/换绑（当前链接失败或劫持时
 	// 自动切到池里下一条稳定链接）；false = 用户手动指定，永不自动改动。
 	Auto bool `json:"auto,omitempty"`
@@ -159,22 +159,22 @@ type accountProxyDoc struct {
 
 // proxyRuntime 单个账号的实测快照（写 data/proxy_state.json）。
 type proxyRuntime struct {
-	IP         string `json:"ip,omitempty"`
-	ExpectedIP string `json:"expected_ip,omitempty"`
-	DirectIP   string `json:"direct_ip,omitempty"`
-	Country    string `json:"country,omitempty"`
+	IP          string `json:"ip,omitempty"`
+	ExpectedIP  string `json:"expected_ip,omitempty"`
+	DirectIP    string `json:"direct_ip,omitempty"`
+	Country     string `json:"country,omitempty"`
 	CountryCode string `json:"country_code,omitempty"`
-	Timezone   string `json:"timezone,omitempty"`
-	ASN        string `json:"asn,omitempty"`
-	State      string `json:"state"`
-	Message    string `json:"message,omitempty"`
-	Leak       string `json:"leak,omitempty"`
-	LatencyMS  int64  `json:"latency_ms,omitempty"`
-	CheckedAt  int64  `json:"checked_at,omitempty"`
-	Fails      int    `json:"fails,omitempty"`
+	Timezone    string `json:"timezone,omitempty"`
+	ASN         string `json:"asn,omitempty"`
+	State       string `json:"state"`
+	Message     string `json:"message,omitempty"`
+	Leak        string `json:"leak,omitempty"`
+	LatencyMS   int64  `json:"latency_ms,omitempty"`
+	CheckedAt   int64  `json:"checked_at,omitempty"`
+	Fails       int    `json:"fails,omitempty"`
 	// CallIP 调用链路出口最近一次采样（SampleLoop；轮换池会随时间变化）。
-	CallIP     string `json:"call_ip,omitempty"`
-	CallAt     int64  `json:"call_at,omitempty"`
+	CallIP string `json:"call_ip,omitempty"`
+	CallAt int64  `json:"call_at,omitempty"`
 }
 
 // AccountProxyStatus 面板 / 日志消费的一个账号代理状态。
@@ -188,21 +188,21 @@ type AccountProxyStatus struct {
 	Label     string `json:"label,omitempty"`
 	Note      string `json:"note,omitempty"`
 
-	ExpectedIP string `json:"expected_ip,omitempty"`
-	ActualIP   string `json:"actual_ip,omitempty"`
-	DirectIP   string `json:"direct_ip,omitempty"`
-	Country    string `json:"country,omitempty"`
+	ExpectedIP  string `json:"expected_ip,omitempty"`
+	ActualIP    string `json:"actual_ip,omitempty"`
+	DirectIP    string `json:"direct_ip,omitempty"`
+	Country     string `json:"country,omitempty"`
 	CountryCode string `json:"country_code,omitempty"`
-	Timezone   string `json:"timezone,omitempty"`
-	ASN        string `json:"asn,omitempty"`
+	Timezone    string `json:"timezone,omitempty"`
+	ASN         string `json:"asn,omitempty"`
 
 	// Effective 代理确实改变了出口（出口 != 本机直连出口）。
 	Effective bool `json:"effective"`
 	// Match 实测出口 == 声明/锁定 IP。
-	Match  bool   `json:"match"`
-	State  string `json:"state"`
+	Match   bool   `json:"match"`
+	State   string `json:"state"`
 	Message string `json:"message,omitempty"`
-	Leak   string `json:"leak,omitempty"`
+	Leak    string `json:"leak,omitempty"`
 
 	LatencyMS int64 `json:"latency_ms"`
 	CheckedAt int64 `json:"checked_at"`
@@ -235,9 +235,12 @@ type accountBinding struct {
 	spec  *AccountProxyEntry
 	entry *proxyEntry // 复用既有出口统计结构（fails/deadUntil + client 对）
 
-	state   atomic.Int32
-	msg     atomicString
-	probeIP atomicString
+	// rateLimitHits 每账号 429 连续计数（见 NoteRateLimit）。
+	rateLimitHits map[string]*rateLimitHit
+
+	state    atomic.Int32
+	msg      atomicString
+	probeIP  atomicString
 	directIP atomicString
 	// lockedIP 固定模式下锁定的出口 IP；rotate 模式下为最近一次实测值。
 	lockedIP atomicString
@@ -275,6 +278,9 @@ type AccountProxy struct {
 	// client 出站 Client 引用（订阅池所在；SetClient 注入）。
 	// 自动绑定/换绑用它查池里最稳定的条目（Client.BestProxyFor）。
 	client *Client
+	// rateLimitHits 每账号 429 连续计数（见 NoteRateLimit）：429 是请求级限流，
+	// 探活照样通过，所以必须单独记账才能触发换绑。
+	rateLimitHits map[string]*rateLimitHit
 	// bindSerial 绑定决策串行化：巡检并发跑多个账号的探活（网络 IO），但
 	// 「选哪条链接」的决策必须串行——否则并发账号同时读到空绑定快照，
 	// 全部绑到同一条链接（实测 4 账号同链接同出口 IP，风控高危）。
@@ -283,10 +289,10 @@ type AccountProxy struct {
 	directIPCache atomicString
 	// 直连出口的地理与运营方（与 directIPCache 同一次探测取得）。
 	// 未绑代理的账号出口就是它，面板账号池要显示，所以必须缓存住。
-	directCountry   atomicString
-	directCountryC  atomicString
-	directASN       atomicString
-	directChecked   atomic.Int64
+	directCountry  atomicString
+	directCountryC atomicString
+	directASN      atomicString
+	directChecked  atomic.Int64
 
 	checkMu sync.Mutex // 串行化校验，避免面板手触发与周期校验并发打同一批代理
 	runs    atomic.Uint64
@@ -533,6 +539,59 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 	log.Printf("[autobind] %s 池内全部候选不可用，解绑回落直连 uid=%s", realm, logfmt.UID8(uid))
 }
 
+// NoteRateLimit 记录一次「经该出口被上游/代理限流（429）」，连续到阈值即换绑出口。
+//
+// 为什么必须单独记账：429 是**请求级**限流——链路本身是通的（探活得过），只是
+// 出口 IP 被上游按 IP 限速。因此原有的「探活失败累计 → 换绑」判定不会触发，
+// 被限流的出口会一直粘在账号上。而树脂链接是 sticky（可粘 3600 秒），实测
+// 2026-10-05 因此出现单号 30+ 次 429 + 连带的 503，用户看到"一堆报错"。
+//
+// 计数带 5 分钟衰减窗口：只有**连续**被限流才换绑，偶发一次不折腾（换绑本身
+// 也要探活候选，频繁换绑反而制造抖动）。
+func (m *AccountProxy) NoteRateLimit(uid, realm string) {
+	if m == nil || uid == "" {
+		return
+	}
+	const threshold = 2
+	const window = 5 * time.Minute
+	now := time.Now()
+
+	m.mu.Lock()
+	if m.rateLimitHits == nil {
+		m.rateLimitHits = map[string]*rateLimitHit{}
+	}
+	h := m.rateLimitHits[uid]
+	if h == nil || now.Sub(h.at) > window {
+		h = &rateLimitHit{n: 1, at: now}
+	} else {
+		h.n++
+		h.at = now
+	}
+	m.rateLimitHits[uid] = h
+	hit := h.n
+	m.mu.Unlock()
+	if hit < threshold {
+		return
+	}
+	// 达阈：清计数后异步换绑（换绑要探活候选，绝不能在请求路径上同步做网络 IO）。
+	m.mu.Lock()
+	m.rateLimitHits[uid] = &rateLimitHit{n: 0, at: now}
+	m.mu.Unlock()
+	go func() {
+		if m.bindFirstUsable(uid, realm) {
+			log.Printf("[autobind] 出口被限流（429）×%d，已换绑 uid=%s", threshold, logfmt.UID8(uid))
+			return
+		}
+		log.Printf("[autobind] 出口被限流（429）×%d，但池内无可换候选 uid=%s", threshold, logfmt.UID8(uid))
+	}()
+}
+
+// rateLimitHit 每账号的 429 连续计数（带衰减窗口）。
+type rateLimitHit struct {
+	n  int
+	at time.Time
+}
+
 // bindFirstUsable 按稳定度探活候选并绑定第一个满足反亲和的。
 // 两阶段：① 锁外并发探活全部候选（拿出口 IP）② bindSerial+m.mu 串行决策——
 // 决策时重读 takenLinks/takenIPs，能看到其他账号刚完成的绑定，保证多账号
@@ -643,6 +702,7 @@ func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
 	}
 	return tryBind(false)
 }
+
 // Remove 从绑定表移除一个账号的代理绑定（落盘同步）。
 func (m *AccountProxy) Remove(uid string) error {
 	if m == nil || m.opts.File == "" {
@@ -1052,7 +1112,7 @@ func (m *AccountProxy) checkOne(ctx context.Context, uid string) AccountProxySta
 		return b.toStatus(m)
 	}
 
-		// ③ 出口一致性验证。
+	// ③ 出口一致性验证。
 	//
 	// 语义：验证的是「调用确实走这条代理链路」，而**不是**「出口 IP 恒定不变」。
 	// 聚合代理（resin 等）的出口会实时轮换，轮换是正常行为，绝不因漂移判
@@ -1073,7 +1133,7 @@ func (m *AccountProxy) checkOne(ctx context.Context, uid string) AccountProxySta
 		return b.toStatus(m)
 	}
 
-// ④ 来源泄漏
+	// ④ 来源泄漏
 	if p.XFF != "" && !strings.Contains(p.XFF, p.IP) {
 		b.setState(proxyStateLeak, fmt.Sprintf("代理注入了来源头（%s），真实来源可能随请求到达上游", truncate(p.XFF, 120)))
 		return b.toStatus(m)
@@ -1268,22 +1328,22 @@ func (m *AccountProxy) Status(uid string) (AccountProxyStatus, bool) {
 // toStatus 由运行态构造对外状态。
 func (b *accountBinding) toStatus(m *AccountProxy) AccountProxyStatus {
 	s := AccountProxyStatus{
-		UID:        b.uid,
-		Enabled:    b.spec.Enabled,
-		Label:      b.spec.Label,
-		Note:       b.spec.Note,
-		ExpectedIP: strings.TrimSpace(b.spec.ExpectedIP),
-		ActualIP:   b.probeIP.Load(),
-		DirectIP:   b.directIP.Load(),
-		Country:    b.country.Load(),
+		UID:         b.uid,
+		Enabled:     b.spec.Enabled,
+		Label:       b.spec.Label,
+		Note:        b.spec.Note,
+		ExpectedIP:  strings.TrimSpace(b.spec.ExpectedIP),
+		ActualIP:    b.probeIP.Load(),
+		DirectIP:    b.directIP.Load(),
+		Country:     b.country.Load(),
 		CountryCode: b.countryC.Load(),
-		Timezone:   b.tz.Load(),
-		ASN:        b.asn.Load(),
-		State:      proxyState(b.state.Load()).String(),
-		Message:    b.msg.Load(),
-		Leak:       b.leak.Load(),
-		LatencyMS:  b.latency.Load(),
-		CheckedAt:  b.checked.Load(),
+		Timezone:    b.tz.Load(),
+		ASN:         b.asn.Load(),
+		State:       proxyState(b.state.Load()).String(),
+		Message:     b.msg.Load(),
+		Leak:        b.leak.Load(),
+		LatencyMS:   b.latency.Load(),
+		CheckedAt:   b.checked.Load(),
 	}
 	if u, err := url.Parse(b.spec.Proxy); err == nil {
 		s.Scheme = strings.ToLower(u.Scheme)
@@ -1371,20 +1431,20 @@ func (m *AccountProxy) EgressView(uid string) *EgressViewInfo {
 		}
 	}
 	v := &EgressViewInfo{
-		Source:    EgressSourceProxy,
-		IP:        b.probeIP.Load(),
-		CallIP:    b.callIP.Load(),
+		Source: EgressSourceProxy,
+		IP:     b.probeIP.Load(),
+		CallIP: b.callIP.Load(),
 		// Declared 只回显**显式声明**的出口 IP。lockedIP 现在的语义是「最近一次
 		// 实测出口」（出口轮换池每次校验都会变），若当 declared 回显，前端会
 		// 把「IP vs 自己」永远判成一致——假的一致比不一致更误导。
-		Declared:  strings.TrimSpace(b.spec.ExpectedIP),
-		DirectIP:  b.directIP.Load(),
-		Country:   b.country.Load(),
+		Declared:    strings.TrimSpace(b.spec.ExpectedIP),
+		DirectIP:    b.directIP.Load(),
+		Country:     b.country.Load(),
 		CountryCode: b.countryC.Load(),
-		ASN:       b.asn.Load(),
-		State:     proxyState(b.state.Load()).String(),
-		Label:     b.spec.Label,
-		CheckedAt: b.checked.Load(),
+		ASN:         b.asn.Load(),
+		State:       proxyState(b.state.Load()).String(),
+		Label:       b.spec.Label,
+		CheckedAt:   b.checked.Load(),
 	}
 	if u, err := url.Parse(b.spec.Proxy); err == nil {
 		v.ProxyHost = u.Host
@@ -1408,7 +1468,7 @@ type EgressViewInfo struct {
 	// Source 出口来源：proxy（账号代理）/ direct（未绑，走本机直连）。
 	Source string
 	// CallIP 最近一次「调用时实测出口」（NoteCall 采样；空 = 尚未采样）。
-	CallIP string
+	CallIP      string
 	IP          string
 	Declared    string
 	DirectIP    string

@@ -976,6 +976,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
 			fail(acct.UID)
+			// 代理/出口级 429：Do 在网络层就失败（CONNECT 被限速），既不算探活
+			// 失败也不走业务 429 分支——结果是被限流的出口一直粘着账号。单独
+			// 记账，连续 2 次即换绑出口（见 AccountProxy.NoteRateLimit）。
+			if isRateLimitedErr(terr) {
+				h.noteProxyRateLimit(acct.UID)
+			}
 			// 传输层错误区分：timeout/EOF 重退避，其他正常退避
 			kind := upstream.ErrTransport
 			if strings.Contains(terr.Error(), "timeout") {
@@ -1308,6 +1314,42 @@ func rotateBackoff(i int, ctx context.Context, kind upstream.ErrKind) bool {
 // body 仅在 ErrSoftRate/ErrAccountFault 分支用于解析重置时间/分野；model 为请求
 // 携带的模型名。uerr 是 ChatStreamContext 返回的分类信封（可携带 RetryAfter）；
 // 零值/防御路径下为 nil，冷却时长回落既有计算。
+// isRateLimitedErr 判定传输层错误是否实为「出口被限流」。
+// 代理对 CONNECT 返回非 2xx 时 Go 的 http.Transport 会把状态码文案当成错误抛出
+// （形如 Post "https://…": Too Many Requests），既没有 status 也没有 body，
+// 常规分类路径完全看不见它。
+func isRateLimitedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"too many requests",
+		"429",
+		"rate limit",
+		"rate-limit",
+		"请求过于频繁",
+		"请求频率",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// noteProxyRateLimit 把 429 记账到账号代理（连续命中即换绑出口）。
+func (h *Handler) noteProxyRateLimit(uid string) {
+	if h.cfg.Upstream == nil || h.cfg.Upstream.AccountProxy == nil || uid == "" {
+		return
+	}
+	realm := ""
+	if st, ok := h.cfg.Pool.Status(uid); ok {
+		realm = st.Realm
+	}
+	h.cfg.Upstream.AccountProxy.NoteRateLimit(uid, realm)
+}
+
 func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
 	switch kind {
 	case upstream.ErrHardCredit:
