@@ -797,11 +797,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		delta.HasLatencyMs = true
 		delta.LatencyMs = latencyMs
-		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 && latencyMs > 0 {
+		if delta.HasCompletionTokens && delta.CompletionTokens > 0 && latencyMs > 0 {
 			delta.HasTokensPerSecond = true
 			// 解码期吐字速度：分母剔除首包等待。此前除以整轮耗时，
 			// TTFB 膨胀（代理网关 429 换号重试）时上报速度被低估数倍
 			// （实测 283tok/27s=10.5tok/s，实际解码 283/3s≈94tok/s）。
+			// 条件用 >0 而非 >=0：0-token 空流（如内容拦截空回复）按 0 速度
+			// 计入平均会系统性拉低面板数字，空流不计速度样本。
 			decodeMs := latencyMs - attTTFB.Milliseconds()
 			if decodeMs < 1 {
 				decodeMs = 1
@@ -1134,7 +1136,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if attTTFB < 0 {
 				attTTFB = 0
 			}
-			if st.toks >= 0 {
+			if st.toks > 0 {
 				decodeDur := time.Since(attemptStarted) - attTTFB
 				if decodeDur < time.Millisecond {
 					decodeDur = time.Millisecond
