@@ -1831,7 +1831,14 @@ func stripUnsupportedParamsForModel(body []byte) []byte {
 		return body
 	}
 	changed := false
-	for _, k := range []string{"max_tokens", "max_completion_tokens"} {
+	stripKeys := []string{"max_tokens", "max_completion_tokens"}
+	if strings.Contains(ml, "deepseek") {
+		// deepseek-v4.1-flash 上游不接受 reasoning_effort/thinking 参数名，
+		// 硬发则 400 code=11133。这些是 wb2api prepareBody 加的，去掉才能调用成功。
+		// 如果某个 deepseek 模型确实支持思考且上游有正确参数名，可单独加回。
+		stripKeys = append(stripKeys, "reasoning_effort", "thinking")
+	}
+	for _, k := range stripKeys {
 		if _, ok := m[k]; ok {
 			delete(m, k)
 			changed = true
