@@ -168,6 +168,7 @@ function go(v) {
   if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
+const MM = { realm: '', status: '', q: '', sort: 'id', rows: [], tiers: [], freeOnly: false };
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
@@ -699,7 +700,6 @@ function outCell(m, pr) {
  * 支持域与状态筛选、关键字搜索、多维度排序、一键复制真实映射名与调用名、
  * 逐个或批量实测可调用性。
  */
-const MM = { realm: '', status: '', q: '', sort: 'id', rows: [], tiers: [], freeOnly: false };
 
 const MM_ST_TEXT = { verified: '已验证', failed: '不可调用', unverified: '未验证' };
 
