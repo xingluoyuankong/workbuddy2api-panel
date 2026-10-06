@@ -1832,11 +1832,11 @@ func stripUnsupportedParamsForModel(body []byte, realm string) []byte {
 	}
 	changed := false
 	stripKeys := []string{"max_tokens", "max_completion_tokens"}
-	if strings.Contains(ml, "deepseek") {
-		// 研究结论（simplast/workbuddy-api）：reasoning_effort 是正确参数，
-		// thinking.type 可能不是正确参数名。只剥 thinking，保留 reasoning_effort。
-		// 不分 realm：cn/global 都这么处理。
-		stripKeys = append(stripKeys, "thinking")
+	if strings.Contains(ml, "deepseek") && realmKey(realm) == "global" {
+		// global 域 deepseek-v4.1-flash：vLLM 文档明确：thinking/reasoning_effort 都不发时，
+		// 思考默认开启（effort 50）。硬发参数反而 11133。
+		// 不发 = 用默认思考，不是删功能。cn 域保留（thinking.go 逆向证实可用）。
+		stripKeys = append(stripKeys, "thinking", "reasoning_effort")
 	}
 	for _, k := range stripKeys {
 		if _, ok := m[k]; ok {
