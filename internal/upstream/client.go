@@ -1832,11 +1832,11 @@ func stripUnsupportedParamsForModel(body []byte, realm string) []byte {
 	}
 	changed := false
 	stripKeys := []string{"max_tokens", "max_completion_tokens"}
-	if strings.Contains(ml, "deepseek") && realmKey(realm) == "global" {
-		// global 域 deepseek 上游不接受 reasoning_effort/thinking 参数名，硬发则 400 code=11133。
-		// thinking.go 逆向的是 CN 客户端（codebuddy），CN 域保留思考参数；
-		// global 域（workbuddy.ai）不认，去掉才能调用成功。
-		stripKeys = append(stripKeys, "reasoning_effort", "thinking")
+	if strings.Contains(ml, "deepseek") {
+		// 研究结论（simplast/workbuddy-api）：reasoning_effort 是正确参数，
+		// thinking.type 可能不是正确参数名。只剥 thinking，保留 reasoning_effort。
+		// 不分 realm：cn/global 都这么处理。
+		stripKeys = append(stripKeys, "thinking")
 	}
 	for _, k := range stripKeys {
 		if _, ok := m[k]; ok {
