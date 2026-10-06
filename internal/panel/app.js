@@ -927,20 +927,12 @@ const MM_SORTS = {
 
 function mmFiltered() {
   const q = MM.q.toLowerCase();
-  // 有 live 条目的 bare_id 集合：默认隐藏"影子 orphan"用。
-  // orphan = 上游目录已不再下发的手工登记/遗留条目（后端有意保留）；
-  // 同 bare_id 既有 live 又有 orphan 时（如 cn:hy4-preview-f live + global:hy4-preview-f orphan），
-  // 用户看到的是"同名两张卡"。只杀影子，不杀无 live 对应的纯遗留 orphan。
-  const liveBare = new Set();
-  for (const m of MM.rows) { if (!m.orphan) liveBare.add(m.bare_id || m.id); }
   let rows = MM.rows.filter(m => {
     if (MM.realm && (m.realm || 'cn') !== MM.realm) return false;
     if (MM.status === 'hidden') { if (!m.hidden) return false; }
     else if (MM.status === 'removed') { if (!m.removed) return false; }
-    else if (MM.status === 'orphan') { if (!m.orphan) return false; }
     else if (MM.status && (m.status || 'unverified') !== MM.status) return false;
     else if ((m.hidden || m.removed) && MM.status !== 'hidden') return false;
-    if (!MM.status && m.orphan && liveBare.has(m.bare_id || m.id)) return false;
     if (MM.freeOnly && !mmIsFree(m)) return false;
     if (!q) return true;
     return [m.bare_id, m.display_name, m.upstream_model, m.category, m.full_id]
