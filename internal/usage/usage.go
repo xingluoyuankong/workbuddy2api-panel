@@ -59,6 +59,8 @@ type bucket struct {
 	TPSN  int64   `json:"vn"` // 速率样本数
 	CR    float64 `json:"cr"` // 积分消耗累计（上游 usage.credit）
 	CRN   int64   `json:"cn"` // 积分样本数（拿到 credit 的请求数）
+	CHT   int64   `json:"ch"` // 前缀缓存命中 tokens 累计（上游 usage.prompt_cache_hit_tokens）
+	CHP   int64   `json:"cp"` // 带缓存信息样本的 prompt tokens 累计（缓存率分母）
 }
 
 // file 落盘结构。
@@ -143,6 +145,10 @@ type Delta struct {
 	// Credit 本次实际消耗的积分（上游 usage.credit）。失败尝试通常没有。
 	Credit    float64
 	HasCredit bool
+	// CacheHitTokens 本次命中的前缀缓存 tokens（上游 usage.prompt_cache_hit_tokens）。
+	// 与 PromptTokens 同帧下发；失败尝试通常没有。
+	CacheHitTokens    int64
+	HasCacheHitTokens bool
 }
 
 // Add 记录一次请求尝试。
@@ -200,6 +206,14 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		b.CR += d.Credit
 		b.CRN++
 	}
+	// 前缀缓存命中：分母只计「带缓存信息样本」的 prompt——网关上线该字段前的
+	// 历史桶 CHT/CHP 恒 0，不参与分母，避免历史 prompt 稀释新口径的缓存率。
+	if d.HasCacheHitTokens {
+		b.CHT += d.CacheHitTokens
+		if d.HasPromptTokens {
+			b.CHP += d.PromptTokens
+		}
+	}
 	r.dirty = true
 }
 
@@ -250,6 +264,8 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.TPSN += src.TPSN
 			dst.CR += src.CR
 			dst.CRN += src.CRN
+			dst.CHT += src.CHT
+			dst.CHP += src.CHP
 		}
 		delete(r.buckets, m.from)
 	}
@@ -290,7 +306,7 @@ func (r *Recorder) flush(force bool) {
 		r.mu.Unlock()
 		return
 	}
-	snap := file{Version: 1, Saved: time.Now().Format(time.RFC3339), Buckets: make([]bucket, 0, len(r.buckets))}
+	snap := file{Version: 2, Saved: time.Now().Format(time.RFC3339), Buckets: make([]bucket, 0, len(r.buckets))}
 	for _, b := range r.buckets {
 		snap.Buckets = append(snap.Buckets, *b)
 	}
@@ -340,6 +356,13 @@ type Agg struct {
 	// 也能对上账。与 Credits 分开存放，前端按「估算」标注，绝不冒充实测值。
 	CreditsEst     float64 `json:"credits_est"`
 	CreditsEstToks int64   `json:"credits_est_tokens"` // 参与估算的 token 数（0 = 无单价可估）
+	// 前缀缓存命中（上游 usage.prompt_cache_hit_tokens 聚合）。
+	CacheHitTokens int64 `json:"cache_hit_tokens"`
+	// CachePromptToks 缓存率分母：带缓存信息样本的 prompt tokens（0 = 无数据）。
+	CachePromptToks int64 `json:"cache_prompt_tokens,omitempty"`
+	// CacheHitRate 缓存命中率 = CacheHitTokens/CachePromptToks；分母为 0 时为 0
+	// （此时按 CachePromptToks==0 判「无数据」，不要把 0 读成「命中率为 0」）。
+	CacheHitRate float64 `json:"cache_hit_rate"`
 }
 
 // CreditsTotal 对外口径的积分合计：有实测用实测，否则用回填估算。
@@ -370,6 +393,8 @@ type aggAcc struct {
 	latSamples int64
 	tpsSum     float64
 	tpsSamples int64
+	cacheHit   int64 // prompt_cache_hit_tokens 累计
+	cachePrompt int64 // 带缓存信息样本的 prompt 累计（缓存率分母）
 	// est 历史积分回填器（nil = 不回填）。放在累加器里，避免给每处 add 调用
 	// 都加一个参数、漏传就静默丢估算。
 	est CostEstimator
@@ -387,6 +412,8 @@ func (g *aggAcc) add(b *bucket) {
 	g.tpsSamples += b.TPSN
 	g.Credits += b.CR
 	g.CreditSamples += b.CRN
+	g.cacheHit += b.CHT
+	g.cachePrompt += b.CHP
 	// 回填：只有「该桶完全没有实测 credit」且「有 token 数」时才估算，
 	// 避免与实测值重复计入（重复计会让总量虚高一倍）。
 	if b.CRN == 0 && b.TT > 0 && g.est != nil {
@@ -415,6 +442,12 @@ func (g *aggAcc) finish() Agg {
 		if total := a.Credits + a.CreditsEst; total > 0 {
 			a.CreditsPer1k = total / float64(a.TotalTokens) * 1000
 		}
+	}
+	// 缓存命中率：分母只含带缓存信息样本的 prompt，上线前历史不稀释。
+	a.CacheHitTokens = g.cacheHit
+	a.CachePromptToks = g.cachePrompt
+	if g.cachePrompt > 0 {
+		a.CacheHitRate = float64(g.cacheHit) / float64(g.cachePrompt)
 	}
 	return a
 }
@@ -669,6 +702,45 @@ func (r *Recorder) SnapshotWithCost(hours int, nicks map[string]string, est Cost
 		snap.Since = snap.Series[0].T
 	}
 	return snap
+}
+
+// CacheStat 单个账号的前缀缓存命中聚合（账号池「缓存率」列的数据源）。
+type CacheStat struct {
+	HitTokens    int64 `json:"hit_tokens"`    // prompt_cache_hit_tokens 累计
+	PromptTokens int64 `json:"prompt_tokens"` // 带缓存信息样本的 prompt 累计（分母）
+	Samples      int64 `json:"samples"`       // 带缓存信息的请求样本数
+}
+
+// Rate 缓存命中率 = HitTokens/PromptTokens；无数据时 ok=false（调用方显示"-"）。
+func (c CacheStat) Rate() (rate float64, ok bool) {
+	if c.PromptTokens <= 0 {
+		return 0, false
+	}
+	return float64(c.HitTokens) / float64(c.PromptTokens), true
+}
+
+// CacheByAccount 全量桶按账号聚合缓存命中（轻量：只扫桶做加法，不经过
+// Snapshot 的成本回填与窗口过滤；账号池列表每轮刷新调用，开销 O(桶数)）。
+func (r *Recorder) CacheByAccount() map[string]CacheStat {
+	out := map[string]CacheStat{}
+	if r == nil {
+		return out
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, b := range r.buckets {
+		if b.CHP == 0 && b.CHT == 0 {
+			continue
+		}
+		c := out[b.UID]
+		c.HitTokens += b.CHT
+		c.PromptTokens += b.CHP
+		if b.CHP > 0 {
+			c.Samples++
+		}
+		out[b.UID] = c
+	}
+	return out
 }
 
 func keyed(m map[string]*aggAcc, label func(string) (string, string)) []KeyedAgg {

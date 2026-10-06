@@ -243,60 +243,48 @@ function egressCell(eg) {
 function shortModel(m) {
   return m && m.length > 16 ? m.slice(0, 15) + '…' : (m || '—');
 }
-/* quotaCell 额度/报错列：realm **全量**免费模型一枚 chip。
- *   √ 绿 = 今日还有额度（含"今日未用"——没用过不代表没有，只是无观测）
- *   × 红 = 今日已耗尽（6004 限流中，或当日用量已达实测额度）
- * 数字全进 tooltip；报错 badge 可点击 → 跳日志页并按该 uid 过滤 err 行，
- * 让"报错 4"能被一眼查证，而不是一个需要解释的数字。 */
+/* quotaCell 账号页只做一件事：**提醒免费额度是否已达上限**。
+ * 不列模型、不摆数字——具体"每个模型额度多少"在模型列表页看（那是它的主场）。
+ * 形态：一个带颜色的状态标记 ——
+ *   正常（灰/绿）：今日没有任何免费模型撞线
+ *   已达上限（红）：至少一个免费模型被上游 6004 限额，含重置倒计时
+ * 报错计数独立成一条（可点，跳日志按账号过滤查证）。
+ */
 function quotaCell(s) {
-  const day = s.model_day || {};
-  const names = Object.keys(day);
-  if (!names.length && !(s.err_recent > 0)) {
-    return '<td class="qcell"><span class="q-none">—</span></td>';
-  }
   const bits = [];
-  if (names.length) {
-    const chips = names.map(m => {
-      const v = day[m];
-      const bare = m.indexOf(':') >= 0 ? m.slice(m.indexOf(':') + 1) : m;
-      const nm = esc(shortModel(bare));
-      // 「已耗尽」必须同时满足：已达实测额度 且 上游重置墙钟未到——
-      // 重置时间一过额度窗口已更新，× 继续挂着就是与上游实际恢复状态脱节。
-      const resetAt = v.quota_reset_at ? new Date(v.quota_reset_at).getTime() : 0;
-      const quotaActive = v.quota_reqs > 0 && (!resetAt || Date.now() < resetAt);
-      const exhausted = v.limited || (quotaActive && v.reqs >= v.quota_reqs);
-      let tip;
-      if (exhausted) {
-        tip = nm + '：今日已耗尽';
-        if (v.reqs || v.tokens) tip += '（已用 ' + v.reqs + ' 次 / ' + (v.tokens || 0) + ' tok';
-        if (v.quota_reqs > 0) tip += '，实测额度 ≈ ' + v.quota_reqs + ' 次（观测 ' + v.quota_samples + ' 次）';
-        if (v.reqs || v.tokens) tip += ')';
-        if (v.limited) tip += '｜' + (v.reason || '6004 限流') +
-          (v.until ? ' · 重置于 ' + new Date(v.until).toLocaleTimeString('zh-CN', { hour12: false }) : '');
-      } else if (v.reqs > 0) {
-        tip = nm + '：今日已用 ' + v.reqs + ' 次 / ' + (v.tokens || 0) + ' tok' +
-          (v.quota_reqs > 0 ? '｜实测额度 ≈ ' + v.quota_reqs + ' 次（观测 ' + v.quota_samples + ' 次）' : '｜额度未知（尚未触发过 6004）');
-      } else {
-        tip = nm + '：今日未用（无用量观测，额度未知）';
-      }
-      return {
-        exhausted,
-        html: '<span class="q-chip ' + (exhausted ? 'q-bad' : 'q-ok') + '" title="' + esc(tip) + '">' +
-          (exhausted ? '×' : '√') + ' ' + nm + '</span>'
-      };
-    }).sort((a, b) => (b.exhausted ? 1 : 0) - (a.exhausted ? 1 : 0));
-    bits.push('<div class="q-chips">' + chips.map(c => c.html).join('') + '</div>');
+  // 免费额度：只看"有没有免费模型撞线"，撞线就红字 + 重置时刻
+  const exhausted = (s.rate_limited_models || []).map(r => ({
+    model: r.model,
+    until: r.until ? new Date(r.until).getTime() : 0,
+    reason: r.reason || '',
+  })).filter(x => x.until > Date.now());
+  const day = s.model_day || {};
+  const used = {};
+  for (const m of Object.keys(day)) {
+    const bare = m.indexOf(':') >= 0 ? m.slice(m.indexOf(':') + 1) : m;
+    if (day[m].reqs > 0) used[bare] = day[m].reqs;
+  }
+  if (exhausted.length) {
+    const soonest = Math.min.apply(null, exhausted.map(x => x.until));
+    const left = Math.round((soonest - Date.now()) / 1000);
+    const names = exhausted.map(x => esc(shortModel(x.model))).join('、');
+    bits.push('<span class="q-chip q-bad" title="免费额度已达上限：' + names +
+      '\n上游声明重置于 ' + new Date(soonest).toLocaleTimeString('zh-CN', { hour12: false }) +
+      '">免费额度 已达上限' + (left > 0 ? '（' + dur(left) + '后重置）' : '') + '</span>');
+  } else {
+    const keys = Object.keys(used);
+    bits.push('<span class="q-chip q-ok" title="今日免费额度正常：没有免费模型触发上游 6004 限额。各模型额度见「模型与映射」页。">' +
+      '免费额度 正常' + (keys.length ? '（' + keys.length + ' 个在用）' : '') + '</span>');
   }
   if (s.err_recent > 0) {
-    // badge 自带上下文：最近一次报错的时间与原文，让数字不用点开日志就能定性
-    //（transport error=出口/代理问题、429=上游限流、SECURITY=劫持熔断……）。
     let lastTip = '';
     if (s.err_last_at) {
       lastTip = '\n最近一次：' + new Date(s.err_last_at).toLocaleString('zh-CN', { hour12: false }) +
         '\n' + String(s.err_last_text || '').slice(0, 180);
     }
     bits.push('<span class="tag bad q-errlog" data-errlog="' + esc(s.uid.slice(0, 8)) +
-      '" title="该账号在日志环内的报错行数（err 级别）。点击跳转日志页按此账号过滤查看全部明细' + esc(lastTip) + '">报错 ' + s.err_recent + '</span>');
+      '" title="该账号在日志环内的报错行数。点击跳日志页按此账号过滤查证' + esc(lastTip) +
+      '">报错 ' + s.err_recent + '</span>');
   }
   return '<td class="qcell">' + bits.join(' ') + '</td>';
 }
@@ -304,7 +292,7 @@ function quotaCell(s) {
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -345,6 +333,15 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+    // 前缀缓存命中率（上游 prompt_cache_hit_tokens 聚合，全量历史）：
+    // 无数据（旧桶 / 上游未下发）显示 —，悬停看命中/输入 tokens 明细。
+    let cacheCell = '<span style="color:var(--ink-3)">—</span>';
+    if (s.cache_hit_rate != null && s.cache_prompt_tokens > 0) {
+      const pct = (s.cache_hit_rate * 100).toFixed(1) + '%';
+      const tip = '前缀缓存命中 ' + formatTokenCount(s.cache_hit_tokens) + ' / 输入 ' +
+        formatTokenCount(s.cache_prompt_tokens) + ' tokens（全量历史）';
+      cacheCell = '<span title="' + esc(tip) + '"><b>' + pct + '</b></span>';
+    }
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + realmTag(s.realm) + '</div><div class="id">' + esc(short) + '</div><div class="id" style="font-family:var(--sans)">最近成功 ' + ago(s.last_success) + '</div></td>' +
@@ -358,6 +355,7 @@ function renderAccounts(list) {
         '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
+      '<td class="num">' + cacheCell + '</td>' +
       quotaCell(s) +
       '<td class="acts">' +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
@@ -852,6 +850,7 @@ function mmQuotaToday(m) {
       '<div class="mm-kv"><span class="lb">消耗</span><span' + ledgerTip + '>' + credit + '</span></div>' +
       mmQuotaToday(m) +
       '<div class="mm-kv"><span class="lb">倍率</span><span>' +
+        (m.credits ? esc(m.credits) : '<span style="color:var(--ink-3)">—</span>') + '</span></div>' +
         (m.credits ? esc(m.credits) : '<span style="color:var(--ink-3)">—</span>') + '</span></div>' +
       '<div class="mm-kv"><span class="lb">上下文</span><span>' +
         (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') +

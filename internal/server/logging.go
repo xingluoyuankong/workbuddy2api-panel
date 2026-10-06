@@ -45,6 +45,9 @@ type chatStat struct {
 	// 与"实测为 0（免费模型）"区分开。
 	credit    float64
 	hasCredit bool
+	tries     int     // 本请求实际尝试的账号数（含换号重试）
+	tokps     float64 // 解码期吐字速度（分母剔除首包等待），hasTokps=false 时回落旧口径
+	hasTokps  bool
 
 	logged bool
 }
@@ -72,7 +75,8 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.credit, s.hasCredit)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.credit, s.hasCredit,
+		s.tries, s.tokps, s.hasTokps)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -92,7 +96,11 @@ type chatStatsReader struct {
 	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
 	hasCredit bool
 	credit    float64
-	pend      []byte // 已读未返回的行缓存
+	// cacheHitTokens 上游末帧 usage.prompt_cache_hit_tokens（前缀缓存命中 tokens），
+	// 供用量统计的账号缓存率。hasCacheHitTokens=false 表示上游没下发该字段。
+	hasCacheHitTokens bool
+	cacheHitTokens    int
+	pend              []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -109,6 +117,11 @@ func (s *chatStatsReader) Tokens() (int, bool) { return s.completionTokens, s.ha
 // Credit 返回末帧 usage.credit（本次真实扣费积分）与是否缺失。
 func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
 
+// CacheHitTokens 返回末帧 usage.prompt_cache_hit_tokens（前缀缓存命中）与是否缺失。
+func (s *chatStatsReader) CacheHitTokens() (int, bool) {
+	return s.cacheHitTokens, s.hasCacheHitTokens
+}
+
 // TotalTokens 返回末帧 usage.total_tokens 与是否缺失。
 func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.hasTotalTokens }
 
@@ -121,6 +134,8 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 		CompletionTokens:    int64(s.completionTokens),
 		HasTotalTokens:      s.hasTotalTokens,
 		TotalTokens:         int64(s.totalTokens),
+		HasCacheHitTokens:   s.hasCacheHitTokens,
+		CacheHitTokens:      int64(s.cacheHitTokens),
 	}
 }
 
@@ -144,6 +159,7 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			CompletionTokens *int     `json:"completion_tokens"`
 			TotalTokens      *int     `json:"total_tokens"`
 			Credit           *float64 `json:"credit"`
+			CacheHitTokens   *int     `json:"prompt_cache_hit_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -164,6 +180,10 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if chunk.Usage.Credit != nil {
 		s.hasCredit = true
 		s.credit = *chunk.Usage.Credit
+	}
+	if chunk.Usage.CacheHitTokens != nil {
+		s.hasCacheHitTokens = true
+		s.cacheHitTokens = *chunk.Usage.CacheHitTokens
 	}
 }
 
@@ -308,6 +328,9 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 	if n, ok := read("total_tokens"); ok {
 		delta.HasTotalTokens, delta.TotalTokens = true, n
 	}
+	if n, ok := read("prompt_cache_hit_tokens"); ok {
+		delta.HasCacheHitTokens, delta.CacheHitTokens = true, n
+	}
 	return delta
 }
 
@@ -367,7 +390,8 @@ const chatLogModelWidth = 26
 // credit/hasCredit 为本次请求真实消耗的工作积分（上游 usage.credit）：
 // hasCredit=false 显示 "-"（上游没下发），credit==0 显示 "0"（实测免费）。
 // 两者必须分开——把"没数据"显示成 0 会让人误以为这些请求都免费。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int, credit float64, hasCredit bool) {
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int, credit float64, hasCredit bool,
+	tries int, tokps float64, hasTokps bool) {
 	if !chatLogEnabled {
 		return
 	}
@@ -385,11 +409,18 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	tokpsField := "-"
 	if toks >= 0 {
 		tokField = fmt.Sprintf("%d", toks)
-		if total > 0 {
+		if hasTokps {
+			// 解码期速度（分母已剔除首包等待）：这才是「字节输出速度」。
+			tokpsField = fmt.Sprintf("%.1f", tokps)
+		} else if total > 0 {
 			tokpsField = fmt.Sprintf("%.1f", float64(toks)/total.Seconds())
 		} else {
 			tokpsField = "0.0"
 		}
+	}
+	tryField := ""
+	if tries > 1 {
+		tryField = fmt.Sprintf(" try=%d |", tries)
 	}
 	ttfbMS := "-"
 	if ttfb > 0 {
@@ -403,7 +434,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if hasCredit {
 		creditField = trimCredit(credit)
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | cr=%s | total=%.1fs |\n",
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | cr=%s | total=%.1fs |%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -415,5 +446,6 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		tokpsField,
 		creditField,
 		total.Seconds(),
+		tryField,
 	)
 }

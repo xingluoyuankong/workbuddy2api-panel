@@ -62,6 +62,10 @@ type TokenUsageDelta struct {
 	// 与 token 数不是一回事：不同模型倍率差几十倍，只看 token 看不出真实成本。
 	HasCredit bool
 	Credit    float64
+	// CacheHitTokens 本次请求命中的前缀缓存 tokens（上游 usage.prompt_cache_hit_tokens）。
+	// 与 PromptTokens 同源（同一 usage 帧），缓存率 = CacheHitTokens / PromptTokens。
+	HasCacheHitTokens bool
+	CacheHitTokens    int64
 }
 
 // Status 单个账号对外暴露的状态（脱敏）。

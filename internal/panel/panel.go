@@ -123,6 +123,17 @@ type Panel struct {
 	freeAt    time.Time
 }
 
+// modelQuotaAgg 单个 (realm, 模型) 在**全池各账号**上的额度聚合。
+// limit/tokens = 实测单日额度（6004 撞线快照），取跨账号最小观测值（最保守）。
+// 额度是**模型维度**的：不同别名各是各的价，绝不能把别名的用量混算。
+type modelQuotaAgg struct {
+	accounts  int
+	exhausted int
+	limit     int64
+	tokens    int64
+	used      int64
+}
+
 // freeModels 计算免费模型集（带 5 分钟缓存）。
 //
 // 免费判定只认两个**硬证据**源——2026-10-04 事故教训：曾把 modelmeta 的
@@ -434,6 +445,11 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	for r := range freeByRealm {
 		sort.Strings(freeByRealm[r])
 	}
+	// 每账号前缀缓存命中率：用量桶按账号聚合（轻量 O(桶数)，5s 轮询可承受）。
+	var cacheByUID map[string]usage.CacheStat
+	if p.cfg.Usage != nil {
+		cacheByUID = p.cfg.Usage.CacheByAccount()
+	}
 	accounts := p.cfg.Pool.List()
 	rows := make([]accountRow, len(accounts))
 	for i, st := range accounts {
@@ -473,6 +489,13 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 			st.ModelDay = fm
 		}
 		row := accountRow{Status: st, ErrRecent: n}
+		if cs, ok := cacheByUID[st.UID]; ok {
+			if rate, has := cs.Rate(); has {
+				row.CacheHitRate = &rate
+				row.CacheHitTokens = cs.HitTokens
+				row.CachePromptTok = cs.PromptTokens
+			}
+		}
 		if n > 0 {
 			if le, ok := errLast[strings.ToLower(st.UID[:8])]; ok {
 				row.ErrLastAt = le.TS.Format(time.RFC3339)
@@ -510,6 +533,11 @@ type accountRow struct {
 	ErrRecent   int    `json:"err_recent"`
 	ErrLastAt   string `json:"err_last_at,omitempty"`   // 环内最近一次报错时刻
 	ErrLastText string `json:"err_last_text,omitempty"` // 最近一次报错原文（badge tooltip）
+	// 前缀缓存命中（上游 usage.prompt_cache_hit_tokens 聚合，全量历史）。
+	// 无数据（网关上线该统计前的旧桶 / 上游未下发）时三者全空，旧前端零回归。
+	CacheHitRate   *float64 `json:"cache_hit_rate,omitempty"`   // 命中率 0~1
+	CacheHitTokens int64    `json:"cache_hit_tokens,omitempty"` // 命中 tokens 累计
+	CachePromptTok int64    `json:"cache_prompt_tokens,omitempty"`
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
@@ -613,7 +641,7 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 	// 每模型「今日额度状态」跨账号聚合（模型页标注）：账号列表只标单号，
 	// 模型页标全局——一眼看出"哪个免费模型今天在几个号上已经耗尽"。
 	// exhausted = 6004 限流中，或当日用量已达实测额度（6004 快照）。
-	qstat := map[string]struct{ accounts, exhausted int }{}
+	qstat := map[string]*modelQuotaAgg{}
 	now := time.Now()
 	for _, st := range p.cfg.Pool.List() {
 		lim := map[string]bool{}
@@ -627,6 +655,10 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 			}
 			k := st.Realm + ":" + bare
 			s := qstat[k]
+			if s == nil {
+				s = &modelQuotaAgg{}
+				qstat[k] = s
+			}
 			s.accounts++
 			// 已耗尽 = 6004 限流中，或已达实测额度且上游重置墙钟未到
 			//（重置后额度窗口已更新，不能再算耗尽）。
@@ -634,7 +666,15 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 			if lim[bare] || (quotaActive && v.Reqs >= v.QuotaReqs) {
 				s.exhausted++
 			}
-			qstat[k] = s
+			// 实测额度：取该模型跨账号观测的**最小值**（最紧的一次撞线上限）。
+			// 不同账号撞线点可能不同（取决于各自命中窗口），取最小最保守。
+			if v.QuotaReqs > 0 && (s.limit == 0 || v.QuotaReqs < s.limit) {
+				s.limit = v.QuotaReqs
+				s.tokens = v.QuotaTokens
+			}
+			if v.Reqs > 0 {
+				s.used += v.Reqs
+			}
 		}
 		for _, mc := range st.ModelCosts {
 			if mc.Model == "" || mc.Samples < 2 {
@@ -698,7 +738,12 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 		// **不用** modelmeta 的 credit<=0 当免费——探针缺 usage.credit 时零值
 		// 会把收费模型误标（gpt-5.6-sol/terra/primary-model/hunyuan 实测踩中）。
 		if qs, ok := qstat[k]; ok && p.freeModels()[k] {
-			m["quota_today"] = map[string]any{"accounts": qs.accounts, "exhausted": qs.exhausted}
+			m["quota_today"] = map[string]any{
+				"accounts":  qs.accounts,
+				"exhausted": qs.exhausted,
+				"limit":     qs.limit, // 实测额度（0 = 尚未观测到撞线，额度未知）
+				"used":      qs.used,
+			}
 		}
 		// 成本账本：实测单价与免费判定。面板据此标「免费」徽标，
 		// 让用户一眼看出该用哪个变体（如 hy4-preview-f 免费、hy4-preview 收费）。

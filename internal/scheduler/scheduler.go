@@ -424,9 +424,14 @@ func (s *Scheduler) RunKeepaliveNow() {
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
+// balanceRefreshStagger 余额刷新错峰间隔：8 号齐发会瞬间占满代理网关并发位
+// （resin MAX_PER_IP=32），把自己 429 成一堆报错。2s 间隔错峰，8 号约 14s
+// 跑完，相对 5 分钟刷新周期可忽略。
+const balanceRefreshStagger = 2 * time.Second
+
 func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
-	for _, st := range s.cfg.Pool.List() {
+	for idx, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
 		}
@@ -435,8 +440,11 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			continue
 		}
 		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
+		go func(a *auth.Auth, uid string, delay time.Duration) {
 			defer wg.Done()
+			if delay > 0 {
+				time.Sleep(delay)
+			}
 			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 			if err != nil {
 				log.Printf("balance %s: %v", uid, err)
@@ -447,7 +455,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			} else {
 				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 			}
-		}(a, st.UID)
+		}(a, st.UID, time.Duration(idx)*balanceRefreshStagger)
 	}
 	wg.Wait()
 }

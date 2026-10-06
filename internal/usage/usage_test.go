@@ -79,7 +79,7 @@ func TestFlushLoadRoundtrip(t *testing.T) {
 	}
 	raw, _ := os.ReadFile(path)
 	var f file
-	if err := json.Unmarshal(raw, &f); err != nil || f.Version != 1 || len(f.Buckets) != 1 {
+	if err := json.Unmarshal(raw, &f); err != nil || f.Version != 2 || len(f.Buckets) != 1 {
 		t.Fatalf("落盘文件异常: err=%v buckets=%d", err, len(f.Buckets))
 	}
 }
@@ -147,5 +147,59 @@ func TestLifecycleFlush(t *testing.T) {
 	r.Stop()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("Stop 后应有落盘文件: %v", err)
+	}
+}
+
+// 缓存命中：Delta 里的 prompt_cache_hit_tokens 进桶、按账号聚合、版本兼容。
+func TestCacheHitAggregation(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u1", "m", Delta{
+		PromptTokens: 1000, HasPromptTokens: true,
+		CacheHitTokens: 750, HasCacheHitTokens: true,
+	}, true)
+	r.Add(now, "cn", "u1", "m", Delta{
+		PromptTokens: 500, HasPromptTokens: true,
+		CacheHitTokens: 0, HasCacheHitTokens: true, // 命中 0 也是有效样本
+	}, true)
+	r.Add(now, "cn", "u2", "m", Delta{PromptTokens: 200, HasPromptTokens: true}, true) // 无缓存信息
+
+	stats := r.CacheByAccount()
+	c1, ok := stats["u1"]
+	if !ok {
+		t.Fatal("u1 无缓存聚合")
+	}
+	if rate, has := c1.Rate(); !has || rate != 0.5 {
+		t.Fatalf("u1 缓存率 = %v/%v, want 0.5/true", rate, has)
+	}
+	if c1.HitTokens != 750 || c1.PromptTokens != 1500 {
+		t.Fatalf("u1 hit/prompt = %d/%d, want 750/1500", c1.HitTokens, c1.PromptTokens)
+	}
+	if _, ok := stats["u2"]; ok {
+		t.Fatal("u2 无缓存信息，不该出现在聚合里")
+	}
+	// Snapshot 的 Agg 口径一致
+	snap := r.Snapshot(24, nil)
+	if snap.Totals.CacheHitTokens != 750 || snap.Totals.CachePromptToks != 1500 {
+		t.Fatalf("totals cache = %d/%d, want 750/1500",
+			snap.Totals.CacheHitTokens, snap.Totals.CachePromptToks)
+	}
+	if snap.Totals.CacheHitRate != 0.5 {
+		t.Fatalf("totals rate = %v, want 0.5", snap.Totals.CacheHitRate)
+	}
+	// Rollup 折叠不丢缓存字段：100 天前的小时桶带缓存数据，折叠为日桶后仍在
+	r2 := New("")
+	oldT := now.AddDate(0, 0, -100)
+	r2.Add(oldT, "cn", "u1", "m", Delta{
+		PromptTokens: 2000, HasPromptTokens: true,
+		CacheHitTokens: 1500, HasCacheHitTokens: true,
+	}, true)
+	r2.Rollup(now)
+	folded := r2.CacheByAccount()["u1"]
+	if folded.HitTokens != 1500 || folded.PromptTokens != 2000 {
+		t.Fatalf("rollup 后 u1 = %d/%d, want 1500/2000", folded.HitTokens, folded.PromptTokens)
+	}
+	if rate, has := folded.Rate(); !has || rate != 0.75 {
+		t.Fatalf("rollup 后 u1 缓存率 = %v/%v, want 0.75/true", rate, has)
 	}
 }

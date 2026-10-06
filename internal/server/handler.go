@@ -788,7 +788,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			unbindSticky()
 		}
 	}
-	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time) {
+	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time, attTTFB time.Duration) {
 		delta.Model = peek.Model
 		latency := time.Since(started)
 		latencyMs := latency.Milliseconds()
@@ -799,8 +799,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		delta.LatencyMs = latencyMs
 		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 && latencyMs > 0 {
 			delta.HasTokensPerSecond = true
-			delta.TokensPerSecond = float64(delta.CompletionTokens) * 1000 / float64(latencyMs)
+			// 解码期吐字速度：分母剔除首包等待。此前除以整轮耗时，
+			// TTFB 膨胀（代理网关 429 换号重试）时上报速度被低估数倍
+			// （实测 283tok/27s=10.5tok/s，实际解码 283/3s≈94tok/s）。
+			decodeMs := latencyMs - attTTFB.Milliseconds()
+			if decodeMs < 1 {
+				decodeMs = 1
+			}
+			delta.TokensPerSecond = float64(delta.CompletionTokens) * 1000 / float64(decodeMs)
 		}
+		st.tries++
 		h.cfg.Pool.RecordTokenUsage(uid, delta)
 
 		// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试
@@ -831,6 +839,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 积分：上游 usage.credit（真实扣费，与 token 数不同源）。
 				Credit:    delta.Credit,
 				HasCredit: delta.HasCredit,
+				// 前缀缓存命中：上游 usage.prompt_cache_hit_tokens（与 PromptTokens 同帧）。
+				CacheHitTokens:    delta.CacheHitTokens,
+				HasCacheHitTokens: delta.HasCacheHitTokens,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
 		}
 	}
@@ -971,17 +982,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
-			h.cfg.Pool.NoteFailures(acct.UID)
-			fail(acct.UID)
-			// 代理/出口级 429：Do 在网络层就失败（CONNECT 被限速），既不算探活
-			// 失败也不走业务 429 分支——结果是被限流的出口一直粘着账号。单独
-			// 记账，连续 2 次即换绑出口（见 AccountProxy.NoteRateLimit）。
 			if isRateLimitedErr(terr) {
-				h.noteProxyRateLimit(acct.UID)
+				// 传输层 429 = 代理网关自限流（resin MAX_PER_IP=32 并发饱和，
+				// 网关自己回的 429；上游真限流走隧道内 HTTP 429 响应，
+				// 以 status>=400 进业务分支，不会到这里）。
+				// 既非账号问题也非出口问题：不喂账号连败（避免网关级饱和
+				// 把健康号批量误降权），不换绑出口（饱和按客户端 IP 计，
+				// 与出口无关；且换绑探活会占用连接位加剧饱和）。
+				// 换号重试本身已是正确应对（退避后大概率拿到连接位）。
+				log.Printf("WARN: [server] 代理网关并发饱和自限流 uid=%s（transport 429），换号重试，不罚号不换绑",
+					uidPrefix(acct.UID))
+			} else {
+				h.cfg.Pool.NoteFailures(acct.UID)
 			}
+			fail(acct.UID)
 			// 传输层错误区分：timeout/EOF 重退避，其他正常退避
 			kind := upstream.ErrTransport
 			if strings.Contains(terr.Error(), "timeout") {
@@ -995,7 +1012,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if status >= 400 {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			st.status = status
 			var kind upstream.ErrKind
 			if uerr != nil {
@@ -1111,6 +1128,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}))
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			// 本轮尝试的首包延迟（请求级 TTFB 减去之前失败尝试耗时）：
+			// 解码期速度的分母。日志行 TTFB 保留请求级口径（用户体感）。
+			attTTFB := stats.TTFB() - attemptStarted.Sub(st.start)
+			if attTTFB < 0 {
+				attTTFB = 0
+			}
+			if st.toks >= 0 {
+				decodeDur := time.Since(attemptStarted) - attTTFB
+				if decodeDur < time.Millisecond {
+					decodeDur = time.Millisecond
+				}
+				st.tokps, st.hasTokps = float64(st.toks)/decodeDur.Seconds(), true
+			}
 			// 成本账本 + 用量积分：末帧 usage 带 credit 与 token 总数时，
 			// 既记实测单价（供选号排序），也把积分计入用量时序（供用量页统计）。
 			du := stats.Usage()
@@ -1122,14 +1152,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 				}
 			}
-			recordAttempt(acct.UID, du, attemptStarted)
+			recordAttempt(acct.UID, du, attemptStarted, attTTFB)
 			rc.Close()
 			return
 		}
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
 		if err != nil {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
@@ -1142,7 +1172,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.credit, st.hasCredit = credit, true
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 		}
-		recordAttempt(acct.UID, du, attemptStarted)
+		recordAttempt(acct.UID, du, attemptStarted, 0)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
@@ -1339,6 +1369,10 @@ func isRateLimitedErr(err error) bool {
 }
 
 // noteProxyRateLimit 把 429 记账到账号代理（连续命中即换绑出口）。
+//
+// 注意（2026-10-06）：传输层 429 已证实是代理网关自限流（resin MAX_PER_IP
+// 并发饱和），不再走本函数（见传输层错误分支注释）。本函数保留供未来
+// 「出口级」限流场景复用。
 func (h *Handler) noteProxyRateLimit(uid string) {
 	if h.cfg.Upstream == nil || h.cfg.Upstream.AccountProxy == nil || uid == "" {
 		return
