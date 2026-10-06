@@ -228,19 +228,19 @@ func TestStripUnsupportedParamsDeepseek(t *testing.T) {
 	}
 	// deepseek 系：剥掉
 	for _, model := range []string{"deepseek-v4.1-flash", "global:deepseek-v4.1-flash", "DeepSeek-V3"} {
-		out := stripUnsupportedParamsForModel(mk(model))
+		out := stripUnsupportedParamsForModel(mk(model), "cn")
 		if has(out, "max_tokens") || has(out, "max_completion_tokens") {
 			t.Errorf("%s 应剥 max_tokens/max_completion_tokens: %s", model, out)
 		}
 	}
 	// codex/gpt- 系：保持原有行为
-	out := stripUnsupportedParamsForModel(mk("gpt-5.3-codex"))
+	out := stripUnsupportedParamsForModel(mk("gpt-5.3-codex"), "cn")
 	if has(out, "max_tokens") {
 		t.Errorf("gpt-5.3-codex 应剥 max_tokens: %s", out)
 	}
 	// hy4/glm 系：不剥
 	for _, model := range []string{"hy4-preview-f", "cn:glm-5.2", "kimi-k2"} {
-		out := stripUnsupportedParamsForModel(mk(model))
+		out := stripUnsupportedParamsForModel(mk(model), "cn")
 		if !has(out, "max_tokens") {
 			t.Errorf("%s 不应被剥 max_tokens: %s", model, out)
 		}

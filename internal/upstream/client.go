@@ -1717,7 +1717,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// codex 系模型参数兼容（2026-09-27 实测）：global:gpt-5.4 / gpt-5.3-codex 对
 	// max_tokens / max_completion_tokens 一律 400 11133 model_param_invalid，
 	// 不带则 200。剥参代价 = 输出上限走模型默认，远好于整请求失败。
-	prepared = stripUnsupportedParamsForModel(prepared)
+	prepared = stripUnsupportedParamsForModel(prepared, a.Realm())
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
@@ -1816,7 +1816,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 // 规则：模型名含 codex / deepseek 或以 gpt- 开头 → 剥 max_tokens /
 // max_completion_tokens。误剥的代价是「输出上限走模型默认上限」，远好于整个
 // 请求被 400 打回；因此按名字宽匹配，而不是维护一张精确名单。
-func stripUnsupportedParamsForModel(body []byte) []byte {
+func stripUnsupportedParamsForModel(body []byte, realm string) []byte {
 	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {
 		return body
@@ -1832,10 +1832,10 @@ func stripUnsupportedParamsForModel(body []byte) []byte {
 	}
 	changed := false
 	stripKeys := []string{"max_tokens", "max_completion_tokens"}
-	if strings.Contains(ml, "deepseek") {
-		// deepseek-v4.1-flash 上游不接受 reasoning_effort/thinking 参数名，
-		// 硬发则 400 code=11133。这些是 wb2api prepareBody 加的，去掉才能调用成功。
-		// 如果某个 deepseek 模型确实支持思考且上游有正确参数名，可单独加回。
+	if strings.Contains(ml, "deepseek") && realmKey(realm) == "global" {
+		// global 域 deepseek 上游不接受 reasoning_effort/thinking 参数名，硬发则 400 code=11133。
+		// thinking.go 逆向的是 CN 客户端（codebuddy），CN 域保留思考参数；
+		// global 域（workbuddy.ai）不认，去掉才能调用成功。
 		stripKeys = append(stripKeys, "reasoning_effort", "thinking")
 	}
 	for _, k := range stripKeys {
