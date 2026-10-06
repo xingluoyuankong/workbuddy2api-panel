@@ -810,8 +810,19 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 	// 仓库中未进主表的条目：
 	//   - Removed（被剔除的遗留模型 / 区域变体别名）：面板「已删除」筛选下可见，可恢复；
 	//   - 目录外条目（手工登记 / 实测发现的遗留模型）。
+	// 影子 orphan 去重：若 bare_id 已有 live 条目（上游目录在下发），直接跳过不下发——否则面板显示“同名两张卡”。
+	// 纯遗留 orphan（无 live 对应）保留，避免丢失唯一管理入口。
+	liveBare := make(map[string]bool)
+	for _, m := range out {
+		if b, _ := m["bare_id"].(string); b != "" {
+			liveBare[b] = true
+		}
+	}
 	for _, v := range p.cfg.ModelMeta.All() {
 		if seen[v.Key] {
+			continue
+		}
+		if !v.Removed && liveBare[v.ID] {
 			continue
 		}
 		appendEntry(map[string]any{
