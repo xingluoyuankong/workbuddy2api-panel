@@ -528,7 +528,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .mm-list { display: grid; gap: 10px; padding: 12px;
     grid-template-columns: repeat(auto-fill, minmax(430px, 1fr)); }
   @media (max-width: 900px) { .mm-list { grid-template-columns: 1fr; } }
-  .mm-card { border: 1px solid var(--line); border-radius: 10px; background: var(--surface);
+  .mm-card { border: 1px solid var(--line); border-radius: 10px; background: var(--surface); min-width: 0;
     overflow: hidden; display: flex; flex-direction: column; }
   .mm-card.free { border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
   .mm-card.gone { opacity: .55; }

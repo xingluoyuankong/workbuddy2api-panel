@@ -159,7 +159,7 @@ function go(v) {
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
-  if (v === 'models' && !$('mmList').children.length) loadModels();
+  if (v === 'models') loadModels(false);
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
@@ -965,7 +965,7 @@ function mmFlash(key) {
   el._t = setTimeout(() => el.classList.remove('on'), 1500);
 }
 
-async function loadModels() {
+async function loadModels(force) {
   const box = $('mmList');
   if (!box) {
     // 版本哨兵：HTML 与 app.js 不匹配（浏览器缓存了旧版 app.js 或旧版 HTML）。
@@ -976,6 +976,8 @@ async function loadModels() {
       '面板资源版本不匹配（浏览器缓存）。请按 <b>Ctrl+Shift+R</b>（Mac: <b>Cmd+Shift+R</b>）强制刷新。</div>');
     return;
   }
+  // 缓存优先：非强制刷新且已有数据时直接渲染，不显示 loading。模型目录/价格/倍率由后端每日0点更新，面板切换不重复拉取。
+  if (!force && MM.rows && MM.rows.length) { mmRender(); return; }
   box.innerHTML = '<div class="empty">正在查询模型目录与元数据…</div>';
   try {
     const d = await api('modelmeta');
@@ -987,7 +989,7 @@ async function loadModels() {
     $('mmList').innerHTML = '<div class="empty">' + esc(e.message) + '</div>';
   }
 }
-el('btnModels').onclick = loadModels;
+el('btnModels').onclick = () => loadModels(true);
 
 /* 筛选 / 排序 / 搜索 */
 on('mmRealm', 'click', ev => {
