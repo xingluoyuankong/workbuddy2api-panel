@@ -211,3 +211,38 @@ func TestPrepareBodyDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// deepseek 系也拒收 max_tokens（2026-10-06 上游行为变更，9 次 400 code=11133）：
+// strip 名单按宽匹配覆盖 deepseek，hy4 等不受影响的模型不误剥。
+func TestStripUnsupportedParamsDeepseek(t *testing.T) {
+	mk := func(model string) []byte {
+		return []byte(`{"model":"` + model + `","messages":[],"max_tokens":100,"max_completion_tokens":50}`)
+	}
+	has := func(out []byte, k string) bool {
+		var m map[string]any
+		if err := json.Unmarshal(out, &m); err != nil {
+			return false
+		}
+		_, ok := m[k]
+		return ok
+	}
+	// deepseek 系：剥掉
+	for _, model := range []string{"deepseek-v4.1-flash", "global:deepseek-v4.1-flash", "DeepSeek-V3"} {
+		out := stripUnsupportedParamsForModel(mk(model))
+		if has(out, "max_tokens") || has(out, "max_completion_tokens") {
+			t.Errorf("%s 应剥 max_tokens/max_completion_tokens: %s", model, out)
+		}
+	}
+	// codex/gpt- 系：保持原有行为
+	out := stripUnsupportedParamsForModel(mk("gpt-5.3-codex"))
+	if has(out, "max_tokens") {
+		t.Errorf("gpt-5.3-codex 应剥 max_tokens: %s", out)
+	}
+	// hy4/glm 系：不剥
+	for _, model := range []string{"hy4-preview-f", "cn:glm-5.2", "kimi-k2"} {
+		out := stripUnsupportedParamsForModel(mk(model))
+		if !has(out, "max_tokens") {
+			t.Errorf("%s 不应被剥 max_tokens: %s", model, out)
+		}
+	}
+}

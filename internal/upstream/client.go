@@ -1808,11 +1808,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 // 现状（2026-09-27 上游实测）：global 域 codex 系（gpt-5.3-codex / gpt-5.4）对
 // max_tokens / max_completion_tokens 一律返回 400 code=11133 model_param_invalid，
 // 两个参数去掉任何一个都仍然 11133，只有完全不带才 200。CN 域模型与 global 的
-// glm/hy4/kimi/deepseek 系实测无此限制。
+// glm/hy4/kimi 系实测无此限制。
+// 2026-10-06 追加：global:deepseek-v4.1-flash 也开始拒收 max_tokens
+// （48h 内 9 次 400 code=11133，17:49 一分钟内两号连撞；9-27 实测时还不拒，
+// 上游行为变了——这份名单会随上游行为漂移，见此注释即加）。
 //
-// 规则：模型名含 codex 或以 gpt- 开头（OpenAI 系）→ 剥 max_tokens /
+// 规则：模型名含 codex / deepseek 或以 gpt- 开头 → 剥 max_tokens /
 // max_completion_tokens。误剥的代价是「输出上限走模型默认上限」，远好于整个
-// 请求被 400 打回；因此按名字前缀宽匹配，而不是维护一张精确名单。
+// 请求被 400 打回；因此按名字宽匹配，而不是维护一张精确名单。
 func stripUnsupportedParamsForModel(body []byte) []byte {
 	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {
@@ -1823,7 +1826,8 @@ func stripUnsupportedParamsForModel(body []byte) []byte {
 		return body
 	}
 	ml := strings.ToLower(model)
-	if !strings.Contains(ml, "codex") && !strings.HasPrefix(ml, "gpt-") {
+	if !strings.Contains(ml, "codex") && !strings.HasPrefix(ml, "gpt-") &&
+		!strings.Contains(ml, "deepseek") {
 		return body
 	}
 	changed := false
