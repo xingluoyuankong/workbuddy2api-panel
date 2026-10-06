@@ -1733,3 +1733,31 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 		t.Fatalf("state.json contains credential field: %s", raw)
 	}
 }
+
+// 全冷却兜底应推进 usedSeq：连续兜底请求轮换试探不同账号，
+// 而不是反复命中同一个最早到期号。
+func TestFallbackAdvancesUsedSeq(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	// 两号都软冷却，u1 先到期
+	p.Cooldown("u1", CoolSoft, time.Minute, "test")
+	p.Cooldown("u2", CoolSoft, 2*time.Minute, "test")
+
+	first := p.PickExcluding(nil)
+	if first == nil || first.UID != "u1" {
+		t.Fatalf("首次兜底应选中 u1，got %v", first)
+	}
+	if p.byUID["u1"].usedSeq == 0 {
+		t.Fatal("兜底未推进 usedSeq")
+	}
+	// u1 冷却被延长（仍不可用），tried 排除 u1 后应换 u2 试探
+	p.Cooldown("u1", CoolSoft, 3*time.Minute, "test")
+	second := p.PickExcluding(map[string]bool{"u1": true})
+	if second == nil || second.UID != "u2" {
+		t.Fatalf("二次兜底应换 u2 试探，got %v", second)
+	}
+	if p.byUID["u2"].usedSeq <= p.byUID["u1"].usedSeq {
+		t.Fatal("u2 的 usedSeq 应大于 u1")
+	}
+}

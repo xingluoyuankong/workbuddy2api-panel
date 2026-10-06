@@ -230,6 +230,10 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	}
 	log.Printf("pool: fallback_earliest_expiry uid=%s until=%s kind=%s", best.a.UID, best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
+	// 兜底也要推进 usedSeq：否则连续兜底请求会反复命中同一个最早到期号
+	// （usedSeq 陈旧 → LRU 永远选它），起不到轮换试探的作用。
+	p.pickSeq++
+	best.usedSeq = p.pickSeq
 	return best.a
 }
 
