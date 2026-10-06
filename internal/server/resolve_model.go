@@ -11,6 +11,13 @@ import "strings"
 //
 // 导出为 ResolveModel（cmd/server/main.go 粘性闭包需要），包内简写 resolveModel。
 func resolveModel(model string) (realm, bare string) {
+	// 客户端自定义前缀（如 custom-local:）是客户端本地网关的标记，
+	// 不是 wb2api 的 realm 协议，先剥掉再解析。
+	// 否则 custom-local:global:deepseek-x 会被误判为 realm=cn、
+	// bare=custom-local:global:deepseek-x，导致路由错误和参数剥除失效。
+	if strings.HasPrefix(model, "custom-local:") {
+		model = strings.TrimPrefix(model, "custom-local:")
+	}
 	idx := strings.IndexByte(model, ':')
 	if idx < 0 {
 		return "cn", model
