@@ -1128,7 +1128,7 @@ func newProxyEntry(raw string) (*proxyEntry, error) {
 	var tr *http.Transport
 	switch strings.ToLower(u.Scheme) {
 	case "socks5", "socks5h":
-		d := &socks5Dialer{addr: host, forward: newDialer()}
+		d := &socks5Dialer{addr: host, forward: newCachedDialer(newDialer())}
 		if u.User != nil {
 			d.user = u.User.Username()
 			d.pass, _ = u.User.Password()

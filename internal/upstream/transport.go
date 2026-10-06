@@ -66,7 +66,9 @@ func newDialer() *net.Dialer {
 //   - TCP 层：DialContext 10s 建连上限 + 15s keepalive 探测，半开连接在建立期
 //     和复用期都能被快速识别（见 dialTimeout/dialKeepAlive 注释）。
 func newTransport() *http.Transport {
-	dialer := newDialer()
+	// DNS ç¼å­æ¨å·å¨ï¼ä»£ç/ä¸æ¸¸ååè§£æç»ææä¸»æºåç¼å­å¤ç¨
+	//ï¼ä»£çé¾æ¥åæ´å³æ°å»º Transport + æ°ç¼å­å®ä¾ï¼å¤©ç¶éç¦»ï¼ã
+	dialer := newCachedDialer(newDialer())
 	return &http.Transport{
 		DialContext: dialer.DialContext,
 		// 空 TLSNextProto（非 nil）真正禁 h2：见函数注释。必须 make 而非 nil——

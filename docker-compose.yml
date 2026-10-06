@@ -34,7 +34,6 @@ services:
     # 让容器能用 host.docker.internal 访问宿主上的 resin 代理网关（2268/2269）。
     extra_hosts:
       - "host.docker.internal:host-gateway"
-      - "resin-proxy.your-domain.example:host-gateway"
     networks:
       - default
       # 与 warp 代理容器同网，供 global 域走代理出口（config: upstream.proxy_global）。

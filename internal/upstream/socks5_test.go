@@ -64,7 +64,7 @@ func fakeSocks5(t *testing.T, reply byte) (addr string, got *string) {
 
 func TestSocks5DialerHandshake(t *testing.T) {
 	addr, got := fakeSocks5(t, 0x00)
-	d := &socks5Dialer{addr: addr, forward: newDialer()}
+	d := &socks5Dialer{addr: addr, forward: newCachedDialer(newDialer())}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c, err := d.DialContext(ctx, "tcp", "example.com:443")
@@ -80,7 +80,7 @@ func TestSocks5DialerHandshake(t *testing.T) {
 
 func TestSocks5DialerReject(t *testing.T) {
 	addr, _ := fakeSocks5(t, 0x05) // 0x05 = connection refused
-	d := &socks5Dialer{addr: addr, forward: newDialer()}
+	d := &socks5Dialer{addr: addr, forward: newCachedDialer(newDialer())}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err := d.DialContext(ctx, "tcp", "example.com:443")
@@ -93,7 +93,7 @@ func TestSocks5DialerReject(t *testing.T) {
 }
 
 func TestSocks5DialerBadAddr(t *testing.T) {
-	d := &socks5Dialer{addr: "127.0.0.1:1", forward: newDialer()}
+	d := &socks5Dialer{addr: "127.0.0.1:1", forward: newCachedDialer(newDialer())}
 	if _, err := d.DialContext(context.Background(), "tcp", "no-port"); err == nil {
 		t.Error("addr without port must error")
 	}

@@ -30,7 +30,7 @@ type socks5Dialer struct {
 	user    string // 空 = 无认证
 	pass    string
 	// forward 建连到代理用的拨号器（复用网关统一的 10s 建连上限 + keepalive）。
-	forward *net.Dialer
+	forward *cachedDialer
 }
 
 // DialContext 实现 ContextDialer，可直接挂到 http.Transport.DialContext。
