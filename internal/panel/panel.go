@@ -450,6 +450,13 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Usage != nil {
 		cacheByUID = p.cfg.Usage.CacheByAccount()
 	}
+	// 全账号缓存汇总（顶部汇总块数据源；口径与按账号列一致：全量历史桶聚合）。
+	var cacheTotal usage.CacheStat
+	for _, cs := range cacheByUID {
+		cacheTotal.HitTokens += cs.HitTokens
+		cacheTotal.PromptTokens += cs.PromptTokens
+		cacheTotal.Samples += cs.Samples
+	}
 	accounts := p.cfg.Pool.List()
 	rows := make([]accountRow, len(accounts))
 	for i, st := range accounts {
@@ -518,6 +525,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 账号代理：bound = 已绑定且启用的账号数，bad = 出口异常的账号数。
 		"proxy_bound": pxBound,
 		"proxy_bad":   pxBad,
+		"cache_summary": cacheSummaryJSON(cacheTotal),
 		"accounts":    rows,
 	})
 }
@@ -689,6 +697,16 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 近 7 天按模型用量（稳定值的数据源；key 为 "realm:model"，与 freeSet 同口径）。
+	var usage7d map[string]usage.Agg
+	if p.cfg.Usage != nil {
+		usage7d = make(map[string]usage.Agg)
+		for _, ka := range p.cfg.Usage.SnapshotWithCost(24*7, nil, nil).ByModel {
+			usage7d[ka.Key] = ka.Agg
+		}
+	}
+	freeSet := p.freeModels()
+
 	appendEntry := func(m map[string]any, realm, id, name string) {
 		k := realm + ":" + id
 		if seen[k] {
@@ -744,6 +762,26 @@ func (p *Panel) modelMeta(w http.ResponseWriter, r *http.Request) {
 				"limit":     qs.limit, // 实测额度（0 = 尚未观测到撞线，额度未知）
 				"used":      qs.used,
 			}
+		}
+		// 免费模型稳定值（0-100，三维度加权；口径见 stability.go）。
+		// 非免费模型不下发——收费模型谈"稳定值"会误导。
+		if freeSet[k] {
+			var agg usage.Agg
+			if usage7d != nil {
+						agg = usage7d[k]
+			}
+			catalog, _ := m["credits"].(string)
+			in := stabilityInput{
+				Requests: agg.Requests,
+				Errors:   agg.Errors,
+				Credits:  agg.Credits,
+				Catalog:  catalog,
+			}
+			if qs, ok := qstat[k]; ok {
+				in.Accounts = qs.accounts
+				in.Exhausted = qs.exhausted
+			}
+			m["stability"] = calcStability(in)
 		}
 		// 成本账本：实测单价与免费判定。面板据此标「免费」徽标，
 		// 让用户一眼看出该用哪个变体（如 hy4-preview-f 免费、hy4-preview 收费）。

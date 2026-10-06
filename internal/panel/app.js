@@ -583,6 +583,17 @@ async function loadOverview(quiet) {
     $('sCooling').textContent = d.cooling;
     $('sDisabled').textContent = d.disabled;
     renderCreditsByRealm(d.accounts || []);
+    // 上下文缓存率汇总（全账号聚合；口径与账号列表缓存率列一致：全量历史）。
+    // 无数据时后端不下发 rate，前端显示"-"（与账号列同语义）。
+    const cs = d.cache_summary || {};
+    const csEl = $('sCacheRate');
+    if (csEl) {
+      csEl.textContent = (cs.rate != null) ? (cs.rate * 100).toFixed(1) + '%' : '-';
+      const csCard = csEl.closest('.stat');
+      if (csCard) csCard.title = '全账号前缀缓存命中率（' + (cs.window || '全量历史') + '）\n' +
+        '命中 ' + fmtCredit(cs.hit_tokens) + ' / 输入 ' + fmtCredit(cs.prompt_tokens) + ' tokens' +
+        ' · ' + (cs.samples || 0) + ' 个样本';
+    }
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
@@ -821,6 +832,29 @@ function mmCard(m) {
 
 /* mmQuotaToday 模型卡「今日额度」行：跨账号聚合（后端只对免费模型下发）。
    额度语义只对免费模型成立——按量计费的模型谈"额度"是误导。 */
+/* mmStability 模型卡「稳定值」行：仅免费模型显示（0-100，三维度加权）。
+   口径（后端 stability.go，与 tooltip 明细一致，不许黑盒）：
+   成功率×50（近7天 1-e/q，样本<10 不打分）+
+   额度×30（今日跨账号 6004 耗尽率；7天频率无历史台账暂用今日值）+
+   价格×20（今日目录 x0.00=100；涨价/缺席但7天实扣0=50；实扣>0=0）。
+   非免费模型不显示——收费模型谈"稳定值"会误导。 */
+function mmStability(m) {
+  if (!mmIsFree(m)) return '';
+  const s = m.stability;
+  if (!s) return '';
+  if (s.score == null) {
+    return '<div class="mm-kv"><span class="lb">稳定值</span><span style="color:var(--ink-3)" title="' +
+      esc(s.note || '样本不足') + '">样本不足</span></div>';
+  }
+  const color = s.score >= 80 ? 'var(--ok)' : s.score >= 60 ? 'var(--warn)' : 'var(--bad)';
+  const tip = '成功率 ' + (s.success != null ? s.success.toFixed(1) : '—') + '（近7天 ' + (s.samples || 0) + ' 次请求，权重50）\n' +
+    '额度 ' + (s.quota != null ? s.quota.toFixed(1) : '—') + '（今日跨账号耗尽率，权重30）\n' +
+    '价格 ' + s.price.toFixed(0) + '（今日目录价+7天实扣，权重20）' +
+    (s.note ? '\n' + s.note : '');
+  return '<div class="mm-kv"><span class="lb">稳定值</span><span style="color:' + color + '" title="' +
+    esc(tip) + '">' + s.score + ' 分</span></div>';
+}
+
 function mmQuotaToday(m) {
   const q = m.quota_today;
   if (!q || !q.accounts) return '';
@@ -849,6 +883,7 @@ function mmQuotaToday(m) {
       '<div class="mm-kv"><span class="lb">调用名</span>' + mmCopy(key, '调用名') + '</div>' +
       '<div class="mm-kv"><span class="lb">消耗</span><span' + ledgerTip + '>' + credit + '</span></div>' +
       mmQuotaToday(m) +
+      mmStability(m) +
       '<div class="mm-kv"><span class="lb">倍率</span><span>' +
         (m.credits ? esc(m.credits) : '<span style="color:var(--ink-3)">—</span>') + '</span></div>' +
         (m.credits ? esc(m.credits) : '<span style="color:var(--ink-3)">—</span>') + '</span></div>' +
