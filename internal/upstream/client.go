@@ -1757,6 +1757,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("WARN: [upstream] chat_stream uid=%s realm=%s model=%s: upstream %d %s body=%s",
 				logfmt.UID8(a.UID), realmKey(a.Realm()), modelOf(prepared), resp.StatusCode, kind, truncate(string(raw), 200))
+			// 自动学习：11133 = 参数被上游拒收。若请求带了思考参数，
+			// 说明该模型不支持自定义思考，加入黑名单，下次走默认。
+			if strings.Contains(string(raw), "11133") {
+				bk := realmKey(a.Realm()) + ":" + modelOf(prepared)
+			if _, loaded := thinkingNoSupport.LoadOrStore(bk, true); !loaded {
+				log.Printf("LEARN: [upstream] model %s 不支持思考参数，已加入黑名单（下次走默认）", bk)
+				}
+			}
 			// global 首次路径 404/405 或 **WAF 拦截页 403** → 换 fallback 路径重试
 			// （见 chatPathFallback：WAF 规则只覆盖 /console，/v2 可直通）；其余状态码直接返回。
 			if attempt < len(c.chatPaths(a))-1 && chatPathFallback(resp.StatusCode, raw) {
@@ -1803,6 +1811,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }
 
+// thinkingNoSupport 思考参数黑名单：这些 (realm, model) 上游不接受思考参数，发了就 11133。
+// key = realm + ":" + bare_model。自动学习：遇到 11133 自动加入。预置已知不支持的；
+// 其他模型默认支持自定义（面板 UI/下游传的值被尊重）。
+var thinkingNoSupport = func() *sync.Map {
+	m := &sync.Map{}
+	m.Store("global:deepseek-v4.1-flash", true)
+	return m
+}()
+
 // stripUnsupportedParamsForModel 剥掉特定模型不接受、会直接 400 的请求参数。
 //
 // 现状（2026-09-27 上游实测）：global 域 codex 系（gpt-5.3-codex / gpt-5.4）对
@@ -1832,11 +1849,11 @@ func stripUnsupportedParamsForModel(body []byte, realm string) []byte {
 	}
 	changed := false
 	stripKeys := []string{"max_tokens", "max_completion_tokens"}
-	if strings.Contains(ml, "deepseek") && realmKey(realm) == "global" {
-		// global 域 deepseek-v4.1-flash：vLLM 文档明确：thinking/reasoning_effort 都不发时，
-		// 思考默认开启（effort 50）。硬发参数反而 11133。
-		// 不发 = 用默认思考，不是删功能。cn 域保留（thinking.go 逆向证实可用）。
-		stripKeys = append(stripKeys, "thinking", "reasoning_effort")
+	// 思考参数黑名单检查：在黑名单中的模型不发思考参数（走默认），
+	// 否则尊重面板 UI/下游的自定义值。
+	blockKey := realmKey(realm) + ":" + model
+	if _, blocked := thinkingNoSupport.Load(blockKey); blocked {
+		stripKeys = append(stripKeys, "thinking", "thinking_effort", "reasoning_effort", "reasoningEffort")
 	}
 	for _, k := range stripKeys {
 		if _, ok := m[k]; ok {
