@@ -50,7 +50,7 @@ var globalEffortFallback = map[string]effortCap{
 	"primary-model":       {efforts: []string{"high"}},
 	"hy4-preview-f":       {efforts: []string{"high"}, defaultEffort: "high"},
 	"hy3":                 {efforts: []string{"low", "high"}, defaultEffort: "high"},
-	"deepseek-v4.1-flash": {efforts: []string{"high"}},
+	"deepseek-v4.1-flash": {efforts: []string{"low", "high", "max"}, defaultEffort: "max"}, // 2026-10-07 实测：上游接受 max，issue #84 已过时
 	"gpt-6-astra":         {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
 	"gpt-5.6-sol":         {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
 	"gpt-5.6-terra":       {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
