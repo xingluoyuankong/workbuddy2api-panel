@@ -48,6 +48,16 @@ func isDeepSeekModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek")
 }
 
+// isGLMModel 判断是否为 GLM 系列模型（需 qwen 格式 enable_thinking）。
+func isGLMModel(model string) bool {
+	lm := strings.ToLower(strings.TrimSpace(model))
+	// 处理带 realm 前缀的模型名，如 global:glm-5.2
+	if idx := strings.LastIndex(lm, ":"); idx >= 0 {
+		lm = lm[idx+1:]
+	}
+	return strings.HasPrefix(lm, "glm")
+}
+
 // backfillReasoningContent DeepSeek 多轮一致性：历史 assistant 消息带 reasoning 痕迹时，
 // 上游要求后续请求所有 assistant 消息都带 reasoning_content 字段（string，可为空串）
 // ——即 requiresReasoningContentOnAssistantMessages（官方客户端 matches 规则）。

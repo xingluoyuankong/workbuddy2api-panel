@@ -117,8 +117,10 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 			`{"model":"glm-5.2","reasoning_effort":"ultra"}`, efforts, "reasoning_effort", "ultra"},
 		{"empty cache passes through",
 			`{"model":"glm-5.2","reasoning_effort":"max"}`, map[string][]string{}, "reasoning_effort", "max"},
-		{"no effort field untouched",
-			`{"model":"glm-5.2-mini","messages":[]}`, efforts, "", ""},
+		{"no effort field untouched (non-GLM)",
+			`{"model":"kimi-k2.5","messages":[]}`, efforts, "", ""},
+		{"glm injects effort",
+			`{"model":"glm-5.2","messages":[]}`, efforts, "reasoning_effort", "high"},
 		{"nil efforts map passes through",
 			`{"model":"glm-5.2","reasoning_effort":"max"}`, nil, "reasoning_effort", "max"},
 	}

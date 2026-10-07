@@ -270,9 +270,9 @@ func TestInjectThinkingSkipNonDeepSeek(t *testing.T) {
 					t.Errorf("thinking 被改动: in=%s out=%s", inJSON, outJSON)
 				}
 			}
-			// 非 deepseek 不得新增 thinking 相关字段；允许的既有新增字段：
-			// stream（强制流式）+ stream_options（D7 include_usage，CLI 流式必发）。
-			allowedNew := map[string]bool{"stream": true, "stream_options": true}
+			// 非 deepseek 不得新增 thinking 字段；允许的新增字段：
+			// stream（强制流式）+ stream_options（D7）+ GLM 的 enable_thinking/reasoning_effort（qwen 格式）。
+			allowedNew := map[string]bool{"stream": true, "stream_options": true, "enable_thinking": true, "reasoning_effort": true}
 			if len(got) > len(in)+len(allowedNew) {
 				for k := range got {
 					if _, had := in[k]; !had && !allowedNew[k] {

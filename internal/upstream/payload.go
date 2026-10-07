@@ -71,6 +71,23 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
 	modelName, _ := obj["model"].(string)
 	injectThinking(obj, lookupDefaultEffort(defaultEfforts, modelName))
+	// GLM 思考注入：qwen 系 enable_thinking 格式。glm-5.2 需显式开启，
+	// glm-5.3+ 默认开但显式发也无害。
+	if isGLMModel(modelName) {
+		if _, ok := obj["enable_thinking"]; !ok {
+			obj["enable_thinking"] = true
+		}
+		// 检查 snake_case 和 camelCase 两种形式，避免重复添加
+		_, hasSnake := obj["reasoning_effort"]
+		_, hasCamel := obj["reasoningEffort"]
+		if !hasSnake && !hasCamel {
+			if def, ok := defaultEfforts[modelName]; ok && def != "" {
+				obj["reasoning_effort"] = def
+			} else {
+				obj["reasoning_effort"] = "high"
+			}
+		}
+	}
 	normalizeReasoningEffort(obj, efforts)
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
