@@ -33,7 +33,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"math/rand"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -42,6 +41,17 @@ import (
 
 // proxyState 单个账号代理的处置状态。
 type proxyState int
+
+// 自动换绑相关默认值（用户可经 config.json account_proxy.rebind_window /
+// active_window 覆盖；见 AccountProxyOptions）。
+const (
+	// DefaultRebindWindow 同一账号自动换绑的防抖窗口：撞 IP 时窗口内换一次即可，
+	// 之后 10 分钟内不再重复折腾（需求①：10 分钟之内换绑到其他 IP 就行）。
+	DefaultRebindWindow = 10 * time.Minute
+	// DefaultActiveWindow 「使用中」判定窗口：最近这么久内有真实出站请求的账号
+	// 视为在用，同 IP 冲突时优先保留它、换绑空闲账号（需求②）。
+	DefaultActiveWindow = 10 * time.Minute
+)
 
 const (
 	proxyStateUnchecked    proxyState = iota // 还没校验过（启动后首次请求先放行）
@@ -132,6 +142,27 @@ type AccountProxyOptions struct {
 	// 代价：并发高时请求会排队（等待时间最坏 = 并发数 × 间隔），所以默认关闭且
 	// 配置上限 5s（normalize 校验）。
 	MinInterval time.Duration
+
+	// RebindWindow 同一账号两次「自动换绑」的最小间隔（防抖窗口）。默认 10m。
+	//
+	// 语义（用户定稿 2026-10-07）：**不是**「窗口内禁止换绑」，而是「出口 IP 与
+	// 别的账号撞了时，在窗口内换到另一个 IP 就行」——撞了就换、换完 10 分钟内
+	// 不再因为同一原因反复折腾。旧实现硬编码 5 分钟且把窗口当锁死期，导致
+	// 「明明撞了也不换、非要等满 5 分钟」，被用户判定为「限制太死」。
+	// 置 0 用默认 10m；负值表示彻底关闭防抖（每次巡检都可换，慎用）。
+	RebindWindow time.Duration
+
+	// ActiveWindow 「账号是否正在被使用」的判定窗口。默认 10m。
+	//
+	// 一个绑定的 lastReq（最近一次真实出站请求）落在 now-ActiveWindow 之内即
+	// 视为「使用中」；否则「空闲」。同 IP 冲突时**优先换绑空闲账号**（需求②）：
+	// 正在服役的账号尽量不动，避免打断线上调用。
+	ActiveWindow time.Duration
+
+	// MinFreeIPs 池内「空闲出口 IP」的软下限。当池里可用的不同出口 IP 数
+	// 不足绑定账号数时，bindFirstUsable 会放宽反亲和（允许复用 IP），否则
+	// 池子小的时候会导致大量账号解绑回落直连。0 = 不启用该放宽（严格反亲和）。
+	MinFreeIPs int
 }
 
 // AccountProxyEntry 单账号代理绑定（落盘结构）。
@@ -264,15 +295,43 @@ type accountBinding struct {
 	callAt atomic.Int64
 	// sharedBlocked 该账号因「同出口 IP 承载账号超限」被隔离（MaxPerIPAction=quarantine）。
 	sharedBlocked atomic.Bool
-	// lastRebind 上次换绑时间（unix nano）。
-	lastRebind atomic.Int64
-	// conflictLogged 冲突已记录（避免同一冲突刷屏）。
-	conflictLogged atomic.Bool
-	// scheduledRebind 计划换绑时间（unix nano，0=无计划）。
-	// IP 冲突时不立即换绑，而是计划在10-15分钟内执行。
-	scheduledRebind atomic.Int64
-	// rebindReason 换绑原因（仅调试日志用）。
-	rebindReason atomicString
+	// 【已废弃】lastRebind / conflictLogged 原挂在这里，但 bindFirstUsable 换绑
+	// 会重建绑定对象导致时间戳丢失（防抖失效、每分钟换绑死循环）。
+	// 现统一挂在 AccountProxy.rebindAt（uid → *rebindState），与本结构体解耦。
+}
+
+// inUse 该绑定是否「正在被使用」（需求②判定依据）。
+//
+// 判定用 lastReq（每次真实出站请求的 CAS 时间戳，热路径写入，最权威）为主、
+// callAt（调用链路口采样）为辅：任一落在 now-window 之内即算在用。
+// window<=0 时退化为「恒不在用」，便于关闭该特性。
+func (b *accountBinding) inUse(window time.Duration) bool {
+	if b == nil || window <= 0 {
+		return false
+	}
+	now := time.Now().UnixNano()
+	if w := window.Nanoseconds(); w > 0 {
+		if lr := b.lastReq.Load(); lr > 0 && now-lr <= w {
+			return true
+		}
+		if ca := b.callAt.Load(); ca > 0 && now-ca*int64(time.Millisecond) <= w {
+			return true
+		}
+	}
+	return false
+}
+
+// effectiveIP 返回该绑定当前对外可见的出口 IP。优先 probeIP（校验侧多源实测），
+// 为空时回落 callIP（调用链路口采样）——冲突检测必须同时看两个来源，否则
+// 「校验还没跑但已经在调用」的账号其出口 IP 在冲突检测里是盲区。
+func (b *accountBinding) effectiveIP() string {
+	if b == nil {
+		return ""
+	}
+	if ip := b.probeIP.Load(); ip != "" {
+		return ip
+	}
+	return b.callIP.Load()
 }
 
 // AccountProxy 账号代理守卫。
@@ -295,6 +354,11 @@ type AccountProxy struct {
 	// 「选哪条链接」的决策必须串行——否则并发账号同时读到空绑定快照，
 	// 全部绑到同一条链接（实测 4 账号同链接同出口 IP，风控高危）。
 	bindSerial sync.Mutex
+	// scanMu 每账号巡检互斥（AutoBindAccount 入口全局串行）。
+	// 巡检含 8-20s 网络探活，上一轮未结束下一轮又进来会对同一账号重复
+	// 触发换绑（2026-10-07 晚实测：同一换绑一秒打两遍）。main.go 的巡检
+	// 循环本来就并发各账号，这里只在账号粒度去重即可。
+	scanMu sync.Mutex
 	// directIPCache 直连出口 IP（每次扫都重测成本高，缓存到 check 周期粒度）。
 	directIPCache atomicString
 	// 直连出口的地理与运营方（与 directIPCache 同一次探测取得）。
@@ -307,6 +371,12 @@ type AccountProxy struct {
 	checkMu sync.Mutex // 串行化校验，避免面板手触发与周期校验并发打同一批代理
 	runs    atomic.Uint64
 	shared  atomic.Pointer[map[string]int] // ip → 账号数（上次扫描结果）
+
+	// rebindAt 每账号换绑状态（上次换绑时刻 + 冲突登记）。
+	// 【关键】必须挂在 AccountProxy 级而不是 accountBinding 上：bindFirstUsable
+	// 换绑时会**重建绑定对象**，挂在绑定上的时间戳随旧对象一起丢弃——防抖
+	// 永远失效（2026-10-07 晚实测：resin 出口轮换导致每分钟换绑一次的死循环）。
+	rebindAt map[string]*rebindState
 }
 
 // NewAccountProxy 构建守卫；File 为空时等同关闭（所有查询返回未绑定）。
@@ -320,12 +390,19 @@ func NewAccountProxy(opts AccountProxyOptions) *AccountProxy {
 	if opts.ProbeTimeout <= 0 {
 		opts.ProbeTimeout = 20 * time.Second
 	}
+	if opts.RebindWindow == 0 {
+		opts.RebindWindow = DefaultRebindWindow
+	}
+	if opts.ActiveWindow == 0 {
+		opts.ActiveWindow = DefaultActiveWindow
+	}
 	tr := newTransport()
 	m := &AccountProxy{
 		opts:     opts,
 		doc:      &accountProxyDoc{Version: 1, Accounts: map[string]*AccountProxyEntry{}},
 		bindings: map[string]*accountBinding{},
 		direct:   &http.Client{Timeout: 30 * time.Second, Transport: tr},
+		rebindAt: map[string]*rebindState{},
 	}
 	return m
 }
@@ -457,16 +534,24 @@ func (m *AccountProxy) probeCandidate(raw string) bool {
 	return ok
 }
 
-// AutoBindAccount 自动绑定：无绑定账号粘住池里最稳定链接；auto 绑定的链接
-// 连续校验失败（fails>=2）时换绑到下一条稳定链接。手动绑定（auto=false）
-// 永不改动。换绑保留原 Enabled/Label/Note，清掉旧出口采样。
+// AutoBindAccount 自动绑定巡检（每账号每轮一次）：
 //
-// 设计语义（用户定稿）：**不是随机轮询**——账号粘住一条稳定出口，只有它坏了
-// 才切换；切换后重新粘住。与池轮询（pickProxy 分散负载）是两种模式。
+// 铁律（用户定稿 2026-10-08）：
+//   ① 链接活着就绝不动——同 IP 冲突只登记，12 分钟宽限后仍冲突才换；
+//   ② 冲突要换时优先换未使用账号；
+//   ③ 只有「使用中账号」的链接探活连续失败才立即换绑；
+//   ④ 手动绑定（auto=false）/ 已停用永不改动。
+//
+// scanSerial 保证同一账号同一时刻只有一轮巡检在跑：探活最长 8-20s，上一轮
+// 还没结束下一轮又进来会重复触发换绑（2026-10-07 晚实测：同一换绑日志
+// 一秒内打两遍、两个并发换绑打架）。
 func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 	if m == nil || m.client == nil {
 		return
 	}
+	m.scanMu.Lock()
+	defer m.scanMu.Unlock()
+
 	// 严禁持锁做网络 IO（曾因此卡死整个服务）：锁外读快照 → 锁外探活/预检 →
 	// 短临界区提交。所有探活都在锁外完成。
 	m.mu.RLock()
@@ -501,96 +586,61 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 		b.entry.fails.Store(0) // 探活成功清零（抗抖动：瞬时不可用不累积）
 		b.probeIP.Store(ip)    // 刷新采样（面板显示 + 反亲和数据源）
 
-		// 同 IP 冲突检测（风控）：2026-10-07 重构。
-		// 规则：
-		// 1. 冲突不立即换绑，计划在10-15分钟内执行（随机避免雷群）。
-		// 2. 优先换未被使用账号：正在使用的账号不动，换闲置的。
-		// 3. 立即换绑仅在探活失败（IP不可用）时触发。
+		// ── 铁律（用户定稿 2026-10-08）：链接活着就不动 ──────────────
+		// 同 IP 冲突**不是立即换绑的理由**：只登记 firstConflictAt，进入
+		// ConflictGrace（12 分钟）宽限期。宽限期内什么都不做——resin 出口
+		// 轮换本来就会把两个账号短暂转到同一出口，几分钟后自然错开，
+		// 这期间任何换绑都是白折腾（昨晚实测：每分钟换一次，死循环）。
+		// 宽限期过后**仍然冲突**（说明两个 sticky 会话真的粘在同一出口）
+		// 才动手换：优先换未使用账号，其次确定性选一个。
 		m.mu.RLock()
-		var conflictUID string
-		var conflictBinding *accountBinding
+		var otherUID string
 		for ou, ob := range m.bindings {
-			if ou == uid {
-				continue
-			}
-			if oip := ob.probeIP.Load(); oip != "" && oip == ip {
-				conflictUID = ou
-				conflictBinding = ob
+			if ou != uid && ob.effectiveIP() == ip {
+				otherUID = ou
 				break
 			}
 		}
 		m.mu.RUnlock()
-		if conflictUID != "" {
-			// 判断哪个账号更闲：比较 lastReq（最近请求时间）
-			now := time.Now().UnixNano()
-			myLastReq := b.lastReq.Load()
-			otherLastReq := conflictBinding.lastReq.Load()
-			// 10分钟内有请求算"正在使用"
-			const activeWindow = 10 * 60 * 1e9
-			myActive := now-myLastReq < activeWindow
-			otherActive := now-otherLastReq < activeWindow
-			// 决策：优先换闲的。两个都闲或都忙时，换当前检测到的（避免两个同时换）。
-			targetUID := uid
-			targetB := b
-			reason := "conflict"
-			if myActive && !otherActive {
-				// 我忙对方闲：换对方
-				targetUID = conflictUID
-				targetB = conflictBinding
-				reason = "conflict-prefer-idle"
-			}
-			// 检查是否已有计划
-			if targetB.scheduledRebind.Load() == 0 {
-				// 10-15分钟随机延迟
-				delay := time.Duration(10*60+int64(rand.Intn(5*60))) * time.Second
-				scheduled := now + int64(delay)
-				targetB.scheduledRebind.Store(scheduled)
-				targetB.rebindReason.Store(reason)
-				log.Printf("[autobind] %s 出口 IP %s 冲突（%s vs %s），计划 %.0f 分钟后换绑 uid=%s（优先闲置）",
-					realm, ip, logfmt.UID8(uid), logfmt.UID8(conflictUID),
-					float64(delay)/float64(time.Minute), logfmt.UID8(targetUID))
-			}
-			// 检查当前账号是否有到期的计划换绑
-			if sched := b.scheduledRebind.Load(); sched != 0 && now >= sched {
-				b.scheduledRebind.Store(0)
-				log.Printf("[autobind] 执行计划换绑 uid=%s reason=%s", logfmt.UID8(uid), b.rebindReason.Load())
-				if m.bindFirstUsable(uid, realm) {
-					b.lastRebind.Store(now)
-					b.conflictLogged.Store(false)
-				}
-			}
-			return
-		}
-		// 无冲突时，也检查是否有到期的计划换绑
-		if sched := b.scheduledRebind.Load(); sched != 0 && time.Now().UnixNano() >= sched {
-			b.scheduledRebind.Store(0)
-			log.Printf("[autobind] 执行计划换绑 uid=%s reason=%s", logfmt.UID8(uid), b.rebindReason.Load())
-			if m.bindFirstUsable(uid, realm) {
-				b.lastRebind.Store(time.Now().UnixNano())
-				b.conflictLogged.Store(false)
-			}
+		if otherUID != "" {
+			m.deferConflictRebind(uid, otherUID, ip, realm)
 		}
 		return
 	}
 	b.entry.noteFail()
 
-	// 连续失败未达阈值：继续观察（避免网络抖动导致频繁换绑）
+	// ── 链接探活失败：这是唯一的「立即换绑」理由（用户铁律④）────
+	// 连续 2 次探活失败才动手（单次失败可能是网络抖动，探活本身也过代理）。
 	const failThreshold = 2
 	if b.entry.fails.Load() < failThreshold {
 		return
 	}
-
-	// ── 阈值达到：换绑（逐个探活候选）────────────────────────────
-	// 防抖：5 分钟内不重复换绑。
-	// 池里没有可用候选（全探活失败）→ 解绑回落直连（订阅恢复后自动重绑）。
 	now2 := time.Now().UnixNano()
-	if now2-b.lastRebind.Load() < 5*60*1e9 {
+	if m.inRebindCooldown(uid, now2) {
+		log.Printf("[autobind] %s 出口连续失败但 uid=%s 在防抖窗口内，本轮跳过", realm, logfmt.UID8(uid))
 		return
 	}
-	if m.bindFirstUsable(uid, realm) {
-		b.lastRebind.Store(now2)
-		log.Printf("[autobind] 绑定出口连续失败 %d 次，已换绑 uid=%s",
-			failThreshold, logfmt.UID8(uid))
+	if b.inUse(m.opts.ActiveWindow) {
+		// 使用中账号：立即换绑（它正在挨打，等不了宽限期）。
+		if m.bindFirstUsable(uid, realm) {
+			m.markRebound(uid, now2)
+			log.Printf("[autobind] %s 使用中账号出口连续失败 %d 次，立即换绑 uid=%s",
+				realm, failThreshold, logfmt.UID8(uid))
+			return
+		}
+	} else {
+		// 空闲账号：不急着换（没人用它），只解绑回落直连、卸掉死链接；
+		// 等它下次被使用时巡检自然会重新绑定可用出口。
+		m.markRebound(uid, now2)
+		m.mu.Lock()
+		if nb := m.bindings[uid]; nb == nil || nb.spec.Proxy != curRaw {
+			return // 并发：已变化
+		}
+		delete(m.doc.Accounts, uid)
+		delete(m.bindings, uid)
+		_ = m.saveLocked()
+		log.Printf("[autobind] %s 空闲账号出口连续失败 %d 次，解绑回落直连 uid=%s",
+			realm, failThreshold, logfmt.UID8(uid))
 		return
 	}
 	m.mu.Lock()
@@ -603,6 +653,143 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 	_ = m.saveLocked()
 	log.Printf("[autobind] %s 池内全部候选不可用，解绑回落直连 uid=%s", realm, logfmt.UID8(uid))
 }
+
+// ---------------------------------------------------------------------------
+// 换绑防抖与冲突宽限（时间戳全部存 AccountProxy.rebindAt，不随绑定对象重建丢失）
+// ---------------------------------------------------------------------------
+
+// rebindState 账号级换绑状态。
+type rebindState struct {
+	at            int64 // 上次换绑时刻（unix nano），0 = 从未
+	firstConflict int64 // 同 IP 冲突首次登记时刻（unix nano），0 = 无未决冲突
+}
+
+// ConflictGrace 同 IP 冲突的宽限期：冲突只登记不动手，超过该时长仍在冲突
+// 才执行换绑。默认 12 分钟（用户定稿：10-15 分钟之内换绑到其他 IP 就行）。
+const ConflictGrace = 12 * time.Minute
+
+// rebindStateLocked 取（或初始化）某账号的换绑状态。调用方必须已持有 m.mu 写锁。
+func (m *AccountProxy) rebindStateLocked(uid string) *rebindState {
+	if m.rebindAt == nil {
+		m.rebindAt = map[string]*rebindState{}
+	}
+	st := m.rebindAt[uid]
+	if st == nil {
+		st = &rebindState{}
+		m.rebindAt[uid] = st
+	}
+	return st
+}
+
+// inRebindCooldown 该账号是否仍在换绑防抖窗口内（窗口 = RebindWindow，默认 10m）。
+func (m *AccountProxy) inRebindCooldown(uid string, nowNano int64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	w := m.opts.RebindWindow
+	if w < 0 {
+		return false
+	}
+	if w == 0 {
+		w = DefaultRebindWindow
+	}
+	st := m.rebindAt[uid]
+	return st != nil && st.at > 0 && nowNano-st.at < w.Nanoseconds()
+}
+
+// markRebound 记录一次已完成的换绑（重置该账号的冲突登记）。
+func (m *AccountProxy) markRebound(uid string, nowNano int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.rebindStateLocked(uid)
+	st.at = nowNano
+	st.firstConflict = 0
+}
+
+// deferConflictRebind 冲突处置入口（每轮巡检调用，幂等）：
+//   - 首次发现冲突 → 只登记时间戳 + 打一条日志，**不换绑**；
+//   - 宽限期（ConflictGrace=12m）内再看到冲突 → 静默跳过；
+//   - 超过宽限期仍在冲突 → 选 mover（优先空闲账号）执行换绑。
+//
+// mover 决策：
+//  1. 一方使用中、一方空闲 → 换空闲的（保护线上调用）；
+//  2. 双方同状态 → 换 uid 字典序靠后的（确定性，避免两边来回踢皮球）。
+func (m *AccountProxy) deferConflictRebind(uid, otherUID, ip, realm string) {
+	now := time.Now().UnixNano()
+	m.mu.Lock()
+	st := m.rebindStateLocked(uid)
+	if st.firstConflict == 0 {
+		st.firstConflict = now
+		m.mu.Unlock()
+		log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突，登记待观察（%v 宽限期内不动） uid=%s",
+			realm, ip, logfmt.UID8(otherUID), ConflictGrace, logfmt.UID8(uid))
+		return
+	}
+	elapsed := time.Duration(now - st.firstConflict)
+	if elapsed < ConflictGrace {
+		m.mu.Unlock()
+		return // 宽限期内：什么都不做
+	}
+	// 宽限期已过、冲突仍在：选 mover。
+	selfB := m.bindings[uid]
+	otherB := m.bindings[otherUID]
+	if selfB == nil || otherB == nil {
+		m.mu.Unlock()
+		return
+	}
+	active := m.opts.ActiveWindow
+	selfInUse := selfB.inUse(active)
+	otherInUse := otherB.inUse(active)
+	moverUID := otherUID
+	why := "优先换绑未使用账号"
+	switch {
+	case selfInUse && !otherInUse:
+		moverUID = otherUID // 换空闲的对方
+	case !selfInUse && otherInUse:
+		moverUID = uid // 换空闲的自己
+	default:
+		// 都同状态：确定性换 uid 靠后的（避免两边来回踢皮球）。
+		why = "双方同状态，按确定性规则让位"
+		if otherUID < uid {
+			moverUID = otherUID
+		} else {
+			moverUID = uid
+		}
+	}
+	// 防抖：mover 近期换过就不再折腾（保留登记，下一轮冲突继续等）。
+	if m.moverCoolingLocked(moverUID, now) {
+		m.mu.Unlock()
+		return
+	}
+	// 清双方登记（换绑成败都不再重复触发），换绑在锁外做。
+	st.firstConflict = 0
+	if o := m.rebindAt[otherUID]; o != nil {
+		o.firstConflict = 0
+	}
+	m.mu.Unlock()
+
+	log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突持续超过 %v，%s → 换绑 uid=%s",
+		realm, ip, logfmt.UID8(otherUID), ConflictGrace, why, logfmt.UID8(moverUID))
+	if m.bindFirstUsable(moverUID, realm) {
+		m.markRebound(moverUID, time.Now().UnixNano())
+		log.Printf("[autobind] 同 IP 冲突换绑完成 uid=%s", logfmt.UID8(moverUID))
+	} else {
+		log.Printf("[autobind] 同 IP 冲突但池内暂无可换出口，保持现状 uid=%s", logfmt.UID8(moverUID))
+	}
+}
+
+// moverCoolingLocked mover 是否在换绑防抖窗口内。调用方必须已持有 m.mu。
+func (m *AccountProxy) moverCoolingLocked(uid string, nowNano int64) bool {
+	w := m.opts.RebindWindow
+	if w < 0 {
+		return false
+	}
+	if w == 0 {
+		w = DefaultRebindWindow
+	}
+	st := m.rebindAt[uid]
+	return st != nil && st.at > 0 && nowNano-st.at < w.Nanoseconds()
+}
+
 
 // NoteRateLimit 记录一次「经该出口被上游/代理限流（429）」，连续到阈值即换绑出口。
 //
@@ -639,11 +826,17 @@ func (m *AccountProxy) NoteRateLimit(uid, realm string) {
 		return
 	}
 	// 达阈：清计数后异步换绑（换绑要探活候选，绝不能在请求路径上同步做网络 IO）。
+	// 同样受防抖约束：429 连环限流也不允许 10 分钟内反复换。
 	m.mu.Lock()
 	m.rateLimitHits[uid] = &rateLimitHit{n: 0, at: now}
 	m.mu.Unlock()
 	go func() {
+		if m.inRebindCooldown(uid, time.Now().UnixNano()) {
+			log.Printf("[autobind] 出口被限流（429）×%d，但 uid=%s 在防抖窗口内，暂不换绑", threshold, logfmt.UID8(uid))
+			return
+		}
 		if m.bindFirstUsable(uid, realm) {
+			m.markRebound(uid, time.Now().UnixNano())
 			log.Printf("[autobind] 出口被限流（429）×%d，已换绑 uid=%s", threshold, logfmt.UID8(uid))
 			return
 		}
@@ -701,18 +894,31 @@ func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
 	defer m.bindSerial.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	active := m.opts.ActiveWindow
 	takenLinks := map[string]bool{}
+	// takenIPs：任意账号已占用的出口 IP（含空闲账号占的）。
 	takenIPs := map[string]bool{}
+	// busyIPs：**使用中**账号占用的出口 IP。需求②的"空闲 IP 优先"依据：
+	// 一个 IP 只被空闲账号占着，比被在役账号占着更适合复用/退让。
+	busyIPs := map[string]bool{}
 	for _, b := range m.bindings {
 		if b.spec.Proxy != "" {
 			takenLinks[b.spec.Proxy] = true
 		}
-		if ip := b.probeIP.Load(); ip != "" {
+		if ip := b.effectiveIP(); ip != "" {
 			takenIPs[ip] = true
+			if b.inUse(active) {
+				busyIPs[ip] = true
+			}
 		}
 	}
 
-	tryBind := func(skipSameIP bool) bool {
+	// tryBind 按优先级挑候选：skips 逐层放宽。
+	//   mode 0（最严）：链接不重复 + IP 未被任何账号占用（真正的空闲 IP）
+	//   mode 1：链接不重复 + IP 未被「使用中」账号占用（空闲账号占的可以抢）
+	//   mode 2：仅链接不重复（IP 可复用，池子小的时候兜底）
+	tryBind := func(mode int) bool {
 		for _, r := range probed {
 			if !r.ok {
 				continue
@@ -720,8 +926,15 @@ func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
 			if takenLinks[r.raw] {
 				continue
 			}
-			if skipSameIP && takenIPs[r.ip] {
-				continue
+			switch mode {
+			case 0:
+				if takenIPs[r.ip] {
+					continue
+				}
+			case 1:
+				if busyIPs[r.ip] {
+					continue
+				}
 			}
 			e := &AccountProxyEntry{Proxy: r.raw, Enabled: true, Auto: true}
 			nb, err := newAccountBinding(uid, e)
@@ -762,10 +975,37 @@ func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
 		return false
 	}
 
-	if tryBind(true) {
-		return true
+	// 逐层放宽：先要真正空闲 IP，退而求其次避开在役 IP，最后只保证链接不撞。
+	// MinFreeIPs>0 且池里空闲 IP 明显不足时，允许直接放宽到 mode 1/2，
+	// 避免"池子小 → 大部分账号解绑回落直连"（用户要的是尽量绑上、而非严格反亲和）。
+	for mode := 0; mode <= 2; mode++ {
+		if tryBind(mode) {
+			return true
+		}
 	}
-	return tryBind(false)
+	return false
+}
+
+// AutoBindForce 手动触发「代理链接池自动配置」：从该 realm 订阅池里挑一条
+// 当前最稳定的链接，重新绑定到该账号（面板「自动池配」按钮）。
+//
+// 与 AutoBindAccount 的区别：AutoBindAccount 是后台巡检用的保守逻辑（粘住现有
+// 绑定、仅在失效/冲突时才动）；本方法是**用户显式动作**，直接把账号换到池里
+// 当前最优链接，保留原绑定的 ExpectedIP/Label/Note。返回是否成功绑定
+// （false = 池里没有可用候选，此时保持原绑定不动，不清空）。
+func (m *AccountProxy) AutoBindForce(uid, realm string) bool {
+	if m == nil || m.client == nil || uid == "" {
+		return false
+	}
+	if !m.Active() {
+		return false
+	}
+	ok := m.bindFirstUsable(uid, realm)
+	if !ok {
+		return false
+	}
+	m.markRebound(uid, time.Now().UnixNano())
+	return true
 }
 
 // Remove 从绑定表移除一个账号的代理绑定（落盘同步）。

@@ -137,6 +137,79 @@ func (p *Panel) proxyDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// proxyDirect 把账号切为「直连」：删除其代理绑定，出站回落本机直连出口。
+//
+// 与 proxyDelete 等价但语义更明确——面板「直连」按钮表达的是「让这个账号走
+// 本机出口、不走任何代理」，而不是「删除一条配置」。返回删除后的账号状态。
+func (p *Panel) proxyDirect(w http.ResponseWriter, r *http.Request) {
+	m := p.proxyManager()
+	if m == nil || !m.Active() {
+		writeErr(w, http.StatusNotImplemented, "账号代理未启用")
+		return
+	}
+	var body struct {
+		UID string `json:"uid"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
+		return
+	}
+	body.UID = strings.TrimSpace(body.UID)
+	if body.UID == "" {
+		writeErr(w, http.StatusBadRequest, "uid 不能为空")
+		return
+	}
+	if err := m.Remove(body.UID); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": body.UID})
+}
+
+// proxyAutobind 「代理链接池自动配置」：从该账号所属 realm 的订阅池里挑一条
+// 当前最稳定的链接绑定上去（面板「自动池配」按钮）。
+//
+// realm 解析优先级：请求体显式 realm > 账号池里该 uid 的 realm > global。
+func (p *Panel) proxyAutobind(w http.ResponseWriter, r *http.Request) {
+	m := p.proxyManager()
+	if m == nil || !m.Active() {
+		writeErr(w, http.StatusNotImplemented, "账号代理未启用")
+		return
+	}
+	var body struct {
+		UID   string `json:"uid"`
+		Realm string `json:"realm"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
+		return
+	}
+	uid := strings.TrimSpace(body.UID)
+	if uid == "" {
+		writeErr(w, http.StatusBadRequest, "uid 不能为空")
+		return
+	}
+	realm := strings.ToLower(strings.TrimSpace(body.Realm))
+	if realm == "" {
+		for _, st := range p.cfg.Pool.List() {
+			if st.UID == uid {
+				realm = strings.ToLower(st.Realm)
+				break
+			}
+		}
+	}
+	if realm == "" {
+		realm = "global"
+	}
+	if !m.AutoBindForce(uid, realm) {
+		writeErr(w, http.StatusBadGateway,
+			"池内暂无可用的代理出口（检查 "+realm+" 订阅池是否已配置/刷新）")
+		return
+	}
+	st, _ := m.Status(uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": st})
+}
+
 // proxyCheck 校验单个账号出口（面板「校验」按钮）。
 func (p *Panel) proxyCheck(w http.ResponseWriter, r *http.Request) {
 	m := p.proxyManager()

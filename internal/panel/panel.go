@@ -351,6 +351,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/proxies/check", p.withAuth(p.proxyCheck))
 	p.mux.HandleFunc("POST /panel/api/proxies/check_all", p.withAuth(p.proxyCheckAll))
 	p.mux.HandleFunc("POST /panel/api/proxies/bulk", p.withAuth(p.proxyBulk))
+	p.mux.HandleFunc("POST /panel/api/proxies/direct", p.withAuth(p.proxyDirect))
+	p.mux.HandleFunc("POST /panel/api/proxies/autobind", p.withAuth(p.proxyAutobind))
 	// 订阅链接池（realm 隔离：global/cn 各自独立的订阅 URL 列表）
 	p.mux.HandleFunc("GET /panel/api/subpool", p.withAuth(p.subPoolList))
 	p.mux.HandleFunc("POST /panel/api/subpool/save", p.withAuth(p.subPoolSave))

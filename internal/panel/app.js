@@ -2689,8 +2689,10 @@ function renderProxies(list) {
 
       '<td class="num">' + (a.latency_ms ? a.latency_ms + ' ms' : '—') + '</td>' +
       '<td class="c-acts">' +
-        '<button class="xs" data-px="' + esc(a.uid) + '">配置</button> ' +
-        (a.bound ? '<button class="xs" data-pxc="' + esc(a.uid) + '">校验</button>' : '') +
+        '<button class="xs" data-px="' + esc(a.uid) + '" title="打开配置弹窗：填代理链接 / 声明IP / 备注">配置</button> ' +
+        '<button class="xs" data-pxab="' + esc(a.uid) + '" title="从该账号所属 realm 的订阅链接池里挑一条当前最稳定的链接自动绑定">自动池配</button> ' +
+        (a.bound ? '<button class="xs" data-pxc="' + esc(a.uid) + '" title="实测这条代理的真实出口 IP 并做一致性校验">校验</button> ' : '') +
+        (a.bound ? '<button class="xs danger" data-pxd="' + esc(a.uid) + '" title="删除该账号的代理绑定，出站回落本机直连出口">直连</button>' : '') +
       '</td></tr>';
   }).join('');
   tb.querySelectorAll('button[data-px]').forEach(b => b.onclick = () => openProxyDlg(b.dataset.px));
@@ -2701,6 +2703,28 @@ function renderProxies(list) {
       toast('出口 ' + (d.account.actual_ip || '—') + ' · ' + (PX_STATE[d.account.state] || [d.account.state])[0]);
       await loadProxies();
     } catch (e) { toast('校验失败：' + e.message, 'bad'); loadProxies(); }
+  });
+  // 自动池配：从订阅池挑当前最稳定的链接绑定
+  tb.querySelectorAll('button[data-pxab]').forEach(b => b.onclick = async () => {
+    b.disabled = true; b.textContent = '配中';
+    try {
+      const d = await api('proxies/autobind', { method: 'POST', body: JSON.stringify({ uid: b.dataset.pxab }) });
+      toast('已自动绑定，出口 ' + ((d.account && d.account.actual_ip) || '待校验'));
+      await loadProxies(true);
+    } catch (e) { toast('自动池配失败：' + e.message, 'bad'); loadProxies(); }
+    finally { b.disabled = false; b.textContent = '自动池配'; }
+  });
+  // 直连：删绑定回落本机出口（破坏性动作，二次确认）
+  tb.querySelectorAll('button[data-pxd]').forEach(b => b.onclick = async () => {
+    const a0 = (pxCache || []).find(x => x.uid === b.dataset.pxd) || {};
+    if (!confirm('让「' + (a0.nickname || b.dataset.pxd.slice(0, 8)) + '」改为本机直连？\n该账号的代理绑定将被删除（需要重新配置才能再走代理）。')) return;
+    b.disabled = true; b.textContent = '切换中';
+    try {
+      await api('proxies/direct', { method: 'POST', body: JSON.stringify({ uid: b.dataset.pxd }) });
+      toast('已切换为直连（代理绑定已删除）');
+      await loadProxies(true);
+    } catch (e) { toast('切换失败：' + e.message, 'bad'); loadProxies(); }
+    finally { b.disabled = false; b.textContent = '直连'; }
   });
   const bad = list.filter(a => a.bound && a.state !== 'ok' && a.state !== 'disabled' && a.state !== 'unchecked').length;
   $('pxNote').textContent = list.length + ' 个账号 · ' + list.filter(a => a.bound).length + ' 个已绑代理 · ' + bad + ' 个异常';
@@ -2777,11 +2801,12 @@ on('pxCancel', 'click', () => $('pxVeil').classList.remove('on'));
 on('pxSave', 'click', () => pxSaveNow(true));
 on('pxDelete', 'click', async () => {
   if (!pxUID) return;
+  if (!confirm('删除该账号的代理绑定、改为本机直连？')) return;
   try {
-    await api('proxies/delete', { method: 'POST', body: JSON.stringify({ uid: pxUID }) });
+    await api('proxies/direct', { method: 'POST', body: JSON.stringify({ uid: pxUID }) });
     $('pxVeil').classList.remove('on');
-    toast('已删除该账号的代理绑定');
-    await loadProxies();
+    toast('已切换为直连（代理绑定已删除）');
+    await loadProxies(true);
   } catch (e) { $('pxMsg').textContent = '删除失败：' + e.message; }
 });
 
