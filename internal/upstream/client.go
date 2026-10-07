@@ -1822,7 +1822,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 // 其他模型默认支持自定义（面板 UI/下游传的值被尊重）。
 var thinkingNoSupport = func() *sync.Map {
 	m := &sync.Map{}
-	m.Store("global:deepseek-v4.1-flash", true)
+	// 2026-10-07 实测：11133 已消失，global deepseek 可直接用 thinking.enabled + reasoning_effort
 	return m
 }()
 
@@ -1861,13 +1861,8 @@ func stripUnsupportedParamsForModel(body []byte, realm string) []byte {
 	// 非黑名单模型：尊重面板 UI/下游的自定义值。
 	blockKey := realmKey(realm) + ":" + model
 	if _, blocked := thinkingNoSupport.Load(blockKey); blocked {
-		// 只剥 thinking 字段（会 11133），保留 reasoning_effort
-		stripKeys = append(stripKeys, "thinking", "thinking_effort", "reasoningEffort")
-		// 注入 reasoning_summary=auto：官方客户端逆向确认，这是开启思考的正确参数
-		if _, ok := m["reasoning_summary"]; !ok {
-			m["reasoning_summary"] = "auto"
-			changed = true
-		}
+		// 黑名单模型：剥思考参数，走默认（目前黑名单为空）
+		stripKeys = append(stripKeys, "thinking", "thinking_effort", "reasoning_effort", "reasoningEffort")
 	}
 	for _, k := range stripKeys {
 		if _, ok := m[k]; ok {
@@ -1882,6 +1877,7 @@ func stripUnsupportedParamsForModel(body []byte, realm string) []byte {
 	if err != nil {
 		return body
 	}
+
 	return out
 }
 
