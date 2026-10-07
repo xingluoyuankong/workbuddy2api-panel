@@ -33,6 +33,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"math/rand"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -263,10 +264,15 @@ type accountBinding struct {
 	callAt atomic.Int64
 	// sharedBlocked 该账号因「同出口 IP 承载账号超限」被隔离（MaxPerIPAction=quarantine）。
 	sharedBlocked atomic.Bool
-	// lastRebind 上次换绑时间（unix nano），防抖：5 分钟内不重复换绑。
+	// lastRebind 上次换绑时间（unix nano）。
 	lastRebind atomic.Int64
 	// conflictLogged 冲突已记录（避免同一冲突刷屏）。
 	conflictLogged atomic.Bool
+	// scheduledRebind 计划换绑时间（unix nano，0=无计划）。
+	// IP 冲突时不立即换绑，而是计划在10-15分钟内执行。
+	scheduledRebind atomic.Int64
+	// rebindReason 换绑原因（仅调试日志用）。
+	rebindReason atomicString
 }
 
 // AccountProxy 账号代理守卫。
@@ -495,25 +501,75 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 		b.entry.fails.Store(0) // 探活成功清零（抗抖动：瞬时不可用不累积）
 		b.probeIP.Store(ip)    // 刷新采样（面板显示 + 反亲和数据源）
 
-		// 同 IP 冲突检测（风控）：2026-10-07 紧急禁用自动换绑。
-		// 原因：Resin 代理池独立出口 IP 不足（22 条链接共用几个 IP），
-		// 自动换绑导致 thrashing（2 分钟内数十次），请求被反复中断，
-		// 输出极慢。现仅记录日志，不自动换绑。待代理池修复后再启用。
+		// 同 IP 冲突检测（风控）：2026-10-07 重构。
+		// 规则：
+		// 1. 冲突不立即换绑，计划在10-15分钟内执行（随机避免雷群）。
+		// 2. 优先换未被使用账号：正在使用的账号不动，换闲置的。
+		// 3. 立即换绑仅在探活失败（IP不可用）时触发。
 		m.mu.RLock()
+		var conflictUID string
+		var conflictBinding *accountBinding
 		for ou, ob := range m.bindings {
 			if ou == uid {
 				continue
 			}
 			if oip := ob.probeIP.Load(); oip != "" && oip == ip {
-				if !b.conflictLogged.Load() {
-					log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突（已禁用自动换绑，仅记录） uid=%s",
-						realm, ip, logfmt.UID8(ou), logfmt.UID8(uid))
-					b.conflictLogged.Store(true)
-				}
+				conflictUID = ou
+				conflictBinding = ob
 				break
 			}
 		}
 		m.mu.RUnlock()
+		if conflictUID != "" {
+			// 判断哪个账号更闲：比较 lastReq（最近请求时间）
+			now := time.Now().UnixNano()
+			myLastReq := b.lastReq.Load()
+			otherLastReq := conflictBinding.lastReq.Load()
+			// 10分钟内有请求算"正在使用"
+			const activeWindow = 10 * 60 * 1e9
+			myActive := now-myLastReq < activeWindow
+			otherActive := now-otherLastReq < activeWindow
+			// 决策：优先换闲的。两个都闲或都忙时，换当前检测到的（避免两个同时换）。
+			targetUID := uid
+			targetB := b
+			reason := "conflict"
+			if myActive && !otherActive {
+				// 我忙对方闲：换对方
+				targetUID = conflictUID
+				targetB = conflictBinding
+				reason = "conflict-prefer-idle"
+			}
+			// 检查是否已有计划
+			if targetB.scheduledRebind.Load() == 0 {
+				// 10-15分钟随机延迟
+				delay := time.Duration(10*60+int64(rand.Intn(5*60))) * time.Second
+				scheduled := now + int64(delay)
+				targetB.scheduledRebind.Store(scheduled)
+				targetB.rebindReason.Store(reason)
+				log.Printf("[autobind] %s 出口 IP %s 冲突（%s vs %s），计划 %.0f 分钟后换绑 uid=%s（优先闲置）",
+					realm, ip, logfmt.UID8(uid), logfmt.UID8(conflictUID),
+					float64(delay)/float64(time.Minute), logfmt.UID8(targetUID))
+			}
+			// 检查当前账号是否有到期的计划换绑
+			if sched := b.scheduledRebind.Load(); sched != 0 && now >= sched {
+				b.scheduledRebind.Store(0)
+				log.Printf("[autobind] 执行计划换绑 uid=%s reason=%s", logfmt.UID8(uid), b.rebindReason.Load())
+				if m.bindFirstUsable(uid, realm) {
+					b.lastRebind.Store(now)
+					b.conflictLogged.Store(false)
+				}
+			}
+			return
+		}
+		// 无冲突时，也检查是否有到期的计划换绑
+		if sched := b.scheduledRebind.Load(); sched != 0 && time.Now().UnixNano() >= sched {
+			b.scheduledRebind.Store(0)
+			log.Printf("[autobind] 执行计划换绑 uid=%s reason=%s", logfmt.UID8(uid), b.rebindReason.Load())
+			if m.bindFirstUsable(uid, realm) {
+				b.lastRebind.Store(time.Now().UnixNano())
+				b.conflictLogged.Store(false)
+			}
+		}
 		return
 	}
 	b.entry.noteFail()
