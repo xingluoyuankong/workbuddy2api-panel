@@ -495,44 +495,25 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 		b.entry.fails.Store(0) // 探活成功清零（抗抖动：瞬时不可用不累积）
 		b.probeIP.Store(ip)    // 刷新采样（面板显示 + 反亲和数据源）
 
-		// 同 IP 冲突检测（风控）：resin 出口轮换可能把两个账号转到同一出口。
-		// 防抖：5 分钟内不重复换绑（避免池 IP 不足时 thrashing）。
-		// 冲突先标记，下轮有真正可用 IP 再换。
+		// 同 IP 冲突检测（风控）：2026-10-07 紧急禁用自动换绑。
+		// 原因：Resin 代理池独立出口 IP 不足（22 条链接共用几个 IP），
+		// 自动换绑导致 thrashing（2 分钟内数十次），请求被反复中断，
+		// 输出极慢。现仅记录日志，不自动换绑。待代理池修复后再启用。
 		m.mu.RLock()
-		conflict := false
-		var conflictWith string
 		for ou, ob := range m.bindings {
 			if ou == uid {
 				continue
 			}
 			if oip := ob.probeIP.Load(); oip != "" && oip == ip {
-				conflict = true
-				conflictWith = logfmt.UID8(ou)
+				if !b.conflictLogged.Load() {
+					log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突（已禁用自动换绑，仅记录） uid=%s",
+						realm, ip, logfmt.UID8(ou), logfmt.UID8(uid))
+					b.conflictLogged.Store(true)
+				}
 				break
 			}
 		}
 		m.mu.RUnlock()
-		if conflict {
-			now := time.Now().UnixNano()
-			lastRb := b.lastRebind.Load()
-			// 5 分钟冷却期内：只记录一次，不换绑
-			if now-lastRb < 5*60*1e9 {
-				if !b.conflictLogged.Load() {
-					log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突（5分钟内已换绑，暂不重复换绑） uid=%s",
-						realm, ip, conflictWith, logfmt.UID8(uid))
-					b.conflictLogged.Store(true)
-				}
-				return
-			}
-			// 冷却期外：尝试换绑
-			log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突，换绑 uid=%s",
-				realm, ip, conflictWith, logfmt.UID8(uid))
-			if m.bindFirstUsable(uid, realm) {
-				b.lastRebind.Store(now)
-				b.conflictLogged.Store(false)
-				log.Printf("[autobind] 同 IP 冲突换绑完成 uid=%s", logfmt.UID8(uid))
-			}
-		}
 		return
 	}
 	b.entry.noteFail()
