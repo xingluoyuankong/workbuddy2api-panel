@@ -1855,11 +1855,19 @@ func stripUnsupportedParamsForModel(body []byte, realm string) []byte {
 	}
 	changed := false
 	stripKeys := []string{"max_tokens", "max_completion_tokens"}
-	// 思考参数黑名单检查：在黑名单中的模型不发思考参数（走默认），
-	// 否则尊重面板 UI/下游的自定义值。
+	// 思考参数黑名单检查：在黑名单中的模型（如 global:deepseek-v4.1-flash），
+	// 不发 thinking 字段（会 11133），但发 reasoning_summary=auto + reasoning_effort
+	// 来开启思考。不发任何参数 = 上游默认不思考（thinking.go 逆向确认）。
+	// 非黑名单模型：尊重面板 UI/下游的自定义值。
 	blockKey := realmKey(realm) + ":" + model
 	if _, blocked := thinkingNoSupport.Load(blockKey); blocked {
-		stripKeys = append(stripKeys, "thinking", "thinking_effort", "reasoning_effort", "reasoningEffort")
+		// 只剥 thinking 字段（会 11133），保留 reasoning_effort
+		stripKeys = append(stripKeys, "thinking", "thinking_effort", "reasoningEffort")
+		// 注入 reasoning_summary=auto：官方客户端逆向确认，这是开启思考的正确参数
+		if _, ok := m["reasoning_summary"]; !ok {
+			m["reasoning_summary"] = "auto"
+			changed = true
+		}
 	}
 	for _, k := range stripKeys {
 		if _, ok := m[k]; ok {
