@@ -263,6 +263,10 @@ type accountBinding struct {
 	callAt atomic.Int64
 	// sharedBlocked 该账号因「同出口 IP 承载账号超限」被隔离（MaxPerIPAction=quarantine）。
 	sharedBlocked atomic.Bool
+	// lastRebind 上次换绑时间（unix nano），防抖：5 分钟内不重复换绑。
+	lastRebind atomic.Int64
+	// conflictLogged 冲突已记录（避免同一冲突刷屏）。
+	conflictLogged atomic.Bool
 }
 
 // AccountProxy 账号代理守卫。
@@ -492,24 +496,42 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 		b.probeIP.Store(ip)    // 刷新采样（面板显示 + 反亲和数据源）
 
 		// 同 IP 冲突检测（风控）：resin 出口轮换可能把两个账号转到同一出口。
-		// 冲突 → 立即换绑（bindFirstUsable 的反亲和会排除冲突 IP）；
-		// 无可用候选则保持现状（下轮再试）。
+		// 防抖：5 分钟内不重复换绑（避免池 IP 不足时 thrashing）。
+		// 冲突先标记，下轮有真正可用 IP 再换。
 		m.mu.RLock()
 		conflict := false
+		var conflictWith string
 		for ou, ob := range m.bindings {
 			if ou == uid {
 				continue
 			}
 			if oip := ob.probeIP.Load(); oip != "" && oip == ip {
 				conflict = true
-				log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突，换绑 uid=%s",
-					realm, ip, logfmt.UID8(ou), logfmt.UID8(uid))
+				conflictWith = logfmt.UID8(ou)
 				break
 			}
 		}
 		m.mu.RUnlock()
-		if conflict && m.bindFirstUsable(uid, realm) {
-			log.Printf("[autobind] 同 IP 冲突换绑完成 uid=%s", logfmt.UID8(uid))
+		if conflict {
+			now := time.Now().UnixNano()
+			lastRb := b.lastRebind.Load()
+			// 5 分钟冷却期内：只记录一次，不换绑
+			if now-lastRb < 5*60*1e9 {
+				if !b.conflictLogged.Load() {
+					log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突（5分钟内已换绑，暂不重复换绑） uid=%s",
+						realm, ip, conflictWith, logfmt.UID8(uid))
+					b.conflictLogged.Store(true)
+				}
+				return
+			}
+			// 冷却期外：尝试换绑
+			log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突，换绑 uid=%s",
+				realm, ip, conflictWith, logfmt.UID8(uid))
+			if m.bindFirstUsable(uid, realm) {
+				b.lastRebind.Store(now)
+				b.conflictLogged.Store(false)
+				log.Printf("[autobind] 同 IP 冲突换绑完成 uid=%s", logfmt.UID8(uid))
+			}
 		}
 		return
 	}
@@ -522,8 +544,14 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 	}
 
 	// ── 阈值达到：换绑（逐个探活候选）────────────────────────────
+	// 防抖：5 分钟内不重复换绑。
 	// 池里没有可用候选（全探活失败）→ 解绑回落直连（订阅恢复后自动重绑）。
+	now2 := time.Now().UnixNano()
+	if now2-b.lastRebind.Load() < 5*60*1e9 {
+		return
+	}
 	if m.bindFirstUsable(uid, realm) {
+		b.lastRebind.Store(now2)
 		log.Printf("[autobind] 绑定出口连续失败 %d 次，已换绑 uid=%s",
 			failThreshold, logfmt.UID8(uid))
 		return

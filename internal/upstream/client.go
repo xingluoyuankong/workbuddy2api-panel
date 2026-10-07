@@ -848,9 +848,15 @@ func (e *proxyEntry) noteUntrusted() {
 	if u, err := url.Parse(e.raw); err == nil && u.Host != "" {
 		host = u.Host
 	}
-	log.Printf("SECURITY: global 代理出口 %s 疑似 TLS 劫持（证书校验失败），熔断 %s（第 %d 次）。"+
-		"经过该出口的流量（含账号 token）可能已被截获——建议检查该出口来源，"+
-		"必要时重新登录经它用过的账号", host, backoff, n)
+	// 降级：同一出口连续 3 次以上，改为 WARN（避免日志刷屏；首次仍为 SECURITY）。
+	if n >= 3 {
+		log.Printf("WARN: [upstream] 代理出口 %s 证书校验失败 %d 次，熔断 %s（疑似配置问题或过载，非首次告警）",
+			host, n, backoff)
+	} else {
+		log.Printf("SECURITY: global 代理出口 %s 疑似 TLS 劫持（证书校验失败），熔断 %s（第 %d 次）。"+
+			"经过该出口的流量（含账号 token）可能已被截获——建议检查该出口来源，"+
+			"必要时重新登录经它用过的账号", host, backoff, n)
+	}
 }
 
 // untrusted 报告出口当前是否处于 MITM 嫌疑熔断期。
