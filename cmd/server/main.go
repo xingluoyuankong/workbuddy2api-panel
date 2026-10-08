@@ -193,6 +193,9 @@ func main() {
 		}
 		ap.SyncAccounts(auths) // 账号已删除的绑定一并清理，防僵尸条目堆积
 		ap.SetClient(up)
+		// 连接保温：SetClient 之后补跑（Load 时 warm 尚未就绪），为全部
+		// 启用绑定启动上游 TLS 隧道保温，消除对话冷启动握手开销。
+		ap.WarmAll()
 		// 自动绑定循环：每分钟巡检——无绑定账号粘住池里最稳定链接；auto 绑定
 		// 连续校验失败自动换绑下一条（非随机轮询，故障才切）。realm 从 auths 取。
 		go func() {
@@ -221,6 +224,13 @@ func main() {
 		up.AccountProxy = ap
 		// 代理闸门：quarantine 策略下出口不可信的账号不参与选号（其余策略恒放行）。
 		p.SetProxyGate(ap.Usable)
+		// 账号 → realm 查询注入（连接保温器按 realm 选上游 base）。
+		ap.SetRealmLookup(func(uid string) string {
+			if a := p.AuthByUID(uid); a != nil {
+				return a.Realm()
+			}
+			return ""
+		})
 		// 出口信息注入账号池：面板「账号池」列表直接显示每号实测出口 IP / 地区 /
 		// 状态，不必切到代理页。pool 不反向依赖 upstream，故用闭包注入。
 		p.SetEgressProvider(func(uid string) *pool.EgressInfo {

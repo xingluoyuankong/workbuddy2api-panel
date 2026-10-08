@@ -377,6 +377,14 @@ type AccountProxy struct {
 	// 换绑时会**重建绑定对象**，挂在绑定上的时间戳随旧对象一起丢弃——防抖
 	// 永远失效（2026-10-07 晚实测：resin 出口轮换导致每分钟换绑一次的死循环）。
 	rebindAt map[string]*rebindState
+
+	// warm 连接保温器：把「账号 → 代理隧道 → 上游 TLS 会话」维持热态，
+	// 消除对话冷启动 1.2~4s 的 TLS 握手（见 warmer.go 头注释）。
+	// SetClient 时初始化；绑定建立/删除时 Start/Stop。
+	warm *warmer
+
+	// realmFn 账号 → realm 查询（main.go 用 pool 注入；保温器用它选上游 base）。
+	realmFn func(uid string) string
 }
 
 // NewAccountProxy 构建守卫；File 为空时等同关闭（所有查询返回未绑定）。
@@ -504,10 +512,76 @@ func (m *AccountProxy) SetEntry(uid string, e AccountProxyEntry) error {
 }
 
 // Remove 删除一个账号的代理绑定。
-// SetClient 注入出站 Client（订阅池所在），启用自动绑定/故障换绑。
+// SetClient 注入出站 Client（订阅池所在），启用自动绑定/故障换绑；
+// 同时初始化连接保温器（依赖 client 的 realm/base 信息）。
 func (m *AccountProxy) SetClient(c *Client) {
 	if m != nil {
 		m.client = c
+		m.warm = newWarmer(c)
+	}
+}
+
+// warmStart 启动某账号的连接保温（幂等；warm 未初始化时静默跳过）。
+// entry.chat 与真实对话共用同一 *http.Client，热连接直接被对话命中。
+// 已有循环先停（换绑 = 新 Transport，旧循环指向的 client 已作废）。
+func (m *AccountProxy) warmStart(uid string, b *accountBinding) {
+	if m == nil || m.warm == nil || b == nil || b.entry == nil || !b.spec.Enabled {
+		return
+	}
+	m.warm.Stop(uid)
+	m.warm.Start(uid, m.realmOf(uid), b.entry.chat)
+}
+
+// warmStop 停止某账号保温（解绑/禁用/换绑重建时调用，幂等）。
+func (m *AccountProxy) warmStop(uid string) {
+	if m == nil || m.warm == nil {
+		return
+	}
+	m.warm.Stop(uid)
+}
+
+// realmOf 取账号所属 realm（pool 注入回调；缺省 global）。
+func (m *AccountProxy) realmOf(uid string) string {
+	if m.realmFn != nil {
+		if r := m.realmFn(uid); r != "" {
+			return r
+		}
+	}
+	return "global"
+}
+
+// SetRealmLookup 注入账号 → realm 查询（main.go 在 pool 就绪后调用）。
+func (m *AccountProxy) SetRealmLookup(fn func(uid string) string) {
+	if m != nil {
+		m.realmFn = fn
+	}
+}
+
+// WarmAll 为当前全部启用绑定启动保温（进程启动时补跑：Load/SyncAccounts 发生
+// 在 SetClient 之前，那时 warm 还没初始化，绑定建立路径上的 warmStart 会静默
+// 跳过）。幂等：已在保温的账号被 Stop+Start 重启，无副作用。
+func (m *AccountProxy) WarmAll() {
+	if m == nil || m.warm == nil {
+		return
+	}
+	m.mu.RLock()
+	type jb struct {
+		uid string
+		b   *accountBinding
+	}
+	jobs := make([]jb, 0, len(m.bindings))
+	for uid, b := range m.bindings {
+		if b.spec.Enabled && b.entry != nil {
+			jobs = append(jobs, jb{uid, b})
+		}
+	}
+	m.mu.RUnlock()
+	for _, j := range jobs {
+		m.warmStart(j.uid, j.b)
+	}
+	if len(jobs) > 0 {
+		log.Printf("[warmer] 连接保温已启动: %d 个绑定（每 %s 一发，消除冷启动 TLS 握手）",
+			len(jobs), warmerKeepAlive)
 	}
 }
 
@@ -638,6 +712,7 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 		}
 		delete(m.doc.Accounts, uid)
 		delete(m.bindings, uid)
+		m.warmStop(uid)
 		_ = m.saveLocked()
 		log.Printf("[autobind] %s 空闲账号出口连续失败 %d 次，解绑回落直连 uid=%s",
 			realm, failThreshold, logfmt.UID8(uid))
@@ -650,6 +725,7 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 	}
 	delete(m.doc.Accounts, uid)
 	delete(m.bindings, uid)
+	m.warmStop(uid)
 	_ = m.saveLocked()
 	log.Printf("[autobind] %s 池内全部候选不可用，解绑回落直连 uid=%s", realm, logfmt.UID8(uid))
 }
@@ -947,6 +1023,7 @@ func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
 				if b := m.bindings[uid]; b != nil && b.spec.Proxy == nb.entry.raw {
 					delete(m.doc.Accounts, uid)
 					delete(m.bindings, uid)
+					m.warmStop(uid)
 					_ = m.saveLocked()
 					log.Printf("[autobind] 绑定出口凭据失效（407），解绑 uid=%s 回落直连", logfmt.UID8(uid))
 				}
@@ -966,6 +1043,7 @@ func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
 			// 立即记录探活出口 IP：后续账号的 takenIPs 反亲和马上可见
 			//（此前要等 30 分钟校验才填 probeIP，期间同 IP 漏检）。
 			nb.probeIP.Store(r.ip)
+			m.warmStart(uid, nb) // 新链接新 Transport：旧保温循环作废，重启
 			_ = m.saveLocked()
 			takenLinks[r.raw] = true // 本轮后续账号跳过（同 tick 并发已串行化，防御性）
 			takenIPs[r.ip] = true
@@ -1020,6 +1098,7 @@ func (m *AccountProxy) Remove(uid string) error {
 	}
 	delete(m.doc.Accounts, uid)
 	delete(m.bindings, uid)
+	m.warmStop(uid)
 	return m.saveLocked()
 }
 
@@ -1064,6 +1143,7 @@ func (m *AccountProxy) rebuildOneLocked(uid string) error {
 	spec := m.doc.Accounts[uid]
 	if spec == nil || strings.TrimSpace(spec.Proxy) == "" {
 		delete(m.bindings, uid)
+		m.warmStop(uid) // 绑定没了：保温即停（幂等）
 		return nil
 	}
 	b, err := newAccountBinding(uid, spec)
@@ -1071,6 +1151,7 @@ func (m *AccountProxy) rebuildOneLocked(uid string) error {
 		return err
 	}
 	m.bindings[uid] = b
+	m.warmStart(uid, b) // 新绑定/链接变更：重启该账号的保温循环
 	return nil
 }
 
@@ -1137,6 +1218,7 @@ func (m *AccountProxy) SyncAccounts(auths []*auth.Auth) {
 		if !live[uid] {
 			delete(m.doc.Accounts, uid)
 			delete(m.bindings, uid)
+			m.warmStop(uid)
 			changed = true
 		}
 	}
