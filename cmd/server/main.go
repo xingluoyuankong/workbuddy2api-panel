@@ -199,7 +199,7 @@ func main() {
 		// 自动绑定循环：每分钟巡检——无绑定账号粘住池里最稳定链接；auto 绑定
 		// 连续校验失败自动换绑下一条（非随机轮询，故障才切）。realm 从 auths 取。
 		go func() {
-			t := time.NewTicker(time.Minute)
+			t := time.NewTicker(5 * time.Minute)
 			defer t.Stop()
 			for range t.C {
 				// 动态账号列表：auths 是启动快照，运行时新增的账号不在里面

@@ -47,7 +47,7 @@ type proxyState int
 const (
 	// DefaultRebindWindow 同一账号自动换绑的防抖窗口：撞 IP 时窗口内换一次即可，
 	// 之后 10 分钟内不再重复折腾（需求①：10 分钟之内换绑到其他 IP 就行）。
-	DefaultRebindWindow = 10 * time.Minute
+	DefaultRebindWindow = 30 * time.Minute
 	// DefaultActiveWindow 「使用中」判定窗口：最近这么久内有真实出站请求的账号
 	// 视为在用，同 IP 冲突时优先保留它、换绑空闲账号（需求②）。
 	DefaultActiveWindow = 10 * time.Minute
@@ -712,7 +712,8 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 		m.markRebound(uid, now2)
 		m.mu.Lock()
 		if nb := m.bindings[uid]; nb == nil || nb.spec.Proxy != curRaw {
-			return // 并发：已变化
+			m.mu.Unlock() // 修复：原代码此处 return 未解锁，导致 m.mu 写锁永久泄漏（全站死锁）
+			return        // 并发：已变化
 		}
 		delete(m.doc.Accounts, uid)
 		delete(m.bindings, uid)
@@ -720,6 +721,7 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 		_ = m.saveLocked()
 		log.Printf("[autobind] %s 空闲账号出口连续失败 %d 次，解绑回落直连 uid=%s",
 			realm, failThreshold, logfmt.UID8(uid))
+		m.mu.Unlock() // 修复：同上，原代码此处 return 未解锁
 		return
 	}
 	m.mu.Lock()
@@ -748,7 +750,7 @@ type rebindState struct {
 
 // ConflictGrace 同 IP 冲突的宽限期：冲突只登记不动手，超过该时长仍在冲突
 // 才执行换绑。默认 12 分钟（用户定稿：10-15 分钟之内换绑到其他 IP 就行）。
-const ConflictGrace = 12 * time.Minute
+const ConflictGrace = 30 * time.Minute
 
 // rebindStateLocked 取（或初始化）某账号的换绑状态。调用方必须已持有 m.mu 写锁。
 func (m *AccountProxy) rebindStateLocked(uid string) *rebindState {

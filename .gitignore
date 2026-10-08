@@ -52,3 +52,6 @@ server.exe
 
 # 本地编译产物（Go 构建输出）
 /workbuddy2api
+
+# 本地源码备份目录（_bak-<时间戳> / _bak2-... / _bak3-...）
+/_bak*/
