@@ -672,6 +672,46 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 	return dynamicModelsCache.ids
 }
 
+// pickWaitMax / pickWaitStep 选号短暂忙时的有界等待（排队）参数。
+//
+// 背景（2026-10-08 实测）：12 并发下 2 个请求 0.02s 就 503 —— 因为「健康号
+// 都在途占满 / 落在 minPickGap 防撞号窗口内」时 pick 返回 nil，旧逻辑直接
+// 503 拒绝。但这是**瞬时忙**，不是没号：等一两百毫秒就有名额释放。
+// 因此改为有界排队：总等待 ≤ pickWaitMax，步进 pickWaitStep，期间反复重选。
+// 只有真没号（healthy==0，全冷却/禁用）才立即 503。
+const (
+	pickWaitMax  = 3 * time.Second
+	pickWaitStep = 120 * time.Millisecond
+)
+
+// pickWithWait 选号；瞬时忙时有界等待重试，真没号立即返回 nil。
+//
+// 「瞬时忙」判定：该 realm 内 healthy>0（有可用号）但 Pick 选不出来——
+// 只可能是全部在途占满或落在 minPickGap 窗口，等名额释放即可。
+// 「真没号」判定：healthy==0（全冷却/禁用）→ 不浪费客户端时间，立即 nil
+//（由上层回 503 + Retry-After，客户端按退避重试）。
+func (h *Handler) pickWithWait(ctx context.Context, tried map[string]bool, model, realm string) *auth.Auth {
+	acct := h.cfg.Pool.PickExcludingForRealm(tried, model, realm)
+	if acct != nil {
+		return acct
+	}
+	if _, healthy, _, _, _ := h.cfg.Pool.CountsDetailedForRealm(realm); healthy <= 0 {
+		return nil // 真没号：立即失败，交给上层 503 + Retry-After
+	}
+	deadline := time.Now().Add(pickWaitMax)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil // 客户端已断连
+		case <-time.After(pickWaitStep):
+		}
+		if acct = h.cfg.Pool.PickExcludingForRealm(tried, model, realm); acct != nil {
+			return acct
+		}
+	}
+	return nil
+}
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
@@ -923,7 +963,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			// 短暂忙（有健康号但都在途占满 / 撞号窗口内）→ 有界等待重试，不立刻 503。
+			acct = h.pickWithWait(r.Context(), tried, bareModel, realm)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable

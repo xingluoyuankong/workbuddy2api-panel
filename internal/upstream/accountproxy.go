@@ -385,6 +385,10 @@ type AccountProxy struct {
 
 	// realmFn 账号 → realm 查询（main.go 用 pool 注入；保温器用它选上游 base）。
 	realmFn func(uid string) string
+
+	// sharedWarn / sharedWarnMu 同 IP 超限告警去重（ip → 上次播报的承载数）。
+	sharedWarnMu sync.Mutex
+	sharedWarn   map[string]int
 }
 
 // NewAccountProxy 构建守卫；File 为空时等同关闭（所有查询返回未绑定）。
@@ -736,8 +740,10 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 
 // rebindState 账号级换绑状态。
 type rebindState struct {
-	at            int64 // 上次换绑时刻（unix nano），0 = 从未
-	firstConflict int64 // 同 IP 冲突首次登记时刻（unix nano），0 = 无未决冲突
+	at            int64  // 上次换绑时刻（unix nano），0 = 从未
+	firstConflict int64  // 同 IP 冲突首次登记时刻（unix nano），0 = 无未决冲突
+	conflictIP    string // 登记时冲突的那个出口 IP（用于「冲突必须稳定」判定）
+	conflictWith  string // 登记时的对端 uid（同上）
 }
 
 // ConflictGrace 同 IP 冲突的宽限期：冲突只登记不动手，超过该时长仍在冲突
@@ -778,26 +784,33 @@ func (m *AccountProxy) markRebound(uid string, nowNano int64) {
 	defer m.mu.Unlock()
 	st := m.rebindStateLocked(uid)
 	st.at = nowNano
-	st.firstConflict = 0
+	st.firstConflict, st.conflictIP, st.conflictWith = 0, "", ""
 }
 
-// deferConflictRebind 冲突处置入口（每轮巡检调用，幂等）：
-//   - 首次发现冲突 → 只登记时间戳 + 打一条日志，**不换绑**；
-//   - 宽限期（ConflictGrace=12m）内再看到冲突 → 静默跳过；
-//   - 超过宽限期仍在冲突 → 选 mover（优先空闲账号）执行换绑。
+// deferConflictRebind 冲突处置入口（每轮巡检调用，幂等，**全静默**）：
 //
-// mover 决策：
-//  1. 一方使用中、一方空闲 → 换空闲的（保护线上调用）；
-//  2. 双方同状态 → 换 uid 字典序靠后的（确定性，避免两边来回踢皮球）。
+//   - 冲突首次出现 → 只登记（uid/对端/冲突 IP/时刻），不打日志；
+//   - 冲突**变化**（换了 IP 或换了对手）→ 重置计时（resin 出口本来就在轮换，
+//     转一圈撞一下是常态，不能算数）；
+//   - 同一对账号、同一 IP 持续 ≥ ConflictGrace(12m) → 才执行换绑；
+//   - 其余情况一律静默返回。
+//
+// 【为什么必须"稳定"才算数】2026-10-08 实测：resin 出口每几分钟轮换一次，
+// 两个账号的出口随机撞车是**常态**。若撞一下就开始计时、12 分钟后照单换绑，
+// 结果是每 12 分钟换一次（用户看到"换绑换绑换绑"）。只有**同一 IP 稳定撞满
+// 12 分钟**才说明两个 sticky 会话真的粘在同一出口，才值得动。
+//
+// mover 决策：一方使用中、一方空闲 → 换空闲的；双方同状态 → 换 uid 靠后的。
 func (m *AccountProxy) deferConflictRebind(uid, otherUID, ip, realm string) {
 	now := time.Now().UnixNano()
 	m.mu.Lock()
 	st := m.rebindStateLocked(uid)
-	if st.firstConflict == 0 {
+	// 冲突内容变化（IP 或对端变了）→ 重新计时，不累计。
+	if st.firstConflict == 0 || st.conflictIP != ip || st.conflictWith != otherUID {
 		st.firstConflict = now
+		st.conflictIP = ip
+		st.conflictWith = otherUID
 		m.mu.Unlock()
-		log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突，登记待观察（%v 宽限期内不动） uid=%s",
-			realm, ip, logfmt.UID8(otherUID), ConflictGrace, logfmt.UID8(uid))
 		return
 	}
 	elapsed := time.Duration(now - st.firstConflict)
@@ -837,19 +850,20 @@ func (m *AccountProxy) deferConflictRebind(uid, otherUID, ip, realm string) {
 		return
 	}
 	// 清双方登记（换绑成败都不再重复触发），换绑在锁外做。
-	st.firstConflict = 0
+	st.firstConflict, st.conflictIP, st.conflictWith = 0, "", ""
 	if o := m.rebindAt[otherUID]; o != nil {
-		o.firstConflict = 0
+		o.firstConflict, o.conflictIP, o.conflictWith = 0, "", ""
 	}
 	m.mu.Unlock()
 
-	log.Printf("[autobind] %s 出口 IP %s 与 %s 冲突持续超过 %v，%s → 换绑 uid=%s",
-		realm, ip, logfmt.UID8(otherUID), ConflictGrace, why, logfmt.UID8(moverUID))
+	// 一行到底：动作与结果合并（用户要的是干净日志，不是过程播报）。
 	if m.bindFirstUsable(moverUID, realm) {
 		m.markRebound(moverUID, time.Now().UnixNano())
-		log.Printf("[autobind] 同 IP 冲突换绑完成 uid=%s", logfmt.UID8(moverUID))
+		log.Printf("[autobind] 出口 IP %s 与 %s 稳定冲突超过 %v，%s → 已换绑 uid=%s",
+			ip, logfmt.UID8(otherUID), ConflictGrace, why, logfmt.UID8(moverUID))
 	} else {
-		log.Printf("[autobind] 同 IP 冲突但池内暂无可换出口，保持现状 uid=%s", logfmt.UID8(moverUID))
+		log.Printf("[autobind] 出口 IP %s 稳定冲突超过 %v，但池内暂无可换出口，保持现状 uid=%s",
+			ip, ConflictGrace, logfmt.UID8(moverUID))
 	}
 }
 
@@ -1047,7 +1061,8 @@ func (m *AccountProxy) bindFirstUsable(uid, realm string) bool {
 			_ = m.saveLocked()
 			takenLinks[r.raw] = true // 本轮后续账号跳过（同 tick 并发已串行化，防御性）
 			takenIPs[r.ip] = true
-			log.Printf("[autobind] %s uid=%s 绑定候选（出口 %s）", realm, logfmt.UID8(uid), r.ip)
+			// 绑定成功由调用方汇总一行（"自动绑定稳定出口"/"已换绑"）；
+			// 这里不再逐条播报候选出口 IP（日志噪音）。
 			return true
 		}
 		return false
@@ -1509,11 +1524,9 @@ func (m *AccountProxy) checkOne(ctx context.Context, uid string) AccountProxySta
 	//（固定 IP 商家场景：用户明知出口该是多少，填进来就是要求强校验）。
 	// 未声明时：记录最新实测出口（lockedIP 字段名沿用，语义=最近一次实测值），
 	// 状态一律 ok。
-	prev := b.lockedIP.Load()
-	b.lockedIP.Store(p.IP) // 每次校验都刷新为最新实测出口
-	if prev != "" && prev != p.IP {
-		log.Printf("[account-proxy] 出口轮换（正常）uid=%s 旧=%s 新=%s", logfmt.UID8(b.uid), prev, p.IP)
-	}
+	// 出口轮换是 resin 的**正常行为**（每几分钟一次），不是事件——不记日志，
+	// 否则每轮校验每个账号一行，日志被 IP 刷满（用户 2026-10-08 反馈）。
+	b.lockedIP.Store(p.IP) // 每次校验刷新为最新实测出口
 	if declared := strings.TrimSpace(b.spec.ExpectedIP); declared != "" && p.IP != declared {
 		b.setState(proxyStateMismatch,
 			fmt.Sprintf("出口 IP 与声明不符：声明 %s，实测 %s", declared, p.IP))
@@ -1916,11 +1929,23 @@ func (m *AccountProxy) recomputeShared() {
 		for _, u := range uids[m.opts.MaxPerIP:] {
 			blocked[u] = true
 		}
-		logProxyWarn(AccountProxyStatus{
-			UID: "*", State: "shared_ip", ActualIP: ip,
-			Message: fmt.Sprintf("出口 IP %s 承载 %d 个账号，超过上限 %d（%s：隔离 %d 个）",
-				ip, len(uids), m.opts.MaxPerIP, m.opts.MaxPerIPAction, len(uids)-m.opts.MaxPerIP),
-		})
+		// 去重播报：同一 IP 的承载数没变就不重复打（resin 轮换导致撞 IP 是常态，
+		// 每轮校验都刷一条会把日志淹掉——用户 2026-10-08 反馈）。
+		m.sharedWarnMu.Lock()
+		if m.sharedWarn == nil {
+			m.sharedWarn = map[string]int{}
+		}
+		if m.sharedWarn[ip] != len(uids) {
+			m.sharedWarn[ip] = len(uids)
+			m.sharedWarnMu.Unlock()
+			logProxyWarn(AccountProxyStatus{
+				UID: "*", State: "shared_ip", ActualIP: ip,
+				Message: fmt.Sprintf("出口 IP %s 承载 %d 个账号，超过上限 %d（%s：隔离 %d 个）",
+					ip, len(uids), m.opts.MaxPerIP, m.opts.MaxPerIPAction, len(uids)-m.opts.MaxPerIP),
+			})
+		} else {
+			m.sharedWarnMu.Unlock()
+		}
 	}
 	if m.opts.MaxPerIPAction == MaxPerIPQuarantine {
 		m.mu.RLock()
