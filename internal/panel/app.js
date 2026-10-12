@@ -346,7 +346,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + realmTag(s.realm) + '</div><div class="id">' + esc(short) + '</div><div class="id" style="font-family:var(--sans)">最近成功 ' + ago(s.last_success) + '</div></td>' +
-      '<td>' + tag + (s.in_flight > 0 ? ' <span class="tag mute" title="该账号当前正在处理的请求数">在途 ' + s.in_flight + '</span>' : '') + note + '</td>' +
+      '<td>' + tag + (s.in_use ? ' <span class="tag ok" title="10分钟内有成功请求，正在被使用">使用中</span>' : '') + (s.in_flight > 0 ? ' <span class="tag mute" title="该账号当前正在处理的请求数">在途 ' + s.in_flight + '</span>' : '') + note + '</td>' +
       egressCell(s.egress) +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +

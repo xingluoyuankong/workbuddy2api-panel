@@ -498,6 +498,12 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 			st.ModelDay = fm
 		}
 		row := accountRow{Status: st, ErrRecent: n}
+		// 是否正在使用：10分钟内有成功请求，或当前有在途请求
+		if st.InFlight > 0 {
+			row.InUse = true
+		} else if !st.LastSuccessTime.IsZero() && time.Since(st.LastSuccessTime) < 10*time.Minute {
+			row.InUse = true
+		}
 		if cs, ok := cacheByUID[st.UID]; ok {
 			if rate, has := cs.Rate(); has {
 				row.CacheHitRate = &rate
@@ -543,6 +549,7 @@ type accountRow struct {
 	ErrRecent   int    `json:"err_recent"`
 	ErrLastAt   string `json:"err_last_at,omitempty"`   // 环内最近一次报错时刻
 	ErrLastText string `json:"err_last_text,omitempty"` // 最近一次报错原文（badge tooltip）
+	InUse       bool   `json:"in_use"`                  // 10分钟内有成功请求或当前有在途请求
 	// 前缀缓存命中（上游 usage.prompt_cache_hit_tokens 聚合，全量历史）。
 	// 无数据（网关上线该统计前的旧桶 / 上游未下发）时三者全空，旧前端零回归。
 	CacheHitRate   *float64 `json:"cache_hit_rate,omitempty"`   // 命中率 0~1
