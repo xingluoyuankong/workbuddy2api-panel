@@ -191,6 +191,33 @@ function shortIP(ip) {
   return ip.slice(0, 13) + '…' + ip.slice(-5);
 }
 
+// 出口/代理状态简写标签（状态列显示）
+function egressStateTag(eg) {
+  if (!eg) return '';
+  let t = '';
+  const st = eg.state || '';
+  if (eg.source === 'direct') {
+    t += ' <span class="tag mute" title="未绑定代理，走本机直连">直连</span>';
+  } else if (st === 'unreachable') {
+    t += ' <span class="tag bad" title="代理出口不可达，可能被熔断或网络故障">出口不通</span>';
+  } else if (st === 'not_effective') {
+    t += ' <span class="tag warn" title="代理已绑定但未生效，实际走直连">代理未生效</span>';
+  } else if (st === 'mismatch') {
+    t += ' <span class="tag warn" title="显示的出口IP与调用实际出口不一致">出口不一致</span>';
+  } else if (st === 'leak') {
+    t += ' <span class="tag bad" title="检测到直连泄漏">泄漏</span>';
+  } else if (st === 'rotating') {
+    t += ' <span class="tag mute" title="轮换池正在轮换出口">轮换中</span>';
+  } else if (st === 'disabled') {
+    t += ' <span class="tag mute" title="代理已禁用">代理禁用</span>';
+  } else if (st === 'unchecked') {
+    t += ' <span class="tag mute" title="出口尚未校验">未校验</span>';
+  }
+  if (eg.shared_by > 1) {
+    t += ' <span class="tag warn" title="同一出口IP共承载 ' + eg.shared_by + ' 个账号，聚号风险">共IP×' + eg.shared_by + '</span>';
+  }
+  return t;
+}
 function egressCell(eg) {
   if (!eg) return '<td class="egress"><span class="eg-idle">—</span></td>';
 
@@ -346,7 +373,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + realmTag(s.realm) + '</div><div class="id">' + esc(short) + '</div><div class="id" style="font-family:var(--sans)">最近成功 ' + ago(s.last_success) + '</div></td>' +
-      '<td>' + tag + (s.in_use ? ' <span class="tag ok" title="10分钟内有成功请求，正在被使用">使用中</span>' : '') + (s.in_flight > 0 ? ' <span class="tag mute" title="该账号当前正在处理的请求数">在途 ' + s.in_flight + '</span>' : '') + note + '</td>' +
+      '<td>' + tag + (s.in_use ? ' <span class="tag ok" title="10分钟内有成功请求，正在被使用">使用中</span>' : '') + (s.in_flight > 0 ? ' <span class="tag mute" title="该账号当前正在处理的请求数">在途 ' + s.in_flight + '</span>' : '') + egressStateTag(s.egress) + note + '</td>' +
       egressCell(s.egress) +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
