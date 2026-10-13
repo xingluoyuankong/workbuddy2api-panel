@@ -887,6 +887,25 @@ func (c *Client) markRealmAuthFail(realm string) {
 	log.Printf("[upstream] %s 池凭据失效（407），整池熔断 1h 回落直连（订阅刷新后自动恢复）", key)
 }
 
+// clearRealmAuthFail 清除 realm 池凭据失效标记（407 熔断提前恢复）。
+// 用于主动探测成功后的恢复，比死等 1h 更快。
+func (c *Client) clearRealmAuthFail(realm string) {
+	key := realmKey(realm)
+	c.realmAuthFail.Delete(key)
+	log.Printf("[upstream] %s 池 407 熔断已清除（主动探测恢复）", key)
+}
+
+// RealmAuthFailed 报告指定 realm 是否处于 407 熔断中。
+func (c *Client) RealmAuthFailed(realm string) bool {
+	key := realmKey(realm)
+	if v, ok := c.realmAuthFail.Load(key); ok {
+		if until, _ := v.(int64); time.Now().UnixMilli() < until {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Client) pickProxy(realm string) *proxyEntry {
 	key := realmKey(realm)
 	// realm 级凭据失效熔断：整池跳过，直接回落直连（比逐条试 407 快得多）。

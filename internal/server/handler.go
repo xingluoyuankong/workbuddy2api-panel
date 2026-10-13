@@ -1505,6 +1505,10 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
+		// 优化 2026-10-13：5xx 连续失败也要喂连败计数——单靠 NoteError 的熔断阈值太高，
+		// 实测曾出现同一账号连续几十个 502 仍被反复选中的情况。连败 5 次即临时出池，
+		// 避免坏账号拖慢整体。
+		h.cfg.Pool.NoteFailures(uid)
 	case upstream.ErrContentBlocked:
 		// 内容策略拦截（误报）：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// passthrough 模式由 chatCompletions 内降级重试处理；custom 模式本不会到此分支。
