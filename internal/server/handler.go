@@ -1038,6 +1038,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 换号重试本身已是正确应对（退避后大概率拿到连接位）。
 				log.Printf("WARN: [server] 代理网关并发饱和自限流 uid=%s（transport 429），换号重试，不罚号不换绑",
 					uidPrefix(acct.UID))
+			} else if isProxyAuthErr(terr) {
+				// 修复 2026-10-13：407 代理凭据失效不该连坐账号。
+				// 代理 token 失效是代理侧问题，账号本身是好的。upstream 侧已触发
+				// 整池熔断（markRealmAuthFail），这里只换号不喂失败计数，
+				// 避免健康账号被误降权。
+				log.Printf("WARN: [server] 代理凭据失效 uid=%s（transport 407），换号重试，不罚号",
+					uidPrefix(acct.UID))
 			} else {
 				h.cfg.Pool.NoteFailures(acct.UID)
 			}
@@ -1391,6 +1398,16 @@ func rotateBackoff(i int, ctx context.Context, kind upstream.ErrKind) bool {
 // 代理对 CONNECT 返回非 2xx 时 Go 的 http.Transport 会把状态码文案当成错误抛出
 // （形如 Post "https://…": Too Many Requests），既没有 status 也没有 body，
 // 常规分类路径完全看不见它。
+// isProxyAuthErr 判断 transport error 是否为 407 代理凭据失效。
+func isProxyAuthErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Proxy Authentication Required") ||
+		strings.Contains(msg, "407")
+}
+
 func isRateLimitedErr(err error) bool {
 	if err == nil {
 		return false

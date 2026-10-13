@@ -1762,6 +1762,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			cancel()
 			log.Printf("ERR: [upstream] chat_stream uid=%s realm=%s model=%s: transport error: %v",
 				logfmt.UID8(a.UID), realmKey(a.Realm()), modelOf(prepared), err)
+			// 修复 2026-10-13：transport error 中的 407 也要触发整池熔断。
+			// 代理在 CONNECT 阶段返回 407 时，走 transport error 路径（错误文本含
+			// "Proxy Authentication Required"），不是 HTTP 响应路径。若不处理，
+			// 系统会逐个试每个坏代理，浪费 N 次往返。直接熔断整池，下一个请求走直连。
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "Proxy Authentication Required") ||
+				strings.Contains(errMsg, "407") {
+				c.markRealmAuthFail(a.Realm())
+			}
 			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能仍
 			// 留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期
 			// 不够，主动清池才断根。
