@@ -163,31 +163,43 @@ func (p *Panel) freeModels() map[string]bool {
 	//    之后整天都用这一份；次日 0 点每日刷新重新捕获。
 	day := time.Now().Format("2006-01-02")
 	if p.cfg.ModelMeta != nil {
-		fresh := false
-		for _, v := range p.cfg.ModelMeta.All() {
-			if v.CatalogDay == day && v.CatalogCredits != "" {
-				fresh = true
-				break
-			}
-		}
-		if !fresh && p.cfg.ListModels != nil {
+		// 查漏补缺：对今日无快照的模型逐个补采（2026-10-13 修复）。
+		// 原逻辑是"一刀切"——只要有一个模型有今日快照就跳过整个刷新，
+		// 导致部分模型（如上游未返回 credits 的）永远补不上。
+		if p.cfg.ListModels != nil {
 			cat := map[string]string{}
+			// 先收集今日缺快照的模型 key
+			missing := map[string]bool{}
+			for _, v := range p.cfg.ModelMeta.All() {
+				if v.CatalogDay != day || v.CatalogCredits == "" {
+					missing[v.Realm+":"+v.ID] = true
+				}
+			}
 			for _, e := range p.cfg.ListModels() {
 				full, _ := e["id"].(string)
 				raw, _ := e["credits"].(string)
-				if full != "" && raw != "" {
+				// 只补采缺失的，且上游确实返回了 credits 的
+				if full != "" && raw != "" && missing[full] {
 					cat[full] = raw
 				}
 			}
 			if len(cat) > 0 {
 				p.cfg.ModelMeta.CaptureCatalog(day, cat)
-				fresh = true
 			}
 		}
-		if fresh {
+		{
+			fresh := false
 			for _, v := range p.cfg.ModelMeta.All() {
-				if v.CatalogDay == day && v.CatalogCredits != "" && creditsIsZero(v.CatalogCredits) {
-					set[v.Realm+":"+v.ID] = true
+				if v.CatalogDay == day && v.CatalogCredits != "" {
+					fresh = true
+					break
+				}
+			}
+			if fresh {
+				for _, v := range p.cfg.ModelMeta.All() {
+					if v.CatalogDay == day && v.CatalogCredits != "" && creditsIsZero(v.CatalogCredits) {
+						set[v.Realm+":"+v.ID] = true
+					}
 				}
 			}
 		}
