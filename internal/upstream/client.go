@@ -991,8 +991,13 @@ func (t *proxyRT) RoundTrip(req *http.Request) (*http.Response, error) {
 		// 2026-10-13 实测：网关纯 TCP 不可能 MITM，证书错误多为上游临时问题。
 		// 不再调用 noteUntrusted（避免误报 SECURITY + 6h 长熔断 + 永久剔除）。
 		t.entry.noteFail()
+		// 只打 host，raw 里有凭据不能进日志
+		host := t.entry.raw
+		if u, perr := url.Parse(t.entry.raw); perr == nil && u.Host != "" {
+			host = u.Host
+		}
 		log.Printf("WARN: [upstream] 代理出口 %s TLS 证书校验失败，按普通失败处理（非劫持）: %v",
-			t.entry.raw, err)
+			host, err)
 	case err != nil:
 		t.entry.noteFail() // 连不上代理 / 代理连不上目标
 	case resp.StatusCode == http.StatusForbidden:
