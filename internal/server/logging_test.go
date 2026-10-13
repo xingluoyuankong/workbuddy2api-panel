@@ -153,7 +153,7 @@ func TestUIDPrefix(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234, 0.08, true, 1, 0, false)
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", "1.2.3.4", http.StatusOK, 1234, 0.08, true, 1, 0, false)
 	})
 	for _, want := range []string{
 		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
@@ -170,7 +170,7 @@ func TestLogChatRowFormat(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, 0, false, 1, 0, false)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", "1.2.3.4", http.StatusServiceUnavailable, -1, 0, false, 1, 0, false)
 	})
 	for _, want := range []string{"TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
@@ -182,8 +182,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 0, true, 1, 0, false)
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 0, true, 1, 0, false)
+		logChatRow(0, time.Second, "m", "sync", "u", "1.2.3.4", 200, 1, 0, true, 1, 0, false)
+		logChatRow(0, time.Second, "m", "sync", "u", "1.2.3.4", 200, 1, 0, true, 1, 0, false)
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -321,7 +321,7 @@ func TestLogChatRowCreditColumn(t *testing.T) {
 			chatLogEnabled = true
 			defer func() { chatLogOut = old; chatLogEnabled = oldEnabled }()
 
-			logChatRow(0, time.Second, "m", "sync", "u", 200, 10, c.credit, c.hasCredit, 1, 0, false)
+			logChatRow(0, time.Second, "m", "sync", "u", "1.2.3.4", 200, 10, c.credit, c.hasCredit, 1, 0, false)
 			line := buf.String()
 			if !strings.Contains(line, c.want) {
 				t.Errorf("line = %q, want %q", line, c.want)
@@ -370,7 +370,7 @@ func TestLogChatRowDecodeTokps(t *testing.T) {
 	out := captureStdout(t, func() {
 		// 283 tok，请求级 TTFB 24s，解码期 94.3 tok/s，重试 3 次
 		logChatRow(24*time.Second, 27*time.Second, "hy4-preview-f", "stream",
-			"00e26541abcdef", http.StatusOK, 283, 0, true, 3, 94.3, true)
+			"00e26541abcdef", "1.2.3.4", http.StatusOK, 283, 0, true, 3, 94.3, true)
 	})
 	for _, want := range []string{"94.3tok/s", "try=3 |", "TTFB=24000ms", "tok=283"} {
 		if !strings.Contains(out, want) {
@@ -386,7 +386,7 @@ func TestLogChatRowDecodeTokps(t *testing.T) {
 func TestLogChatRowFallbackTokps(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, 2*time.Second, "m", "sync", "u", 200, 10, 0, true, 1, 0, false)
+		logChatRow(0, 2*time.Second, "m", "sync", "u", "1.2.3.4", 200, 10, 0, true, 1, 0, false)
 	})
 	if !strings.Contains(out, "5.0tok/s") {
 		t.Errorf("回落口径缺失:\n%s", out)

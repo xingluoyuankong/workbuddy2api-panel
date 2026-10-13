@@ -749,6 +749,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			sizeText = fmt.Sprintf("%.1f MB", float64(r.ContentLength)/(1<<20))
 		}
 		st := newChatStatWithModel(time.Now(), modelName, peek.Stream)
+		st.clientIP = clientIP
 		st.status = http.StatusRequestEntityTooLarge
 		defer st.done()
 		log.Printf("WARN: [server] 413 request_body_too_large: size=%s (len=%d bytes, content_length=%d, limit=%d MB, model=%s) — 多图/长上下文会话易触发（历史图片每轮以 base64 重发）；压缩图片或调大 server.max_body_mb",
@@ -768,6 +769,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStatWithModel(time.Now(), peek.Model, peek.Stream)
+	st.clientIP = clientIP
 	defer st.done()
 
 	tried := map[string]bool{}

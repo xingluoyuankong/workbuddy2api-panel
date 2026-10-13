@@ -33,10 +33,11 @@ func SetChatLogOutput(w io.Writer) { chatLogOut = w }
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
-	start  time.Time
-	model  string
-	mode   string // "stream" | "sync"
-	uid    string // 完整 uid，展示时只取前 8 位
+	start    time.Time
+	model    string
+	mode     string // "stream" | "sync"
+	uid      string // 完整 uid，展示时只取前 8 位
+	clientIP string // 客户端 IP（2026-10-13：定位异常请求源）
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
@@ -75,7 +76,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.credit, s.hasCredit,
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.clientIP, s.status, s.toks, s.credit, s.hasCredit,
 		s.tries, s.tokps, s.hasTokps)
 }
 
@@ -390,7 +391,7 @@ const chatLogModelWidth = 26
 // credit/hasCredit 为本次请求真实消耗的工作积分（上游 usage.credit）：
 // hasCredit=false 显示 "-"（上游没下发），credit==0 显示 "0"（实测免费）。
 // 两者必须分开——把"没数据"显示成 0 会让人误以为这些请求都免费。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int, credit float64, hasCredit bool,
+func logChatRow(ttfb, total time.Duration, model, mode, uid, clientIP string, status int, toks int, credit float64, hasCredit bool,
 	tries int, tokps float64, hasTokps bool) {
 	if !chatLogEnabled {
 		return
@@ -434,13 +435,14 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if hasCredit {
 		creditField = trimCredit(credit)
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | cr=%s | total=%.1fs |%s\n",
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | ip=%s | TTFB=%s | tok=%s | %stok/s | cr=%s | total=%.1fs |%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
 		mode,
 		status,
 		uidPrefix(uid),
+		clientIP,
 		ttfbMS,
 		tokField,
 		tokpsField,
