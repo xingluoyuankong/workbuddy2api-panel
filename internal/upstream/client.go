@@ -929,13 +929,12 @@ func (c *Client) pickProxy(realm string) *proxyEntry {
 	}
 	start := int(c.proxyCursor.Add(1)-1) % n
 	now := time.Now().UnixNano()
-	// mitmBan 永久剔除标记：劫持累计 >=3 次 = 该出口稳定在劫持（不是偶发），
-	// 6h 熔断到期后回来只会再劫持——任何轮次都不再选它。
-	// 剔除只影响选路，条目保留（订阅刷新时整体重建，人工可换链接救回）。
-	const mitmBan = 3
-	good := func(e *proxyEntry, now int64) bool { return e.mitmHits.Load() < mitmBan }
+	// 2026-10-13：删除基于误报 MITM 检测的永久剔除。
+	// 原 mitmBan=3 逻辑基于错误的"劫持"假设，实测网关纯 TCP 不可能 MITM。
+	// 证书错误现按普通失败处理（noteFail），由常规的失败退避机制处理，
+	// 不再永久剔除。
 	healthy := func(e *proxyEntry, now int64) bool {
-		return good(e, now) && e.fails.Load() == 0 && e.deadUntil.Load() <= now && !e.untrusted(now)
+		return e.fails.Load() == 0 && e.deadUntil.Load() <= now && !e.untrusted(now)
 	}
 
 	// 第一轮：健康 **且延迟可接受**（EWMA 未超阈值或无样本）→ 轮询分散。
@@ -955,19 +954,19 @@ func (c *Client) pickProxy(realm string) *proxyEntry {
 			return e
 		}
 	}
-	// 第二轮：没有健康出口 → 跳过期外轮询（避开 MITM 嫌疑/永久剔除出口）。
+	// 第二轮：没有健康出口 → 跳过期外轮询。
 	for i := 0; i < n; i++ {
-		if e := entries[(start+i)%n]; good(e, now) && e.deadUntil.Load() <= now && !e.untrusted(now) {
+		if e := entries[(start+i)%n]; e.deadUntil.Load() <= now && !e.untrusted(now) {
 			return e
 		}
 	}
-	// 兜底：存在非 MITM 嫌疑的出口时，宁可试一个可能坏的（它只是普通失败在
-	// 退避期，几分钟后可能就好了），也不放弃该 realm。
+	// 兜底：宁可试一个可能坏的（它只是普通失败在退避期，几分钟后可能就好了），
+	// 也不放弃该 realm。
 	// 注意：这里**不检查 deadUntil**——全列表轮询语义要求全在退避期时仍给机会。
 	// 凭据失效（407）场景由 realm 级熔断在函数开头拦截（markRealmAuthFail），
 	// 整池立即回落直连，不走这条兜底。
 	for i := 0; i < n; i++ {
-		if e := entries[(start+i)%n]; good(e, now) && !e.untrusted(now) {
+		if e := entries[(start+i)%n]; !e.untrusted(now) {
 			return e
 		}
 	}
@@ -987,10 +986,13 @@ func (t *proxyRT) RoundTrip(req *http.Request) (*http.Response, error) {
 	// 该出口链路质量的信号。noteSuccess/noteFail 已处理成败语义，这里只补延迟。
 	lat := time.Since(start)
 	switch {
-	case err != nil && isTLSInterception(err):
-		// 证书校验失败 = 出口在劫持 HTTPS（MITM）：长熔断 + 告警，
-		// 绝不能当普通失败 10s 后就放它回来。
-		t.entry.noteUntrusted()
+	case err != nil && isTLSCertError(err):
+		// 证书校验失败：按普通代理失败处理（noteFail）。
+		// 2026-10-13 实测：网关纯 TCP 不可能 MITM，证书错误多为上游临时问题。
+		// 不再调用 noteUntrusted（避免误报 SECURITY + 6h 长熔断 + 永久剔除）。
+		t.entry.noteFail()
+		log.Printf("WARN: [upstream] 代理出口 %s TLS 证书校验失败，按普通失败处理（非劫持）: %v",
+			t.entry.raw, err)
 	case err != nil:
 		t.entry.noteFail() // 连不上代理 / 代理连不上目标
 	case resp.StatusCode == http.StatusForbidden:
@@ -1018,10 +1020,11 @@ func (t *proxyRT) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-// isTLSInterception 判定出站错误是否为 TLS 证书校验失败（劫持/MITM 特征）。
+// isTLSCertError 判定出站错误是否为 TLS 证书校验失败。
+// 注意（2026-10-13 实测结论）：网关是纯 TCP 隧道，零 TLS 代码，不可能做 MITM。
+// 证书错误更可能是上游服务器证书问题、DNS 异常或临时网络问题，不应按"劫持"处理。
 // Go 会把 x509 错误包在 *url.Error 里，errors.As 能穿透包装逐层找。
-// 同时兜底匹配错误文本——不同 TLS 库版本的包装不完全一致，宁可多报不可漏报。
-func isTLSInterception(err error) bool {
+func isTLSCertError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -1198,7 +1201,7 @@ func (c *Client) BestProxyFor(realm, excludeRaw string) string {
 	c.realmMu.Unlock()
 	var best *proxyEntry
 	for _, e := range entries {
-		if e.raw == excludeRaw || e.mitmHits.Load() >= 3 {
+		if e.raw == excludeRaw {
 			continue
 		}
 		if best == nil {
@@ -1227,7 +1230,7 @@ func (c *Client) CandidateProxies(realm, excludeRaw string) []string {
 	// 过滤
 	keep := entries[:0:0]
 	for _, e := range entries {
-		if e.raw == excludeRaw || e.mitmHits.Load() >= 3 {
+		if e.raw == excludeRaw {
 			continue
 		}
 		keep = append(keep, e)
