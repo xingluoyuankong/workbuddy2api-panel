@@ -1178,6 +1178,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}))
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			// 2026-10-13 修复：0-token 空响应不算成功。
+			// NoteSuccess 已在上方调用并清零了 consecutiveFails，这里补一次
+			// NoteFailures 抵消——空响应本质是失败，不应重置连败计数。
+			// （内容过滤的空响应由 ErrContentBlocked 分支处理，不走这里。）
+			if st.toks == 0 {
+				h.cfg.Pool.NoteFailures(acct.UID)
+			}
 			// 本轮尝试的首包延迟（请求级 TTFB 减去之前失败尝试耗时）：
 			// 解码期速度的分母。日志行 TTFB 保留请求级口径（用户体感）。
 			attTTFB := stats.TTFB() - attemptStarted.Sub(st.start)
@@ -1226,6 +1233,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		// 2026-10-13 修复：0-token 空响应不算成功（同流式路径）。
+		if st.toks == 0 {
+			h.cfg.Pool.NoteFailures(acct.UID)
+		}
 		return
 	}
 	// 末端错误透传（error-passthrough）：上游返回的错误原样透传，不再规范化成固定文案。
