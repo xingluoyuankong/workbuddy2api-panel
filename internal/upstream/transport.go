@@ -25,7 +25,7 @@ const (
 	// tlsHandshakeTimeout TLS 握手上限。现役此前完全缺失——握手挂起时无任何
 	// 层兜底（ResponseHeaderTimeout 只在请求写完后才计时），只能干等到
 	// HTTP.Client.Timeout(120s)。
-	tlsHandshakeTimeout = 10 * time.Second
+	tlsHandshakeTimeout = 5 * time.Second
 	// idleConnTimeout 空闲连接池保留时长。从 90s 收到 30s：WAF 风暴后上游
 	// NGI 常态性掐闲置连接，90s 池里的连接多半已死（kongjianguan 同款取值）；
 	// 复用侧仍有 15s keepalive 兜底识别。
