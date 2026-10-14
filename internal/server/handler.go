@@ -1272,6 +1272,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusTooManyRequests
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+		case upstream.ErrFreeQuotaExhausted:
+			status = http.StatusTooManyRequests
+			code = "free_quota_exhausted"
+			msg = "free model quota exhausted: all accounts have reached the free limit for this model, please wait for reset or try another model"
 		case upstream.ErrModelBlocked:
 			// 11102「该后端无此模型」：上游**目录里有这个 ID**，但实际调用时该后端
 			// 没有它的服务信息（幽灵模型，如 auto-chat / default-model）。
@@ -1463,7 +1467,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
-	case upstream.ErrSoftRate:
+	case upstream.ErrSoftRate, upstream.ErrFreeQuotaExhausted:
 		// 上游排队（6020 queue.waiting）**优先判**：它不是"账号被限流"，而是该模型
 		// 此刻在排大队（实测 queue_position 2000+）。必须走模型级冷却——账号保持
 		// 健康、其它模型照常可用。若按账号级处理，一个排队模型会把池里的号依次

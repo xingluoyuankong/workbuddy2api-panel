@@ -32,6 +32,7 @@ const (
 	ErrNone             ErrKind = iota // 成功
 	ErrHardCredit                      // 余额不足（402 或 body 关键词）→ 长冷却
 	ErrSoftRate                        // 429 软限流 → 短冷却
+	ErrFreeQuotaExhausted              // 429 + 6004 免费模型额度耗尽 → 短冷却到重置时间
 	ErrSessionDead                     // 401 + 12153 offline session 失效 → 禁用
 	ErrNotFound                        // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                          // 5xx 上游故障
@@ -54,6 +55,8 @@ func (k ErrKind) String() string {
 		return "hard_credit"
 	case ErrSoftRate:
 		return "soft_rate"
+	case ErrFreeQuotaExhausted:
+		return "free_quota_exhausted"
 	case ErrSessionDead:
 		return "session_dead"
 	case ErrNotFound:
@@ -543,6 +546,11 @@ func Classify(status int, body string) ErrKind {
 	// 信号：上游既然给了 429，就按限流语义处理（宁可短冷却自愈，不可长冷却弃号）；
 	// 真正的余额耗尽由 402（上层）捕获，非 429 状态码的 quota 措辞仍走下方
 	// hardMarkers（历史语义不变）。
+	// 6004 免费模型额度耗尽优先于通用 429（2026-10-15：日志明确区分
+	// "限流 / 免费额度耗尽 / 账号故障 / 代理故障"）
+	if IsModelRateLimit(body) {
+		return ErrFreeQuotaExhausted
+	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
 	}
