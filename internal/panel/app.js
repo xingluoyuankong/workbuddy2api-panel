@@ -2708,7 +2708,7 @@ function renderProxies(list) {
         '<div class="note">' + esc((a.uid || '').slice(0, 8)) + (a.realm ? ' · ' + esc(a.realm) : '') + '</div></td>' +
       '<td class="mono">' + esc(a.proxy || (a.proxy_host ? esc(a.scheme) + '://' + esc(a.proxy_host) : '—')) + '</td>' +
       '<td class="mono">' + (a.manual_direct ? '<span style="color:#3fb950">直连</span>' : (a.expected_ip ? esc(a.expected_ip) : '<span class="note">自动锁定</span>')) + '</td>' +
-      '<td class="mono">' + (a.actual_ip ? esc(a.actual_ip) + (sameAsDirect ? ' <span style="color:#f85149">= 直连</span>' : '') : '—') + '</td>' +
+      '<td class="mono">' + (a.manual_direct ? (a.actual_ip ? esc(a.actual_ip) + ' <span style="color:#3fb950">直连</span>' : '<span class="note">直连（探测中）</span>') : (a.actual_ip ? esc(a.actual_ip) + (sameAsDirect ? ' <span style="color:#f85149">= 直连</span>' : '') : '—')) + '</td>' +
       '<td>' + esc(geo || '—') + (a.timezone ? '<div class="note">' + esc(a.timezone) + '</div>' : '') + '</td>' +
       '<td>' + stBadge(a.state, s[0], s[1]) +
         (a.message ? '<div class="note">' + esc(a.message) + '</div>' : '') +

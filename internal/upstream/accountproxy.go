@@ -1746,6 +1746,14 @@ func (m *AccountProxy) Statuses() []AccountProxyStatus {
 	return out
 }
 
+// DirectIP 返回缓存的本机直连出口 IP（2026-10-15：手动直连账号面板显示用）。
+func (m *AccountProxy) DirectIP() string {
+	if m == nil {
+		return ""
+	}
+	return m.directIPCache.Load()
+}
+
 // Status 单账号状态。
 func (m *AccountProxy) Status(uid string) (AccountProxyStatus, bool) {
 	if b := m.bindingOf(uid); b != nil {

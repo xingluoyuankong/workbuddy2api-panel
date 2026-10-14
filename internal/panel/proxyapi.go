@@ -66,6 +66,14 @@ func (p *Panel) proxyList(w http.ResponseWriter, r *http.Request) {
 		manualDirect := false
 		if e, hasEntry := entries[st.UID]; hasEntry && e.Proxy == "" && !e.Auto {
 			manualDirect = true
+			// 直连的出口就是本机直连 IP，填上以便面板显示（2026-10-15）
+			if s.DirectIP == "" {
+				s.DirectIP = m.DirectIP()
+			}
+			// 直连模式下 ActualIP 就是 DirectIP
+			if s.ActualIP == "" {
+				s.ActualIP = s.DirectIP
+			}
 		}
 		rows = append(rows, proxyRow{AccountProxyStatus: s, Nickname: st.Nickname, Realm: st.Realm, Bound: ok, ManualDirect: manualDirect})
 	}
