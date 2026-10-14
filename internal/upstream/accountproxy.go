@@ -641,6 +641,20 @@ func (m *AccountProxy) AutoBindAccount(uid, realm string) {
 		curRaw = b.spec.Proxy
 		isAuto = b.spec.Auto
 		isEnabled = b.spec.Enabled
+	} else {
+		// 2026-10-15 修复：手动直连的账号没有 runtime binding（b==nil），
+		// 但 doc.Accounts 里有 Auto=false 的显式配置。必须查 doc，否则
+		// "手动直连"会被当成"未配置"强制自动重绑——这就是用户骂的
+		// "硬编码强制自动锁定代理"。
+		if e := m.doc.Accounts[uid]; e != nil {
+			isAuto = e.Auto
+			isEnabled = e.Enabled
+			// 有显式配置（即使 Proxy 为空=直连），按配置的 Auto/Enabled 判定
+			if !isAuto || !isEnabled {
+				m.mu.RUnlock()
+				return // 手动直连 / 已停用：不碰
+			}
+		}
 	}
 	m.mu.RUnlock()
 
