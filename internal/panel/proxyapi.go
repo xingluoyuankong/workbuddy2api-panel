@@ -137,10 +137,12 @@ func (p *Panel) proxyDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// proxyDirect 把账号切为「直连」：删除其代理绑定，出站回落本机直连出口。
+// proxyDirect 把账号切为「直连」：设为手动直连模式（auto=false, proxy=""），
+// 出站回落本机直连出口，且 autobind 不会自动重绑。
 //
-// 与 proxyDelete 等价但语义更明确——面板「直连」按钮表达的是「让这个账号走
-// 本机出口、不走任何代理」，而不是「删除一条配置」。返回删除后的账号状态。
+// 修复 2026-10-14：此前调用 m.Remove() 删除绑定，autobind 看到无绑定账号会
+// 立即自动重绑——「直连」按钮点了等于没点。改为 SetEntry 手动模式，Auto=false
+// 让 autobind 永不碰它，真正实现用户可选择的直连。
 func (p *Panel) proxyDirect(w http.ResponseWriter, r *http.Request) {
 	m := p.proxyManager()
 	if m == nil || !m.Active() {
@@ -159,7 +161,12 @@ func (p *Panel) proxyDirect(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "uid 不能为空")
 		return
 	}
-	if err := m.Remove(body.UID); err != nil {
+	// 手动直连模式：Proxy=""（直连），Auto=false（autobind 不碰），Enabled=true
+	if err := m.SetEntry(body.UID, upstream.AccountProxyEntry{
+		Proxy:   "",
+		Enabled: true,
+		Auto:    false,
+	}); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
