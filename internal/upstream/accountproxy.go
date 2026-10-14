@@ -1429,6 +1429,18 @@ func (m *AccountProxy) Check(ctx context.Context, uid string) (AccountProxyStatu
 		return AccountProxyStatus{}, fmt.Errorf("账号代理未启用")
 	}
 	if m.bindingOf(uid) == nil {
+		// 手动直连模式：entry 存在但无代理绑定，返回直连状态而非报错
+		//（2026-10-14 修复：直连账号点"校验"不再报"未配置代理"）
+		m.mu.RLock()
+		e := m.doc.Accounts[uid]
+		m.mu.RUnlock()
+		if e != nil && e.Proxy == "" && !e.Auto {
+			return AccountProxyStatus{
+				UID:     uid,
+				State:   "direct",
+				Message: "手动直连模式（走本机出口）",
+			}, nil
+		}
 		return AccountProxyStatus{}, fmt.Errorf("账号 %s 未配置代理", uid)
 	}
 	m.checkMu.Lock()

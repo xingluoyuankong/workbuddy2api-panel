@@ -30,9 +30,10 @@ func (p *Panel) proxyManager() *upstream.AccountProxy {
 // proxyRow 面板一行：账号身份 + 代理绑定 + 实测状态。
 type proxyRow struct {
 	upstream.AccountProxyStatus
-	Nickname string `json:"nickname"`
-	Realm    string `json:"realm"`
-	Bound    bool   `json:"bound"` // 是否已配置代理（false = 走默认出口）
+	Nickname     string `json:"nickname"`
+	Realm        string `json:"realm"`
+	Bound        bool   `json:"bound"`         // 是否已配置代理（false = 走默认出口）
+	ManualDirect bool   `json:"manual_direct"` // 手动直连模式（用户明确选择直连，autobind 永不碰）
 }
 
 // proxyList 全部账号的代理视图（未绑定的账号也要出现，否则没法给它配）。
@@ -53,6 +54,7 @@ func (p *Panel) proxyList(w http.ResponseWriter, r *http.Request) {
 			byUID[uid] = upstream.AccountProxyStatus{UID: uid, State: "unbound"}
 		}
 	}
+	entries := m.Entries()
 	rows := make([]proxyRow, 0, len(byUID))
 	for _, st := range p.cfg.Pool.List() {
 		s, ok := byUID[st.UID]
@@ -60,7 +62,12 @@ func (p *Panel) proxyList(w http.ResponseWriter, r *http.Request) {
 			s = upstream.AccountProxyStatus{UID: st.UID, State: "unbound"}
 		}
 		delete(byUID, st.UID)
-		rows = append(rows, proxyRow{AccountProxyStatus: s, Nickname: st.Nickname, Realm: st.Realm, Bound: ok})
+		// 手动直连：entry 存在、Proxy 为空、Auto=false
+		manualDirect := false
+		if e, hasEntry := entries[st.UID]; hasEntry && e.Proxy == "" && !e.Auto {
+			manualDirect = true
+		}
+		rows = append(rows, proxyRow{AccountProxyStatus: s, Nickname: st.Nickname, Realm: st.Realm, Bound: ok, ManualDirect: manualDirect})
 	}
 	// 残余（账号已删）追加在末尾，标 unbound 便于清理。
 	for _, s := range byUID {
