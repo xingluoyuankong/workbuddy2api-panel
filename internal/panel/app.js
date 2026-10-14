@@ -2828,13 +2828,13 @@ on('pxCancel', 'click', () => $('pxVeil').classList.remove('on'));
 on('pxSave', 'click', () => pxSaveNow(true));
 on('pxDelete', 'click', async () => {
   if (!pxUID) return;
-  if (!confirm('删除该账号的代理绑定、改为本机直连？')) return;
+  // 2026-10-14：去掉 confirm，直接切直连（用户要求）
   try {
     await api('proxies/direct', { method: 'POST', body: JSON.stringify({ uid: pxUID }) });
     $('pxVeil').classList.remove('on');
-    toast('已切换为直连（代理绑定已删除）');
+    toast('已切换为直连');
     await loadProxies(true);
-  } catch (e) { $('pxMsg').textContent = '删除失败：' + e.message; }
+  } catch (e) { $('pxMsg').textContent = '切换失败：' + e.message; }
 });
 
 /* ── 批量导入代理 ─────────────────────────────────────────────── */

@@ -496,11 +496,12 @@ func (m *AccountProxy) SetEntry(uid string, e AccountProxyEntry) error {
 		return fmt.Errorf("uid 不能为空")
 	}
 	e.Proxy = strings.TrimSpace(e.Proxy)
-	if e.Proxy == "" {
-		return fmt.Errorf("代理链接不能为空")
-	}
-	if err := validateProxyURL(e.Proxy); err != nil {
-		return err
+	// 空 Proxy = 手动直连模式（2026-10-14 修复：允许用户选择直连，
+	// Auto=false 时 autobind 永不碰它）。非空时才校验 URL 格式。
+	if e.Proxy != "" {
+		if err := validateProxyURL(e.Proxy); err != nil {
+			return err
+		}
 	}
 	if e.ExpectedIP != "" && net.ParseIP(e.ExpectedIP) == nil {
 		return fmt.Errorf("expected_ip 不是合法 IP: %s", e.ExpectedIP)
