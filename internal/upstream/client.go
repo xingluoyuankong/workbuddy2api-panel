@@ -194,7 +194,11 @@ var badParamsMarkers = []string{
 }
 
 // badParamsCodes 与上同源的 code 字段形态（codeMarker 判定，容差口径统一）。
-var badParamsCodes = []string{"11101", "11128"}
+// 注意：11128 有两种语义：
+//   - "first message is not system prompt" → 真正的 body 问题，不罚账号
+//   - "conversation id missing" → 账号问题（如 token 失效），必须罚账号
+// 因此 11128 不能一刀切归为 BadParams，由 badParamsBody 的 markers 精确判定。
+var badParamsCodes = []string{"11101"}
 
 // badParamsBody 判定上游 400 body 是否属于「请求体本身被拒」（与账号无关）。
 // body 为上游原始响应体（原文，非小写）。
