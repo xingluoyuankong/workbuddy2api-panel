@@ -1273,10 +1273,10 @@ func (m *AccountProxy) HTTPFor(uid string) (*http.Client, bool) {
 	if b == nil {
 		return nil, false
 	}
-	// 手动直连：直接返回直连 client（同 ChatHTTPFor）。
+	// 手动直连：直接返回直连 client（同 ChatHTTPFor，用 m.direct）。
 	if b.spec != nil && b.spec.Proxy == "" && !b.spec.Auto {
-		if m.client != nil && m.client.HTTP != nil {
-			return m.client.HTTP, true
+		if m.direct != nil {
+			return m.direct, true
 		}
 		return nil, false
 	}
@@ -1306,11 +1306,13 @@ func (m *AccountProxy) ChatHTTPFor(uid string) (*http.Client, bool) {
 	if b == nil {
 		return nil, false
 	}
-	// 手动直连（proxy="" && !Auto）：直接返回直连 client，不回落 realm 代理池。
-	// 否则回落逻辑会把直连账号送进代理池，导致"Upstream Proxy Error"。
+	// 手动直连（proxy="" && !Auto）：直接返回 AccountProxy 自己的直连 client，
+	// 不回落 realm 代理池。否则回落逻辑会把直连账号送进代理池，
+	// 导致"Upstream Proxy Error"（x509 证书不匹配 copilot.tencent.com）。
+	// 注意：用 m.direct 而不是 m.client.chatHTTP()，因为 m.client 可能为 nil。
 	if b.spec != nil && b.spec.Proxy == "" && !b.spec.Auto {
-		if m.client != nil && m.client.chatHTTP() != nil {
-			return m.client.chatHTTP(), true
+		if m.direct != nil {
+			return m.direct, true
 		}
 		return nil, false
 	}
