@@ -1270,14 +1270,30 @@ func (m *AccountProxy) HTTPFor(uid string) (*http.Client, bool) {
 		return nil, false
 	}
 	b := m.bindingOf(uid)
-	if b == nil {
-		return nil, false
+	// 手动直连判定：同时查 binding.spec 和 doc.Accounts（同 ChatHTTPFor）。
+	isManualDirect := func() bool {
+		if b != nil && b.spec != nil {
+			if b.spec.Proxy == "" && !b.spec.Auto {
+				return true
+			}
+		}
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		if e, ok := m.doc.Accounts[uid]; ok && e != nil {
+			if e.Proxy == "" && !e.Auto {
+				return true
+			}
+		}
+		return false
 	}
-	// 手动直连：直接返回直连 client（同 ChatHTTPFor，用 m.direct）。
-	if b.spec != nil && b.spec.Proxy == "" && !b.spec.Auto {
+	if isManualDirect() {
+		// 手动直连：直接返回直连 client（同 ChatHTTPFor，用 m.direct）。
 		if m.direct != nil {
 			return m.direct, true
 		}
+		return nil, false
+	}
+	if b == nil {
 		return nil, false
 	}
 	if b.entry == nil {
@@ -1303,17 +1319,36 @@ func (m *AccountProxy) ChatHTTPFor(uid string) (*http.Client, bool) {
 		return nil, false
 	}
 	b := m.bindingOf(uid)
-	if b == nil {
-		return nil, false
+	// 手动直连判定函数：spec 或 doc 中 Proxy=="" && !Auto 即为手动直连。
+	// 必须同时查 binding.spec 和 doc.Accounts，因为手动直连的账号可能没有
+	// runtime binding（b==nil），但 doc 里有显式配置。漏查会导致回落代理池。
+	isManualDirect := func() bool {
+		if b != nil && b.spec != nil {
+			if b.spec.Proxy == "" && !b.spec.Auto {
+				return true
+			}
+		}
+		// binding 缺失时查 doc（用户显式配置优先）
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		if e, ok := m.doc.Accounts[uid]; ok && e != nil {
+			if e.Proxy == "" && !e.Auto {
+				return true
+			}
+		}
+		return false
 	}
-	// 手动直连（proxy="" && !Auto）：直接返回 AccountProxy 自己的直连 client，
-	// 不回落 realm 代理池。否则回落逻辑会把直连账号送进代理池，
-	// 导致"Upstream Proxy Error"（x509 证书不匹配 copilot.tencent.com）。
-	// 注意：用 m.direct 而不是 m.client.chatHTTP()，因为 m.client 可能为 nil。
-	if b.spec != nil && b.spec.Proxy == "" && !b.spec.Auto {
+	if isManualDirect() {
+		// 手动直连：直接返回 AccountProxy 自己的直连 client，
+		// 不回落 realm 代理池。否则回落逻辑会把直连账号送进代理池，
+		// 导致"Upstream Proxy Error"（x509 证书不匹配）。
+		// 注意：用 m.direct 而不是 m.client.chatHTTP()，因为 m.client 可能为 nil。
 		if m.direct != nil {
 			return m.direct, true
 		}
+		return nil, false
+	}
+	if b == nil {
 		return nil, false
 	}
 	if b.entry == nil {
