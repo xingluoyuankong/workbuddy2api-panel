@@ -1153,20 +1153,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		h.cfg.Pool.NoteSuccess(acct.UID)
 		if degradedApplied {
 			// 内容拦截后的中性提示词重试成功：这条日志说明「本次回答不是按用户
 			// 配置的提示词生成的」——排查 persona 不符时先看这里。
 			log.Printf("content-blocked -> degraded prompt retry succeeded uid=%s model=%s mode=%s",
 				acct.UID, bareModel, h.promptMode())
 		}
-		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
-		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
-		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+		// 2026-10-15 修复：0-token 空响应不算成功。
+		// NoteSuccess 会更新 lastSuccess/successCount/清 breaker，0-token 时调它会污染健康度。
+		// 改为确认有有效 token 后才调用（流式/非流式分别在拿到 toks 后调用）。
+		noteTrueSuccess := func() {
+			h.cfg.Pool.NoteSuccess(acct.UID)
+			// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+			// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
+			h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+			// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
+			// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
+			if sessKey != "" && h.cfg.Session != nil {
+				h.cfg.Session.Bind(sessKey, acct.UID)
+			}
 		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
@@ -1180,12 +1185,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}))
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
-			// 2026-10-13 修复：0-token 空响应不算成功。
-			// NoteSuccess 已在上方调用并清零了 consecutiveFails，这里补一次
-			// NoteFailures 抵消——空响应本质是失败，不应重置连败计数。
-			// （内容过滤的空响应由 ErrContentBlocked 分支处理，不走这里。）
+			// 0-token 空响应不算成功：不调 NoteSuccess（不污染 lastSuccess/successCount/breaker），
+			// 改调 NoteFailures 计一次失败。确认有 token 才算真成功。
 			if st.toks == 0 {
 				h.cfg.Pool.NoteFailures(acct.UID)
+			} else {
+				noteTrueSuccess()
 			}
 			// 本轮尝试的首包延迟（请求级 TTFB 减去之前失败尝试耗时）：
 			// 解码期速度的分母。日志行 TTFB 保留请求级口径（用户体感）。
@@ -1235,9 +1240,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
-		// 2026-10-13 修复：0-token 空响应不算成功（同流式路径）。
+		// 0-token 空响应不算成功（同流式路径）。
 		if st.toks == 0 {
 			h.cfg.Pool.NoteFailures(acct.UID)
+		} else {
+			noteTrueSuccess()
 		}
 		return
 	}

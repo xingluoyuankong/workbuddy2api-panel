@@ -262,6 +262,7 @@ const softRateResetPattern = `将在 (.+?) 重置`
 // 轰炸）时尤甚。模式串均为纯常量。regexp 并发安全（匹配只读），无需额外锁。
 var (
 	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reCreditExhausted   = regexp.MustCompile(`"code"\s*:\s*14018|code=14018|Credits exhausted`)
 	reSoftRateReset  = regexp.MustCompile(softRateResetPattern)
 )
 
@@ -550,6 +551,12 @@ func Classify(status int, body string) ErrKind {
 	// "限流 / 免费额度耗尽 / 账号故障 / 代理故障"）
 	if IsModelRateLimit(body) {
 		return ErrFreeQuotaExhausted
+	}
+	// 14018 积分耗尽：即使走 HTTP 429 也是硬计费问题，不是限流。
+	// 误归 ErrSoftRate 会导致短冷却后反复重试，白烧请求；必须走 ErrHardCredit
+	// 长冷却到次日 04:00（签到恢复）。
+	if reCreditExhausted.MatchString(body) {
+		return ErrHardCredit
 	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
