@@ -1261,6 +1261,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 错误（无上游原文）固定 no_healthy_account hint。
 	hint := upstream.NoHealthyAccountHint()
 	var ue *upstream.Error
+	// 全员 6004：该模型在所有健康账号上额度都已耗尽，直接报 free_quota_exhausted，
+	// 不再硬选账号去撞上游（重试风暴的根源）。
+	if !errors.As(lastErr, &ue) {
+		if exhausted, resetAt := h.cfg.Pool.ModelQuotaExhaustedEverywhere(bareModel, realm); exhausted {
+			msg := "free model quota exhausted for " + bareModel + ": all accounts have reached the free limit"
+			if !resetAt.IsZero() {
+				msg += ", resets at " + resetAt.Format("2006-01-02 15:04:05")
+			}
+			writeOpenAIErrorHint(w, http.StatusTooManyRequests, "free_quota_exhausted", msg,
+				h.hintOf(upstream.ErrFreeQuotaExhausted, "", bareModel, reqHasImage, nil))
+			st.status = http.StatusTooManyRequests
+			return
+		}
+	}
 	if !errors.As(lastErr, &ue) && h.cfg.Pool.ModelBlockedEverywhere(bareModel, realm) {
 		// 本地选号失败（没有上游原文），但**全部健康账号**都已对该模型做过 11102
 		// 负缓存 —— 问题在模型，不在账号。此时报 503 no_healthy_account 会让用户

@@ -504,7 +504,15 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 	if !ok {
 		return false
 	}
-	return !mc.Until.IsZero() && now.Before(mc.Until)
+	// Until 是截断后的短冷却，ResetAt 才是上游真实重置时刻。
+	// 任一未过期都算冷却中——Until 过期不代表额度已恢复。
+	if !mc.Until.IsZero() && now.Before(mc.Until) {
+		return true
+	}
+	if !mc.ResetAt.IsZero() && now.Before(mc.ResetAt) {
+		return true
+	}
+	return false
 }
 
 // healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
@@ -536,7 +544,9 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 		return
 	}
 	for m, mc := range e.modelCooldowns {
-		if mc.Until.IsZero() || !now.Before(mc.Until) {
+		untilActive := !mc.Until.IsZero() && now.Before(mc.Until)
+		resetActive := !mc.ResetAt.IsZero() && now.Before(mc.ResetAt)
+		if !untilActive && !resetActive {
 			delete(e.modelCooldowns, m)
 		}
 	}

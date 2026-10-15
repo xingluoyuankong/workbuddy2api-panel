@@ -196,6 +196,46 @@ func (p *Pool) ModelBlockedEverywhere(model, realm string) bool {
 	return healthy > 0 && blocked == healthy
 }
 
+// ModelQuotaExhaustedEverywhere 报告该 realm 内所有健康账号是否都对指定模型
+// 处于 6004 免费额度耗尽（ResetAt 未过期）。全员耗尽时上层直接报
+// free_quota_exhausted，不再硬选账号去撞 6004。
+// 返回 (全员耗尽, 最早重置时间)。
+func (p *Pool) ModelQuotaExhaustedEverywhere(model, realm string) (bool, time.Time) {
+	if model == "" {
+		return false, time.Time{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	healthy, exhausted := 0, 0
+	var soonest time.Time
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if e.disabled || !e.healthy(now) {
+			continue
+		}
+		healthy++
+		mc, ok := e.modelCooldowns[model]
+		if !ok {
+			continue
+		}
+		// 6004 判定：ResetAt 未过期即算耗尽（Until 是截断后的短冷却）
+		if mc.ResetAt.IsZero() || !now.Before(mc.ResetAt) {
+			continue
+		}
+		exhausted++
+		if soonest.IsZero() || mc.ResetAt.Before(soonest) {
+			soonest = mc.ResetAt
+		}
+	}
+	if healthy > 0 && exhausted == healthy {
+		return true, soonest
+	}
+	return false, time.Time{}
+}
+
 // ModelBlockReasonPrefix 11102 负缓存条目的 reason 前缀（与 upstream.ModelBlockReason
 // 同源；pool 不反向依赖 upstream，故本地定义一份并保持字面一致）。
 const ModelBlockReasonPrefix = "11102"
