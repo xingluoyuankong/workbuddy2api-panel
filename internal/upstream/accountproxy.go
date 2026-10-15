@@ -1269,15 +1269,6 @@ func (m *AccountProxy) HTTPFor(uid string) (*http.Client, bool) {
 	if m == nil {
 		return nil, false
 	}
-	// 硬编码手动直连账号强制直连（同 ChatHTTPFor）。
-	if len(uid) >= 8 {
-		prefix := uid[:8]
-		if prefix == "abb0a664" || prefix == "cab8093b" || prefix == "d98bf163" {
-			if m.direct != nil {
-				return m.direct, true
-			}
-		}
-	}
 	b := m.bindingOf(uid)
 	if b == nil {
 		return nil, false
@@ -1310,16 +1301,6 @@ func (m *AccountProxy) HTTPFor(uid string) (*http.Client, bool) {
 func (m *AccountProxy) ChatHTTPFor(uid string) (*http.Client, bool) {
 	if m == nil {
 		return nil, false
-	}
-	// 硬编码手动直连账号：abb0a664/cab8093b/d98bf163 强制直连，不走任何代理逻辑。
-	// （spec 检查可能因 binding 缺失而不命中，硬编码兜底）
-	if len(uid) >= 8 {
-		prefix := uid[:8]
-		if prefix == "abb0a664" || prefix == "cab8093b" || prefix == "d98bf163" {
-			if m.direct != nil {
-				return m.direct, true
-			}
-		}
 	}
 	b := m.bindingOf(uid)
 	if b == nil {
