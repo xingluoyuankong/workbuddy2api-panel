@@ -247,20 +247,35 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	return best.a
 }
 
-// isModelRateLimitedLocked 持锁版模型 429 熔断判定（调用方已持 p.mu）。
+// isModelRateLimitedLocked 持锁版模型熔断判定（调用方已持 p.mu）。
+// 429 熔断：60 秒内 2+ 次；传输熔断：60 秒内 3+ 次。
 func (p *Pool) isModelRateLimitedLocked(model string, now time.Time) bool {
-	ts, ok := p.model429s[model]
-	if !ok || len(ts) < 2 {
-		return false
-	}
 	cutoff := now.UnixNano() - int64(60*time.Second)
-	count := 0
-	for _, t := range ts {
-		if t >= cutoff {
-			count++
+	// 429
+	if ts, ok := p.model429s[model]; ok {
+		count := 0
+		for _, t := range ts {
+			if t >= cutoff {
+				count++
+			}
+		}
+		if count >= 2 {
+			return true
 		}
 	}
-	return count >= 2
+	// 传输错误
+	if ts, ok := p.model429s["transport:"+model]; ok {
+		count := 0
+		for _, t := range ts {
+			if t >= cutoff {
+				count++
+			}
+		}
+		if count >= 3 {
+			return true
+		}
+	}
+	return false
 }
 
 // inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；

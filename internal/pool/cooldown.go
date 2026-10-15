@@ -261,26 +261,68 @@ func (p *Pool) NoteModel429(model string) {
 	p.model429s[model] = kept
 }
 
-// IsModelRateLimited 报告模型是否正处于 429 熔断（60 秒内 2+ 次 429）。
+// NoteModelTransportErr 记录一次模型级传输错误（EOF/TLS超时/代理错误/timeout）。
+// 60 秒内 3 次即触发熔断，pick 直接返回 nil 快速失败，避免连试 3 号拖慢 TTFB。
+// 与 429 熔断分开计数：传输错误阈值更高（3次），因为单次网络抖动常见。
+func (p *Pool) NoteModelTransportErr(model string) {
+	if model == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now().UnixNano()
+	cutoff := now - int64(60*time.Second)
+	key := "transport:" + model
+	if p.model429s == nil {
+		p.model429s = map[string][]int64{}
+	}
+	ts := p.model429s[key]
+	kept := ts[:0]
+	for _, t := range ts {
+		if t >= cutoff {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	p.model429s[key] = kept
+}
+
+// IsModelRateLimited 报告模型是否正处于熔断：
+//   - 429 熔断：60 秒内 2+ 次 429
+//   - 传输熔断：60 秒内 3+ 次传输错误（EOF/TLS超时/代理错误）
 func (p *Pool) IsModelRateLimited(model string) bool {
 	if model == "" {
 		return false
 	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	ts, ok := p.model429s[model]
-	if !ok || len(ts) < 2 {
-		return false
-	}
 	now := time.Now().UnixNano()
 	cutoff := now - int64(60*time.Second)
-	count := 0
-	for _, t := range ts {
-		if t >= cutoff {
-			count++
+	// 429 熔断
+	if ts, ok := p.model429s[model]; ok {
+		count := 0
+		for _, t := range ts {
+			if t >= cutoff {
+				count++
+			}
+		}
+		if count >= 2 {
+			return true
 		}
 	}
-	return count >= 2
+	// 传输错误熔断
+	if ts, ok := p.model429s["transport:"+model]; ok {
+		count := 0
+		for _, t := range ts {
+			if t >= cutoff {
+				count++
+			}
+		}
+		if count >= 3 {
+			return true
+		}
+	}
+	return false
 }
 
 // ModelBlockReasonPrefix 11102 负缓存条目的 reason 前缀（与 upstream.ModelBlockReason

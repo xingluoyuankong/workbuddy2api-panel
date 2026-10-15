@@ -1058,6 +1058,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else if strings.Contains(terr.Error(), "EOF") {
 				kind = upstream.ErrTransportEOF
 			}
+			// 模型级传输熔断记数：60 秒内 3 次传输错误即熔断，pick 直接 nil 快速失败。
+			h.cfg.Pool.NoteModelTransportErr(bareModel)
 			if !rotateBackoff(i, r.Context(), kind) {
 				break // ctx 取消：终止轮转（传输层错误换号退避）
 			}
