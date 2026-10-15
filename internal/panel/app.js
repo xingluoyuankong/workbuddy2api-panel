@@ -271,6 +271,40 @@ function egressCell(eg) {
 function shortModel(m) {
   return m && m.length > 16 ? m.slice(0, 15) + '…' : (m || '—');
 }
+/* errCell 报错列：默认收纳为按钮，点击展开报错简介。
+ * 按钮显示"成功 N / 报错 M"，展开后显示：近期报错数、最近报错时间、
+ * 最近报错原文摘要，点击数字可跳日志页按账号过滤查证。
+ */
+function errCell(s) {
+  const uid = esc(s.uid || '');
+  const detailId = 'errdetail-' + uid;
+  const succ = s.success_count || 0;
+  const total = s.err_total || 0;
+  const recent = s.err_recent || 0;
+  const btnCls = total > 0 ? 'q-toggle q-bad' : 'q-toggle q-ok';
+  const btnTxt = total > 0 ? ('报错 ' + total) : '无报错';
+  let detail = '<div id="' + detailId + '" class="q-detail" style="display:none">';
+  detail += '<table class="q-detail-tbl">';
+  detail += '<tr><th>项</th><th>值</th></tr>';
+  detail += '<tr><td>成功</td><td>' + succ + '</td></tr>';
+  detail += '<tr><td>累计报错</td><td>' + total + '</td></tr>';
+  detail += '<tr><td>近期报错</td><td>' + recent + '</td></tr>';
+  if (s.err_last_at) {
+    detail += '<tr><td>最近报错</td><td>' + new Date(s.err_last_at).toLocaleString('zh-CN', {hour12:false}) + '</td></tr>';
+  }
+  if (s.err_last_text) {
+    const txt = esc(String(s.err_last_text).slice(0, 120));
+    detail += '<tr><td>报错摘要</td><td style="white-space:normal;max-width:300px">' + txt + '</td></tr>';
+  }
+  detail += '</table>';
+  if (total > 0) {
+    detail += '<div style="margin-top:4px"><a href="javascript:void(0)" data-errlog="' + uid + '" style="font-size:11px">→ 跳日志查看该账号报错</a></div>';
+  }
+  detail += '</div>';
+  return '<td class="num"><button class="' + btnCls + '" onclick="document.getElementById(\'' + detailId + '\').style.display=document.getElementById(\'' + detailId + '\').style.display==\'none\'?\'block\':\'none\'"' +
+    ' title="成功 ' + succ + ' / 报错 ' + total + '（点击展开详情）">' + btnTxt + ' ▾</button>' + detail + '</td>';
+}
+
 /* quotaCell 账号页只做一件事：**提醒免费额度是否已达上限**。
  * 不列模型、不摆数字——具体"每个模型额度多少"在模型列表页看（那是它的主场）。
  * 形态：一个带颜色的状态标记 ——
@@ -337,7 +371,7 @@ function quotaCell(s) {
     tbl += '</table>';
     bits.push('<span class="q-chip q-bad" style="cursor:pointer" onclick="document.getElementById(\'' + detailId + '\').style.display=document.getElementById(\'' + detailId + '\').style.display==\'none\'?\'block\':\'none\'" title="免费额度已达上限：' + names +
       '\n点击展开各模型额度明细' +
-      '">免费额度 已达上限' + (left > 0 ? '（' + dur(left) + '后重置）' : '') + ' ▾</span>' +
+      '">免费额度 已达上限' + (left > 0 ? '（' + dur(left) + '后重置）' : '') + ' ▾</button>' +
       '<div id="' + detailId + '" class="q-detail" style="display:none">' + tbl + '</div>');
   } else {
     const keys = modelRows.map(r => r.name);
@@ -351,7 +385,7 @@ function quotaCell(s) {
     }
     tbl += '</table>';
     bits.push('<span class="q-chip q-ok" style="cursor:pointer" onclick="document.getElementById(\'' + detailId + '\').style.display=document.getElementById(\'' + detailId + '\').style.display==\'none\'?\'block\':\'none\'" title="今日免费额度正常：没有免费模型触发上游 6004 限额。点击展开各模型用量明细。">' +
-      '免费额度 正常' + (keys.length ? '（' + keys.length + ' 个在用）' : '') + ' ▾</span>' +
+      '免费额度 正常' + (keys.length ? '（' + keys.length + ' 个在用）' : '') + ' ▾</button>' +
       (modelRows.length ? '<div id="' + detailId + '" class="q-detail" style="display:none">' + tbl + '</div>' : ''));
   }
   if (s.err_recent > 0) {
@@ -387,6 +421,23 @@ function renderAccounts(list) {
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
+    // 模型级冷却：在状态列直接显示"X模型冷却·Y后恢复"，简洁明了
+    const rlm = s.rate_limited_models || [];
+    const nowMs2 = Date.now();
+    const activeModels = rlm.filter(r => {
+      const u = r.until ? new Date(r.until).getTime() : 0;
+      const ra = r.reset_at ? new Date(r.reset_at).getTime() : 0;
+      return u > nowMs2 || ra > nowMs2;
+    });
+    if (activeModels.length && !s.disabled) {
+      const soonest = Math.min.apply(null, activeModels.map(r =>
+        Math.max(r.until ? new Date(r.until).getTime() : 0, r.reset_at ? new Date(r.reset_at).getTime() : 0)
+      ).filter(t => t > nowMs2));
+      const names = activeModels.map(r => shortModel(r.model)).join('、');
+      tag += ' <span class="tag warn" title="模型级冷却（仅影响该模型，同账号其他模型可用）：\n' +
+        activeModels.map(r => '· ' + r.model + '：' + (r.reset_at ? new Date(r.reset_at).toLocaleString('zh-CN', {hour12:false}) + ' 重置' : '冷却中')).join('\n') +
+        '">' + activeModels.length + '模型冷却 · ' + dur(Math.round((soonest - nowMs2) / 1000)) + '</span>';
+    }
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
@@ -426,7 +477,7 @@ function renderAccounts(list) {
       '<td>' + tag + (s.in_use ? ' <span class="tag ok" title="10分钟内有成功请求，正在被使用">使用中</span>' : '') + (s.in_flight > 0 ? ' <span class="tag mute" title="该账号当前正在处理的请求数">在途 ' + s.in_flight + '</span>' : '') + egressStateTag(s.egress) + note + '</td>' +
       egressCell(s.egress) +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
-      '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
+      errCell(s) +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
         '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
         '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
