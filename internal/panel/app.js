@@ -271,6 +271,39 @@ function egressCell(eg) {
 function shortModel(m) {
   return m && m.length > 16 ? m.slice(0, 15) + '…' : (m || '—');
 }
+/* ── 报错中文映射：技术原文 → 简洁中文 + 通俗解释 ───────────────────
+ * 按钮显示简洁中文（如"免费额度用完"），点击展开显示通俗解释。
+ */
+function errZh(raw) {
+  const t = String(raw || '');
+  // 返回 [简洁中文, 通俗解释, 建议]
+  if (/6004|free_quota_exhausted|free model quota/i.test(t))
+    return ['免费额度用完', '该模型在这个账号上的免费额度已用完，需等上游重置时间恢复。', '等重置时间到，或切换其他模型。'];
+  if (/14018|Credits exhausted/i.test(t))
+    return ['积分耗尽', '账号积分已用完，无法继续调用。', '充值或更换账号。'];
+  if (/11128|conversation id missing/i.test(t))
+    return ['请求被拦截', '上游拦截了该请求（参数缺失），属上游风控。', '重试一次，不行就换账号。'];
+  if (/11102|model blocked|无此模型/i.test(t))
+    return ['模型不可用', '上游该账号无此模型，请求被拒绝。', '换模型或换账号。'];
+  if (/TLS handshake timeout|tls.*timeout/i.test(t))
+    return ['网络握手超时', '到上游的 TLS 握手超时，国际链路抖动或上游繁忙。', '属间歇性，重试即可。'];
+  if (/Upstream Proxy Error|proxy error/i.test(t))
+    return ['代理出口故障', '代理出口到上游的连接失败，出口 IP 可能被上游限制。', '系统会自动换出口，持续出现需换代理。'];
+  if (/timeout awaiting response headers|response header.*timeout/i.test(t))
+    return ['上游响应超时', '上游 60 秒内未返回响应头，模型可能排队或卡住。', '重试，持续超时换模型。'];
+  if (/\bEOF\b/i.test(t))
+    return ['连接被断开', '上游主动断开了连接，属传输层抖动。', '重试即可。'];
+  if (/429|soft_rate|rate limit/i.test(t))
+    return ['上游限流', '请求频率超过上游限制，被暂时限流。', '等冷却结束自动恢复。'];
+  if (/400|bad_params|bad request/i.test(t))
+    return ['请求参数错误', '上游拒绝了请求参数，属客户端/网关构造问题。', '检查模型名和参数。'];
+  if (/503|no_healthy_account|无可用账号/i.test(t))
+    return ['暂无可用账号', '所有账号都在冷却/耗尽中，暂时无号可用。', '等冷却结束。'];
+  if (/500|internal/i.test(t))
+    return ['网关内部错误', '网关内部处理出错，非上游问题。', '看日志详情，联系排查。'];
+  return ['未知错误', '未识别的报错类型，见原文。', '点击"跳日志"查看原文。'];
+}
+
 /* errCell 报错列：默认收纳为按钮，点击展开报错简介。
  * 按钮显示"成功 N / 报错 M"，展开后显示：近期报错数、最近报错时间、
  * 最近报错原文摘要，点击数字可跳日志页按账号过滤查证。
@@ -282,10 +315,22 @@ function errCell(s) {
   const total = s.err_total || 0;
   const recent = s.err_recent || 0;
   const btnCls = total > 0 ? 'q-toggle q-bad' : 'q-toggle q-ok';
-  const btnTxt = total > 0 ? ('报错 ' + total) : '无报错';
+  // 按钮显示简洁中文报错（如"免费额度用完 ×3"），无报错时显示"无报错"
+  let btnTxt = '无报错';
+  let zhShort = '', zhDesc = '', zhAdvice = '';
+  if (total > 0) {
+    const zh = errZh(s.err_last_text);
+    zhShort = zh[0]; zhDesc = zh[1]; zhAdvice = zh[2];
+    btnTxt = zhShort + ' ×' + total;
+  }
   let detail = '<div id="' + detailId + '" class="q-detail" style="display:none">';
   detail += '<table class="q-detail-tbl">';
   detail += '<tr><th>项</th><th>值</th></tr>';
+  if (zhShort) {
+    detail += '<tr><td>报错类型</td><td><b>' + esc(zhShort) + '</b></td></tr>';
+    detail += '<tr><td>什么意思</td><td style="white-space:normal;max-width:320px">' + esc(zhDesc) + '</td></tr>';
+    detail += '<tr><td>怎么办</td><td style="white-space:normal;max-width:320px;color:#2a7">' + esc(zhAdvice) + '</td></tr>';
+  }
   detail += '<tr><td>成功</td><td>' + succ + '</td></tr>';
   detail += '<tr><td>累计报错</td><td>' + total + '</td></tr>';
   detail += '<tr><td>近期报错</td><td>' + recent + '</td></tr>';
@@ -293,8 +338,8 @@ function errCell(s) {
     detail += '<tr><td>最近报错</td><td>' + new Date(s.err_last_at).toLocaleString('zh-CN', {hour12:false}) + '</td></tr>';
   }
   if (s.err_last_text) {
-    const txt = esc(String(s.err_last_text).slice(0, 120));
-    detail += '<tr><td>报错摘要</td><td style="white-space:normal;max-width:300px">' + txt + '</td></tr>';
+    const txt = esc(String(s.err_last_text).slice(0, 200));
+    detail += '<tr><td>技术原文</td><td style="white-space:normal;max-width:320px;font-size:11px;color:#888">' + txt + '</td></tr>';
   }
   detail += '</table>';
   if (total > 0) {
@@ -302,7 +347,7 @@ function errCell(s) {
   }
   detail += '</div>';
   return '<td class="num"><button class="' + btnCls + '" onclick="document.getElementById(\'' + detailId + '\').style.display=document.getElementById(\'' + detailId + '\').style.display==\'none\'?\'block\':\'none\'"' +
-    ' title="成功 ' + succ + ' / 报错 ' + total + '（点击展开详情）">' + btnTxt + ' ▾</button>' + detail + '</td>';
+    ' title="成功 ' + succ + ' / 报错 ' + total + '（点击展开详情）">' + esc(btnTxt) + ' ▾</button>' + detail + '</td>';
 }
 
 /* quotaCell 账号页只做一件事：**提醒免费额度是否已达上限**。
