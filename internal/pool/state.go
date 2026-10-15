@@ -585,7 +585,11 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 	rows := make([]RateLimitedModel, 0, len(models))
 	for _, m := range models {
 		mc := e.modelCooldowns[m]
-		if !mc.Until.IsZero() && now.Before(mc.Until) {
+		// 耗尽判定：Until 未过期 OR ResetAt 未过期。Until 是截断后的短冷却，
+		// ResetAt 才是上游真实重置时刻——Until 过期不代表额度已恢复。
+		untilActive := !mc.Until.IsZero() && now.Before(mc.Until)
+		resetActive := !mc.ResetAt.IsZero() && now.Before(mc.ResetAt)
+		if untilActive || resetActive {
 			row := RateLimitedModel{
 				Model:  m,
 				Until:  mc.Until,

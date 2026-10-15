@@ -280,29 +280,79 @@ function shortModel(m) {
  */
 function quotaCell(s) {
   const bits = [];
-  // 免费额度：只看"有没有免费模型撞线"，撞线就红字 + 重置时刻
+  const nowMs = Date.now();
+  // 免费额度耗尽判定：ResetAt（上游真实重置时刻）未过期即算耗尽。
+  // Until 是截断后的短冷却，ResetAt 才是额度恢复时刻——Until 过期不代表额度恢复。
   const exhausted = (s.rate_limited_models || []).map(r => ({
     model: r.model,
     until: r.until ? new Date(r.until).getTime() : 0,
+    resetAt: r.reset_at ? new Date(r.reset_at).getTime() : 0,
     reason: r.reason || '',
-  })).filter(x => x.until > Date.now());
+  })).filter(x => x.until > nowMs || x.resetAt > nowMs);
   const day = s.model_day || {};
-  const used = {};
+  // 每模型明细：用量 + 实测额度 + 重置时间（可展开）
+  const modelRows = [];
   for (const m of Object.keys(day)) {
+    const d = day[m] || {};
     const bare = m.indexOf(':') >= 0 ? m.slice(m.indexOf(':') + 1) : m;
-    if (day[m].reqs > 0) used[bare] = day[m].reqs;
+    const reqs = d.reqs || 0;
+    const toks = d.tokens || 0;
+    const qReqs = d.quota_reqs || 0;
+    const qToks = d.quota_tokens || 0;
+    const qSamples = d.quota_samples || 0;
+    const limited = !!d.limited;
+    const resetAt = d.reset_at ? new Date(d.reset_at).getTime() : 0;
+    const qResetAt = d.quota_reset_at ? new Date(d.quota_reset_at).getTime() : 0;
+    // 只收录有信息量的：用过 / 有实测额度 / 正被限流
+    if (reqs === 0 && toks === 0 && qReqs === 0 && !limited) continue;
+    const isExhausted = limited && (resetAt > nowMs || qResetAt > nowMs);
+    const effReset = resetAt > nowMs ? resetAt : (qResetAt > nowMs ? qResetAt : 0);
+    modelRows.push({
+      name: bare, reqs: reqs, toks: toks,
+      qReqs: qReqs, qToks: qToks, qSamples: qSamples,
+      limited: limited, isExhausted: isExhausted, resetAt: effReset,
+    });
   }
+  modelRows.sort((a, b) => (b.isExhausted - a.isExhausted) || (b.reqs - a.reqs));
+  const uid = esc(s.uid || s.id || '');
   if (exhausted.length) {
-    const soonest = Math.min.apply(null, exhausted.map(x => x.until));
-    const left = Math.round((soonest - Date.now()) / 1000);
+    const effReset = exhausted.map(x => Math.max(x.until, x.resetAt)).filter(t => t > nowMs);
+    const soonest = Math.min.apply(null, effReset);
+    const left = Math.round((soonest - nowMs) / 1000);
     const names = exhausted.map(x => esc(shortModel(x.model))).join('、');
-    bits.push('<span class="q-chip q-bad" title="免费额度已达上限：' + names +
-      '\n上游声明重置于 ' + new Date(soonest).toLocaleTimeString('zh-CN', { hour12: false }) +
-      '">免费额度 已达上限' + (left > 0 ? '（' + dur(left) + '后重置）' : '') + '</span>');
+    const detailId = 'qdetail-' + uid;
+    let tbl = '<table class="q-detail-tbl"><tr><th>模型</th><th>今日请求</th><th>实测额度(请求)</th><th>今日tokens</th><th>实测额度(tokens)</th><th>状态</th><th>重置时间</th></tr>';
+    for (const r of modelRows) {
+      const st = r.isExhausted ? '<span class="q-chip q-bad">已耗尽</span>'
+        : (r.limited ? '<span class="q-chip">限流中</span>' : '<span class="q-chip q-ok">正常</span>');
+      const resetStr = r.resetAt > nowMs
+        ? new Date(r.resetAt).toLocaleString('zh-CN', { hour12: false }) + '（' + dur(Math.round((r.resetAt - nowMs) / 1000)) + '后）'
+        : '—';
+      tbl += '<tr><td>' + esc(shortModel(r.name)) + '</td><td>' + r.reqs + '</td><td>' +
+        (r.qReqs > 0 ? r.qReqs + (r.qSamples > 1 ? '（' + r.qSamples + '次观测）' : '') : '—') + '</td><td>' +
+        (r.toks >= 10000 ? (r.toks / 10000).toFixed(1) + '万' : r.toks) + '</td><td>' +
+        (r.qToks > 0 ? (r.qToks >= 10000 ? (r.qToks / 10000).toFixed(1) + '万' : r.qToks) : '—') + '</td><td>' +
+        st + '</td><td>' + resetStr + '</td></tr>';
+    }
+    tbl += '</table>';
+    bits.push('<span class="q-chip q-bad" style="cursor:pointer" onclick="document.getElementById(\'' + detailId + '\').style.display=document.getElementById(\'' + detailId + '\').style.display==\'none\'?\'block\':\'none\'" title="免费额度已达上限：' + names +
+      '\n点击展开各模型额度明细' +
+      '">免费额度 已达上限' + (left > 0 ? '（' + dur(left) + '后重置）' : '') + ' ▾</span>' +
+      '<div id="' + detailId + '" class="q-detail" style="display:none">' + tbl + '</div>');
   } else {
-    const keys = Object.keys(used);
-    bits.push('<span class="q-chip q-ok" title="今日免费额度正常：没有免费模型触发上游 6004 限额。各模型额度见「模型与映射」页。">' +
-      '免费额度 正常' + (keys.length ? '（' + keys.length + ' 个在用）' : '') + '</span>');
+    const keys = modelRows.map(r => r.name);
+    const detailId = 'qdetail-' + uid;
+    let tbl = '<table class="q-detail-tbl"><tr><th>模型</th><th>今日请求</th><th>实测额度(请求)</th><th>今日tokens</th><th>状态</th></tr>';
+    for (const r of modelRows) {
+      tbl += '<tr><td>' + esc(shortModel(r.name)) + '</td><td>' + r.reqs + '</td><td>' +
+        (r.qReqs > 0 ? r.qReqs : '—') + '</td><td>' +
+        (r.toks >= 10000 ? (r.toks / 10000).toFixed(1) + '万' : r.toks) + '</td><td>' +
+        '<span class="q-chip q-ok">正常</span></td></tr>';
+    }
+    tbl += '</table>';
+    bits.push('<span class="q-chip q-ok" style="cursor:pointer" onclick="document.getElementById(\'' + detailId + '\').style.display=document.getElementById(\'' + detailId + '\').style.display==\'none\'?\'block\':\'none\'" title="今日免费额度正常：没有免费模型触发上游 6004 限额。点击展开各模型用量明细。">' +
+      '免费额度 正常' + (keys.length ? '（' + keys.length + ' 个在用）' : '') + ' ▾</span>' +
+      (modelRows.length ? '<div id="' + detailId + '" class="q-detail" style="display:none">' + tbl + '</div>' : ''));
   }
   if (s.err_recent > 0) {
     let lastTip = '';

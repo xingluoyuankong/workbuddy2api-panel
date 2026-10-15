@@ -433,8 +433,12 @@ func (e *entry) modelDayStatusLocked(now time.Time) map[string]ModelDayStatus {
 		out[m] = v
 	}
 	for m, mc := range e.modelCooldowns {
-		if !now.Before(mc.Until) {
-			continue // 已过期不算限流
+		// 耗尽判定：Until 未过期 OR ResetAt 未过期。Until 是截断后的短冷却，
+		// ResetAt 才是上游真实重置时刻——Until 过期不代表额度已恢复。
+		untilActive := !mc.Until.IsZero() && now.Before(mc.Until)
+		resetActive := !mc.ResetAt.IsZero() && now.Before(mc.ResetAt)
+		if !untilActive && !resetActive {
+			continue // 都过期了才不算限流
 		}
 		v := out[m]
 		v.Limited, v.Until, v.ResetAt, v.Reason = true, mc.Until, mc.ResetAt, mc.Reason
