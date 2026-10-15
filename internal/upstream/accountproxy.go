@@ -1270,7 +1270,17 @@ func (m *AccountProxy) HTTPFor(uid string) (*http.Client, bool) {
 		return nil, false
 	}
 	b := m.bindingOf(uid)
-	if b == nil || b.entry == nil {
+	if b == nil {
+		return nil, false
+	}
+	// 手动直连：直接返回直连 client（同 ChatHTTPFor）。
+	if b.spec != nil && b.spec.Proxy == "" && !b.spec.Auto {
+		if m.client != nil && m.client.HTTP != nil {
+			return m.client.HTTP, true
+		}
+		return nil, false
+	}
+	if b.entry == nil {
 		return nil, false
 	}
 	if !b.spec.Enabled {
@@ -1293,7 +1303,18 @@ func (m *AccountProxy) ChatHTTPFor(uid string) (*http.Client, bool) {
 		return nil, false
 	}
 	b := m.bindingOf(uid)
-	if b == nil || b.entry == nil {
+	if b == nil {
+		return nil, false
+	}
+	// 手动直连（proxy="" && !Auto）：直接返回直连 client，不回落 realm 代理池。
+	// 否则回落逻辑会把直连账号送进代理池，导致"Upstream Proxy Error"。
+	if b.spec != nil && b.spec.Proxy == "" && !b.spec.Auto {
+		if m.client != nil && m.client.chatHTTP() != nil {
+			return m.client.chatHTTP(), true
+		}
+		return nil, false
+	}
+	if b.entry == nil {
 		return nil, false
 	}
 	if !b.spec.Enabled {
