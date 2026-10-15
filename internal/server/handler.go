@@ -1265,7 +1265,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var ue *upstream.Error
 	// 全员 6004：该模型在所有健康账号上额度都已耗尽，直接报 free_quota_exhausted，
 	// 不再硬选账号去撞上游（重试风暴的根源）。
-	if !errors.As(lastErr, &ue) {
+	// 注意：无论 lastErr 是否为 upstream.Error 都要检查——重试循环可能已把
+	// 6004 记入 modelCooldowns，此时应直接返回而非走通用 no_healthy_account。
+	_ = ue
+	if true {
 		if exhausted, resetAt := h.cfg.Pool.ModelQuotaExhaustedEverywhere(bareModel, realm); exhausted {
 			msg := "free model quota exhausted for " + bareModel + ": all accounts have reached the free limit"
 			if !resetAt.IsZero() {

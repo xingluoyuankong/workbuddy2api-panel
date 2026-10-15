@@ -255,7 +255,7 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 const modelRateLimitCode = "6004"
 
 // softRateResetPattern 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetPattern = `将在 (.+?) 重置`
+const softRateResetPattern = `(?:将在 (.+?) 重置|will reset at ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}))`
 
 // 限流判定正则预编译为包级 var：IsModelRateLimit / ParseRateReset 在每次错误
 // 分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；错误风暴（429
@@ -472,10 +472,14 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 // 的限流也照常由调用方退回有界退避（绝不臆造时间）。
 func ParseRateReset(body string) (time.Time, bool) {
 	m := reSoftRateReset.FindStringSubmatch(body)
-	if len(m) < 2 {
+	if len(m) < 3 {
 		return time.Time{}, false
 	}
+	// 中文组 m[1] 或英文组 m[2]，取非空者
 	ts := strings.TrimSpace(m[1])
+	if ts == "" {
+		ts = strings.TrimSpace(m[2])
+	}
 	ts = strings.TrimSuffix(ts, " UTC+8") // 去掉后缀，固定按 softRateResetLoc 解释
 	t, err := time.ParseInLocation(softRateTimeLayout, ts, softRateResetLoc)
 	if err != nil {
