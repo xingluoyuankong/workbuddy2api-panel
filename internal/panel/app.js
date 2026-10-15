@@ -388,16 +388,6 @@ function quotaCell(s) {
       '免费额度 正常' + (keys.length ? '（' + keys.length + ' 个在用）' : '') + ' ▾</button>' +
       (modelRows.length ? '<div id="' + detailId + '" class="q-detail" style="display:none">' + tbl + '</div>' : ''));
   }
-  if (s.err_recent > 0) {
-    let lastTip = '';
-    if (s.err_last_at) {
-      lastTip = '\n最近一次：' + new Date(s.err_last_at).toLocaleString('zh-CN', { hour12: false }) +
-        '\n' + String(s.err_last_text || '').slice(0, 180);
-    }
-    bits.push('<span class="tag bad q-errlog" data-errlog="' + esc(s.uid.slice(0, 8)) +
-      '" title="该账号在日志环内的报错行数。点击跳日志页按此账号过滤查证' + esc(lastTip) +
-      '">报错 ' + s.err_recent + '</span>');
-  }
   return '<td class="qcell">' + bits.join(' ') + '</td>';
 }
 
