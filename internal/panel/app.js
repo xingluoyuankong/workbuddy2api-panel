@@ -369,7 +369,7 @@ function quotaCell(s) {
         st + '</td><td>' + resetStr + '</td></tr>';
     }
     tbl += '</table>';
-    bits.push('<span class="q-chip q-bad" style="cursor:pointer" onclick="document.getElementById(\'' + detailId + '\').style.display=document.getElementById(\'' + detailId + '\').style.display==\'none\'?\'block\':\'none\'" title="免费额度已达上限：' + names +
+    bits.push('<button class="q-toggle q-bad" onclick="document.getElementById(\'' + detailId + '\').style.display=document.getElementById(\'' + detailId + '\').style.display==\'none\'?\'block\':\'none\'" title="免费额度已达上限：' + names +
       '\n点击展开各模型额度明细' +
       '">免费额度 已达上限' + (left > 0 ? '（' + dur(left) + '后重置）' : '') + ' ▾</button>' +
       '<div id="' + detailId + '" class="q-detail" style="display:none">' + tbl + '</div>');
@@ -384,7 +384,7 @@ function quotaCell(s) {
         '<span class="q-chip q-ok">正常</span></td></tr>';
     }
     tbl += '</table>';
-    bits.push('<span class="q-chip q-ok" style="cursor:pointer" onclick="document.getElementById(\'' + detailId + '\').style.display=document.getElementById(\'' + detailId + '\').style.display==\'none\'?\'block\':\'none\'" title="今日免费额度正常：没有免费模型触发上游 6004 限额。点击展开各模型用量明细。">' +
+    bits.push('<button class="q-toggle q-ok" onclick="document.getElementById(\'' + detailId + '\').style.display=document.getElementById(\'' + detailId + '\').style.display==\'none\'?\'block\':\'none\'" title="今日免费额度正常：没有免费模型触发上游 6004 限额。点击展开各模型用量明细。">' +
       '免费额度 正常' + (keys.length ? '（' + keys.length + ' 个在用）' : '') + ' ▾</button>' +
       (modelRows.length ? '<div id="' + detailId + '" class="q-detail" style="display:none">' + tbl + '</div>' : ''));
   }
