@@ -241,7 +241,14 @@ func main() {
 			// 无绑定账号：出站实际走 realm 订阅池（若池非空），不是直连——
 			// EgressView 的「未绑定=直连」是旧假设，直连 IP 显示会误导。
 			// 用池出口采样视图覆盖（realm 从账号档案取）。
-			if v.Source == upstream.EgressSourceDirect {
+			// 2026-10-15 修复：手动直连（Auto=false 且 Proxy 为空）是用户
+			// 明确选择，不走订阅池，不得覆盖——否则账号池显示的出口 IP
+			// 与代理页不一致（用户骂的就是这个）。
+			isManualDirect := false
+			if e, ok := ap.Entries()[uid]; ok && e.Proxy == "" && !e.Auto {
+				isManualDirect = true
+			}
+			if v.Source == upstream.EgressSourceDirect && !isManualDirect {
 				if a := p.AuthByUID(uid); a != nil {
 					if ev := up.RealmEgressView(a.Realm()); ev != nil {
 						v = ev
