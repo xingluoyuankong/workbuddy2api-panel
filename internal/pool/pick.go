@@ -44,6 +44,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
+	// 模型级 429 熔断：60 秒内 2+ 次 429，直接返回 nil 快速失败，
+	// 不再选号去撞限流（TTFB 12 秒变 1 秒）。
+	if reqModel != "" && p.isModelRateLimitedLocked(reqModel, now) {
+		return nil
+	}
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
 	if reqModel != "" {
@@ -240,6 +245,22 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	p.pickSeq++
 	best.usedSeq = p.pickSeq
 	return best.a
+}
+
+// isModelRateLimitedLocked 持锁版模型 429 熔断判定（调用方已持 p.mu）。
+func (p *Pool) isModelRateLimitedLocked(model string, now time.Time) bool {
+	ts, ok := p.model429s[model]
+	if !ok || len(ts) < 2 {
+		return false
+	}
+	cutoff := now.UnixNano() - int64(60*time.Second)
+	count := 0
+	for _, t := range ts {
+		if t >= cutoff {
+			count++
+		}
+	}
+	return count >= 2
 }
 
 // inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；

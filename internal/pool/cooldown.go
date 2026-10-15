@@ -236,6 +236,53 @@ func (p *Pool) ModelQuotaExhaustedEverywhere(model, realm string) (bool, time.Ti
 	return false, time.Time{}
 }
 
+// NoteModel429 记录一次模型级 429（14003 这类无重置时间的限流）。
+// 60 秒窗口内累计 2 次即触发熔断，后续 pick 直接返回 nil 快速失败。
+func (p *Pool) NoteModel429(model string) {
+	if model == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now().UnixNano()
+	cutoff := now - int64(60*time.Second)
+	if p.model429s == nil {
+		p.model429s = map[string][]int64{}
+	}
+	ts := p.model429s[model]
+	// 剪掉 60 秒前的
+	kept := ts[:0]
+	for _, t := range ts {
+		if t >= cutoff {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	p.model429s[model] = kept
+}
+
+// IsModelRateLimited 报告模型是否正处于 429 熔断（60 秒内 2+ 次 429）。
+func (p *Pool) IsModelRateLimited(model string) bool {
+	if model == "" {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	ts, ok := p.model429s[model]
+	if !ok || len(ts) < 2 {
+		return false
+	}
+	now := time.Now().UnixNano()
+	cutoff := now - int64(60*time.Second)
+	count := 0
+	for _, t := range ts {
+		if t >= cutoff {
+			count++
+		}
+	}
+	return count >= 2
+}
+
 // ModelBlockReasonPrefix 11102 负缓存条目的 reason 前缀（与 upstream.ModelBlockReason
 // 同源；pool 不反向依赖 upstream，故本地定义一份并保持字面一致）。
 const ModelBlockReasonPrefix = "11102"

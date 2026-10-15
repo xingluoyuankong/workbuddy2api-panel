@@ -1489,6 +1489,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate, upstream.ErrFreeQuotaExhausted:
+		// 模型级 429 熔断记数（14003 这类）：60 秒内 2 次即熔断，pick 直接 nil 快速失败。
+		// 6004 走 ErrFreeQuotaExhausted 已有独立重置逻辑，不重复记数。
+		if kind == upstream.ErrSoftRate {
+			h.cfg.Pool.NoteModel429(model)
+		}
 		// 上游排队（6020 queue.waiting）**优先判**：它不是"账号被限流"，而是该模型
 		// 此刻在排大队（实测 queue_position 2000+）。必须走模型级冷却——账号保持
 		// 健康、其它模型照常可用。若按账号级处理，一个排队模型会把池里的号依次

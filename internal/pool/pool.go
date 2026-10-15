@@ -47,6 +47,10 @@ type Pool struct {
 	// 为 LRU 兜底/防惊群提供与 time.Now() 精度无关的严格全序（Windows ~0.5ms 精度下
 	// lastUsed 墙钟会全等）。仅 pick 写锁路径读写，无需 atomic。
 	pickSeq uint64
+	// model429s 模型级 429 熔断：model -> 最近 429 时间戳列表（unix nano）。
+	// 14003 这类无重置时间的限流，60 秒内 2 次即视为模型级限流，pick 直接返回
+	// nil 快速失败，不再连试 3 号拖慢 TTFB。
+	model429s map[string][]int64
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
