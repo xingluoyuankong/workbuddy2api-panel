@@ -76,6 +76,8 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// DEBUG: log all calls
+	println("[DEBUG-COOLDOWN] CooldownSoftForModel called uid=" + uid + " model=" + model + " resetAt=" + resetAt.Format("15:04:05") + " reason=" + reason)
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
 		// 6004 触发瞬间把该模型当日用量定格为实测额度（上游不带限额数字，
