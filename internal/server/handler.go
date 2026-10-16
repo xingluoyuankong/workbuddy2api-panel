@@ -1499,6 +1499,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		if kind == upstream.ErrSoftRate {
 			h.cfg.Pool.NoteModel429(model)
 		}
+		// 6004 免费额度耗尽：强制写入 modelCooldowns，确保 pick 时跳过
+		// （不依赖 ParseRateReset 正则，防止解析失败导致漏记）
+		if kind == upstream.ErrFreeQuotaExhausted {
+			resetAt, ok := upstream.ParseRateReset(body)
+			if !ok {
+				// 解析失败时默认冷却 1 小时（兜底，不让坏号反复被选中）
+				resetAt = time.Now().Add(time.Hour)
+			}
+			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 free quota exhausted (forced)")
+		}
 		// 上游排队（6020 queue.waiting）**优先判**：它不是"账号被限流"，而是该模型
 		// 此刻在排大队（实测 queue_position 2000+）。必须走模型级冷却——账号保持
 		// 健康、其它模型照常可用。若按账号级处理，一个排队模型会把池里的号依次
