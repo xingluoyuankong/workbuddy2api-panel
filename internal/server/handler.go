@@ -1488,7 +1488,12 @@ func (h *Handler) noteProxyRateLimit(uid string) {
 }
 
 func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
-	println("[DEBUG-POLICY] applyErrorPolicy called uid=" + uid + " kind=" + string(kind) + " model=" + model)
+	// 11128 conversation id missing：账号上游会话失效，直接禁用（需重登）
+	// 这不是限流，是账号坏了，冷却重试无意义
+	if strings.Contains(body, "conversation id missing") {
+		h.cfg.Pool.Disable(uid, "11128 conversation id missing: 上游会话失效，需重新登录")
+		return
+	}
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
