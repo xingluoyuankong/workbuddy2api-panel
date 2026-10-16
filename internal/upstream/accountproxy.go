@@ -413,7 +413,7 @@ func NewAccountProxy(opts AccountProxyOptions) *AccountProxy {
 		opts:     opts,
 		doc:      &accountProxyDoc{Version: 1, Accounts: map[string]*AccountProxyEntry{}},
 		bindings: map[string]*accountBinding{},
-		direct:   &http.Client{Timeout: 30 * time.Second, Transport: tr},
+		direct:   &http.Client{Timeout: 0, Transport: tr}, // 无总超时（流式输出可能超30s）；首字节由 ResponseHeaderTimeout 管
 		rebindAt: map[string]*rebindState{},
 	}
 	return m
