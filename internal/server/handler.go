@@ -1488,6 +1488,7 @@ func (h *Handler) noteProxyRateLimit(uid string) {
 }
 
 func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
+	println("[DEBUG-POLICY] applyErrorPolicy called uid=" + uid + " kind=" + string(kind) + " model=" + model)
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
